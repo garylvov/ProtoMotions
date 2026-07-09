@@ -51,6 +51,15 @@ from protomotions.envs.rewards.tracking import (
     compute_relative_body_ori_rew,
     compute_global_body_lin_vel_rew,
     compute_global_body_ang_vel_rew,
+    # Track D root displacement kernels (Option-B fallback, dormant)
+    compute_root_xy_displacement_rew,
+    compute_root_heading_rew,
+)
+
+# Big-step reward kernels (Track D, OmniH2O-style, dormant; stateful callables)
+from protomotions.envs.rewards.big_step import (
+    FeetApexHeightReward,
+    StepDisplacementReward,
 )
 
 # Task reward kernels
@@ -110,6 +119,12 @@ __all__ = [
     "compute_relative_body_ori_rew",
     "compute_global_body_lin_vel_rew",
     "compute_global_body_ang_vel_rew",
+    # Track D root displacement kernels (Option-B fallback, dormant)
+    "compute_root_xy_displacement_rew",
+    "compute_root_heading_rew",
+    # Big-step reward kernels (Track D, OmniH2O-style, dormant)
+    "FeetApexHeightReward",
+    "StepDisplacementReward",
     # Task reward kernels
     "compute_heading_velocity_rew",
     "compute_path_following_rew",

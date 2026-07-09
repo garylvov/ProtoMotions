@@ -6,6 +6,7 @@ import torch
 
 from protomotions.agents.amp.agent import AMP
 from protomotions.envs.obs.humanoid import compute_humanoid_max_coords_observations
+from protomotions.utils.rotations import calc_heading
 from lightning.fabric import Fabric
 from typing import Optional
 from pathlib import Path
@@ -13,12 +14,70 @@ from protomotions.envs.base_env.env import BaseEnv
 
 log = logging.getLogger(__name__)
 
+# Number of extra differential features appended to ``mimic_target_poses_diff``
+# when ``add_root_displacement_features`` is enabled: root xy error in the
+# current heading frame (2) + wrapped heading error (1).
+NUM_ROOT_DISPLACEMENT_FEATURES = 3
+
+
+def compute_root_displacement_features(
+    ref_root_pos: torch.Tensor,
+    ref_root_rot: torch.Tensor,
+    current_root_pos: torch.Tensor,
+    current_root_rot: torch.Tensor,
+    w_last: bool = True,
+) -> torch.Tensor:
+    """Differential root-displacement features for the ADD discriminator.
+
+    Track D teacher-retrain objective 1 (minimize xy + heading displacement
+    relative to the motion): explicit error channels so the ADD discriminator
+    can auto-balance global drift toward zero.  Like the existing
+    ``mimic_target_poses_diff`` (ref pose minus current pose), these are
+    reference-minus-actual differentials that are exactly zero when tracking
+    is perfect — matching ADD's zero-vector positive samples.
+
+    Args:
+        ref_root_pos: Reference root positions [num_envs, 3].
+        ref_root_rot: Reference root rotations [num_envs, 4].
+        current_root_pos: Current root positions [num_envs, 3].
+        current_root_rot: Current root rotations [num_envs, 4].
+        w_last: Quaternion layout (xyzw when True).
+
+    Returns:
+        [num_envs, 3] tensor: xy error expressed in the current root heading
+        frame (2) followed by the wrapped heading error in radians (1).
+    """
+    xy_err_world = ref_root_pos[:, :2] - current_root_pos[:, :2]
+    cur_heading = calc_heading(current_root_rot, w_last)
+    cos_h = torch.cos(cur_heading)
+    sin_h = torch.sin(cur_heading)
+    # Rotate the world-frame error by -heading into the heading-local frame.
+    xy_err_local = torch.stack(
+        [
+            cos_h * xy_err_world[:, 0] + sin_h * xy_err_world[:, 1],
+            -sin_h * xy_err_world[:, 0] + cos_h * xy_err_world[:, 1],
+        ],
+        dim=-1,
+    )
+    ref_heading = calc_heading(ref_root_rot, w_last)
+    heading_err = ref_heading - cur_heading
+    # Wrap to [-pi, pi).
+    heading_err = torch.remainder(heading_err + torch.pi, 2 * torch.pi) - torch.pi
+    return torch.cat([xy_err_local, heading_err.unsqueeze(-1)], dim=-1)
+
 
 class MimicADD(AMP):
     def __init__(
         self, fabric: Fabric, env: BaseEnv, config, root_dir: Optional[Path] = None
     ):
         super().__init__(fabric, env, config, root_dir)
+
+    @property
+    def _root_displacement_features_enabled(self) -> bool:
+        """Config-gated Track D extension, default OFF (no behavior change)."""
+        return bool(
+            getattr(getattr(self, "config", None), "add_root_displacement_features", False)
+        )
 
     # -----------------------------
     # Environment Interaction and Data Updates
@@ -82,7 +141,23 @@ class MimicADD(AMP):
         )
 
         tracking_diff_obs = ref_pose - current_pose
-        obs["mimic_target_poses_diff"] = tracking_diff_obs.view(self.num_envs, -1)
+        tracking_diff_obs = tracking_diff_obs.view(self.num_envs, -1)
+
+        if self._root_displacement_features_enabled:
+            # Track D: append root xy displacement error (heading frame) and
+            # wrapped heading error as extra differential channels.
+            root_displacement_features = compute_root_displacement_features(
+                ref_root_pos=ref_state_gt[:, 0],
+                ref_root_rot=ref_state.rigid_body_rot.reshape(self.num_envs, -1, 4)[:, 0],
+                current_root_pos=current_state.rigid_body_pos[:, 0],
+                current_root_rot=current_state.rigid_body_rot[:, 0],
+                w_last=True,
+            )
+            tracking_diff_obs = torch.cat(
+                [tracking_diff_obs, root_displacement_features], dim=-1
+            )
+
+        obs["mimic_target_poses_diff"] = tracking_diff_obs
         return obs
 
     def get_expert_disc_obs(self, num_samples: int):
@@ -91,6 +166,10 @@ class MimicADD(AMP):
             obs_dim = self.env.observation_manager.observation_history_buffers["max_coords_obs"].data.shape[-1]
         else:
             obs_dim = expert_disc_obs.get("max_coords_obs", expert_disc_obs.get("historical_max_coords_obs", torch.empty(0))).shape[-1] // 8
+        if self._root_displacement_features_enabled:
+            # Expert (positive) samples are zero differentials — extend by the
+            # appended root-displacement channels to keep dimensions aligned.
+            obs_dim += NUM_ROOT_DISPLACEMENT_FEATURES
         tracking_diff_obs = torch.zeros(
             [num_samples, obs_dim],
             device=self.device,

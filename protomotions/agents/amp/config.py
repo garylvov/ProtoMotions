@@ -134,3 +134,15 @@ class AMPAgentConfig(PPOAgentConfig):
         default_factory=dict,
         metadata={"help": "MdpComponent instances for computing reference motion features. Agent injects motion_lib params at runtime."}
     )
+
+    add_root_displacement_features: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "MimicADD only (Track D, dormant by default): append root xy "
+                "displacement error (heading frame, 2D) and wrapped heading error "
+                "(1D) to the mimic_target_poses_diff discriminator input. "
+                "Expert positive samples get matching zero channels."
+            )
+        },
+    )

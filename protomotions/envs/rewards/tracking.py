@@ -32,6 +32,7 @@ from typing import Optional
 
 from protomotions.utils.rotations import (
     quat_angle_diff_norm,
+    calc_heading,
     calc_heading_quat_inv,
     quat_rotate,
     quat_mul,
@@ -479,6 +480,59 @@ def compute_anchor_xy_rew(
     return mean_squared_error_exp(current_xy, ref_anchor_xy, coefficient)
 
 
+def compute_root_xy_displacement_rew(
+    current_root_pos: Tensor,
+    ref_rigid_body_pos: Tensor,
+    coefficient: float = -20.0,
+) -> Tensor:
+    """Root XY displacement tracking reward (exponential MSE).
+
+    Track D Option-B fallback: exp-kernel on the root xy error relative to the
+    reference motion (objective 1 — minimize xy displacement).  The kernel is
+    invariant to the frame the error is expressed in (only the magnitude
+    matters), so no heading-frame rotation is needed here.
+
+    Args:
+        current_root_pos: Current root position [num_envs, 3].
+        ref_rigid_body_pos: Reference body positions [num_envs, num_bodies, 3]
+            (root is body 0).
+        coefficient: Exponential coefficient for error.
+
+    Returns:
+        Reward tensor [num_envs] in (0, 1].
+    """
+    ref_root_xy = ref_rigid_body_pos[:, 0, :2]
+    current_xy = current_root_pos[:, :2]
+    return mean_squared_error_exp(current_xy, ref_root_xy, coefficient)
+
+
+def compute_root_heading_rew(
+    current_root_rot: Tensor,
+    ref_rigid_body_rot: Tensor,
+    coefficient: float = -2.0,
+) -> Tensor:
+    """Root heading tracking reward (exponential squared wrapped-angle error).
+
+    Track D Option-B fallback: exp-kernel on the wrapped heading (yaw) error
+    relative to the reference motion (objective 1 — minimize heading
+    displacement).
+
+    Args:
+        current_root_rot: Current root rotation [num_envs, 4] (w-last).
+        ref_rigid_body_rot: Reference body rotations [num_envs, num_bodies, 4]
+            (w-last, root is body 0).
+        coefficient: Exponential coefficient for error.
+
+    Returns:
+        Reward tensor [num_envs] in (0, 1].
+    """
+    ref_heading = calc_heading(ref_rigid_body_rot[:, 0], w_last=True)
+    cur_heading = calc_heading(current_root_rot, w_last=True)
+    heading_err = ref_heading - cur_heading
+    heading_err = torch.remainder(heading_err + torch.pi, 2 * torch.pi) - torch.pi
+    return heading_err.pow(2).mul(coefficient).exp()
+
+
 __all__ = [
     # Standard tracking rewards
     "compute_gt_rew",
@@ -489,6 +543,9 @@ __all__ = [
     # Heading-local relative tracking (realign=OFF compatible)
     "compute_gt_rel_rew",
     "compute_anchor_xy_rew",
+    # Track D root displacement rewards (Option-B fallback, dormant)
+    "compute_root_xy_displacement_rew",
+    "compute_root_heading_rew",
     # BeyondMimic-style rewards
     "compute_global_position_error_exp",
     "compute_global_anchor_pos_rew",

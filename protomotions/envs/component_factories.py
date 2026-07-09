@@ -695,6 +695,64 @@ def anchor_xy_rew_factory(
     )
 
 
+def root_xy_displacement_rew_factory(
+    weight: float = 0.0, coefficient: float = -20.0
+) -> MdpComponent:
+    """Factory for Track D root XY displacement tracking reward (dormant).
+
+    Exp-kernel on the root xy error relative to the reference motion.
+    Option-B fallback of the Track D teacher-retrain plan (objective 1:
+    minimize xy displacement).  Default ``weight=0.0`` and not registered in
+    any recipe — enable explicitly with a positive weight.
+
+    Args:
+        weight: Reward weight (default 0.0 = dormant).
+        coefficient: Exponential coefficient for the squared xy error.
+
+    Returns:
+        MdpComponent configured for root xy displacement tracking.
+    """
+    from protomotions.envs.rewards import compute_root_xy_displacement_rew
+
+    return MdpComponent(
+        compute_func=compute_root_xy_displacement_rew,
+        dynamic_vars={
+            "current_root_pos": EnvContext.current.root_pos,
+            "ref_rigid_body_pos": EnvContext.mimic.ref_state.rigid_body_pos,
+        },
+        static_params={"weight": weight, "coefficient": coefficient},
+    )
+
+
+def root_heading_rew_factory(
+    weight: float = 0.0, coefficient: float = -2.0
+) -> MdpComponent:
+    """Factory for Track D root heading tracking reward (dormant).
+
+    Exp-kernel on the wrapped heading (yaw) error relative to the reference
+    motion.  Option-B fallback of the Track D teacher-retrain plan
+    (objective 1: minimize heading displacement).  Default ``weight=0.0`` and
+    not registered in any recipe — enable explicitly with a positive weight.
+
+    Args:
+        weight: Reward weight (default 0.0 = dormant).
+        coefficient: Exponential coefficient for the squared heading error.
+
+    Returns:
+        MdpComponent configured for root heading tracking.
+    """
+    from protomotions.envs.rewards import compute_root_heading_rew
+
+    return MdpComponent(
+        compute_func=compute_root_heading_rew,
+        dynamic_vars={
+            "current_root_rot": EnvContext.current.root_rot,
+            "ref_rigid_body_rot": EnvContext.mimic.ref_state.rigid_body_rot,
+        },
+        static_params={"weight": weight, "coefficient": coefficient},
+    )
+
+
 def corrupted_xy_offset_factory(
     log_noise_std: float = 0.12,
     soft_threshold: float = 0.15,
@@ -883,6 +941,90 @@ def reference_contact_liftoff_penalty_factory(
             "historical_body_contacts": EnvContext.historical.body_contacts,
         },
         static_params=static_params,
+    )
+
+
+def max_feet_height_rew_factory(
+    weight: float = 0.0,
+    apex_height_cap: float = 0.15,
+    zero_during_grace_period: bool = True,
+) -> MdpComponent:
+    """Factory for the OmniH2O-style per-step max-feet-height reward (dormant).
+
+    Track D objective 2 (arXiv 2406.08858): tracks each foot's swing apex
+    between touchdowns and rewards ``min(apex, apex_height_cap)`` ONCE at the
+    touchdown transition — never continuously, since continuous feet-height /
+    air-time rewards cause stomping instead of standing (per the paper).
+    Stateful kernel; per-env state resets automatically with the episode via
+    ``progress_buf``.  Default ``weight=0.0`` and not registered in any recipe.
+
+    Args:
+        weight: Reward weight (default 0.0 = dormant; positive to enable).
+        apex_height_cap: Cap on the rewarded swing apex height in meters.
+        zero_during_grace_period: Zero the reward during post-reset grace.
+
+    Returns:
+        MdpComponent configured for the per-step max-feet-height reward.
+    """
+    from protomotions.envs.rewards import FeetApexHeightReward
+
+    return MdpComponent(
+        compute_func=FeetApexHeightReward(apex_height_cap=apex_height_cap),
+        dynamic_vars={
+            "sim_contacts": EnvContext.current.rigid_body_contacts,
+            "rigid_body_pos": EnvContext.current.rigid_body_pos,
+            "ground_heights": EnvContext.ground_heights,
+            "contact_body_ids": EnvContext.contact_body_ids,
+            "progress_buf": EnvContext.progress_buf,
+        },
+        static_params={
+            "weight": weight,
+            "zero_during_grace_period": zero_during_grace_period,
+        },
+    )
+
+
+def step_displacement_rew_factory(
+    weight: float = 0.0,
+    min_step_length: float = 0.1,
+    reward_cap: float = 0.5,
+    zero_during_grace_period: bool = True,
+) -> MdpComponent:
+    """Factory for the displacement-per-step reward (dormant).
+
+    Track D anti-shuffle term: at each foot touchdown, rewards
+    ``min(max(0, step_length - min_step_length), reward_cap)`` where
+    ``step_length`` is the foot's xy travel since its previous touchdown.
+    The dead-zone below ``min_step_length`` makes micro/shuffle steps
+    worthless.  Stateful kernel; per-env state resets automatically with the
+    episode via ``progress_buf``.  Default ``weight=0.0`` and not registered
+    in any recipe.
+
+    Args:
+        weight: Reward weight (default 0.0 = dormant; positive to enable).
+        min_step_length: Step-length dead-zone in meters (default 0.1).
+        reward_cap: Cap on the per-touchdown reward in meters (default 0.5).
+        zero_during_grace_period: Zero the reward during post-reset grace.
+
+    Returns:
+        MdpComponent configured for the displacement-per-step reward.
+    """
+    from protomotions.envs.rewards import StepDisplacementReward
+
+    return MdpComponent(
+        compute_func=StepDisplacementReward(
+            min_step_length=min_step_length, reward_cap=reward_cap
+        ),
+        dynamic_vars={
+            "sim_contacts": EnvContext.current.rigid_body_contacts,
+            "rigid_body_pos": EnvContext.current.rigid_body_pos,
+            "contact_body_ids": EnvContext.contact_body_ids,
+            "progress_buf": EnvContext.progress_buf,
+        },
+        static_params={
+            "weight": weight,
+            "zero_during_grace_period": zero_during_grace_period,
+        },
     )
 
 
@@ -1647,6 +1789,12 @@ __all__ = [
     "rh_rew_factory",
     "gt_rel_rew_factory",
     "anchor_xy_rew_factory",
+    # Track D root displacement reward factories (dormant, weight=0.0 defaults)
+    "root_xy_displacement_rew_factory",
+    "root_heading_rew_factory",
+    # Track D big-step reward factories (OmniH2O-style, dormant)
+    "max_feet_height_rew_factory",
+    "step_displacement_rew_factory",
     "mimic_tracking_rewards_factory",
     # Odometer observation factory
     "corrupted_xy_offset_factory",

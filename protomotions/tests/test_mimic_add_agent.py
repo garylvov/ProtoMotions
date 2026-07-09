@@ -3,21 +3,33 @@
 
 """Tests for the MimicADD observation additions."""
 
+import math
 from types import SimpleNamespace
 
 import torch
 
 from protomotions.agents.mimic import agent_add
-from protomotions.agents.mimic.agent_add import MimicADD
+from protomotions.agents.mimic.agent_add import (
+    MimicADD,
+    NUM_ROOT_DISPLACEMENT_FEATURES,
+    compute_root_displacement_features,
+)
 
 
-def _state(body_pos):
+def _state(body_pos, body_rot=None):
+    if body_rot is None:
+        body_rot = torch.zeros(body_pos.shape[0], body_pos.shape[1], 4)
     return SimpleNamespace(
         rigid_body_pos=body_pos,
-        rigid_body_rot=torch.zeros(body_pos.shape[0], body_pos.shape[1], 4),
+        rigid_body_rot=body_rot,
         rigid_body_vel=torch.zeros_like(body_pos),
         rigid_body_ang_vel=torch.zeros_like(body_pos),
     )
+
+
+def _yaw_quat(yaw: float) -> torch.Tensor:
+    """w-last (xyzw) quaternion for a rotation of ``yaw`` about z."""
+    return torch.tensor([0.0, 0.0, math.sin(yaw / 2), math.cos(yaw / 2)])
 
 
 def test_mimic_add_adds_tracking_difference_observation(monkeypatch):
@@ -74,6 +86,169 @@ def test_mimic_add_adds_tracking_difference_observation(monkeypatch):
     assert torch.equal(
         obs["mimic_target_poses_diff"],
         (ref_pos - cur_pos).reshape(num_envs, -1),
+    )
+
+
+def test_root_displacement_features_values_and_wrapping():
+    # Env 0: current heading 0 — heading-frame xy error equals world error.
+    # Env 1: current heading pi/2 — world error (1, 0) maps to local (0, -1);
+    #        heading error wraps: ref -3.0 rad vs cur 3.0 rad -> +0.2832 rad.
+    ref_root_pos = torch.tensor([[1.0, 2.0, 0.9], [2.0, 0.0, 0.9]])
+    cur_root_pos = torch.tensor([[0.0, 0.0, 0.9], [1.0, 0.0, 0.9]])
+    ref_root_rot = torch.stack([_yaw_quat(math.pi / 2), _yaw_quat(-3.0)])
+    cur_root_rot = torch.stack([_yaw_quat(0.0), _yaw_quat(math.pi / 2)])
+
+    feats = compute_root_displacement_features(
+        ref_root_pos, ref_root_rot, cur_root_pos, cur_root_rot, w_last=True
+    )
+
+    assert feats.shape == (2, NUM_ROOT_DISPLACEMENT_FEATURES)
+    torch.testing.assert_close(
+        feats[0], torch.tensor([1.0, 2.0, math.pi / 2]), atol=1e-5, rtol=0
+    )
+    torch.testing.assert_close(
+        feats[1, :2], torch.tensor([0.0, -1.0]), atol=1e-5, rtol=0
+    )
+    expected_wrap = math.remainder(-3.0 - math.pi / 2, 2 * math.pi)
+    torch.testing.assert_close(
+        feats[1, 2], torch.tensor(expected_wrap), atol=1e-5, rtol=0
+    )
+    # Perfect tracking -> exact zero features (matches ADD's zero positives).
+    zero = compute_root_displacement_features(
+        ref_root_pos, ref_root_rot, ref_root_pos.clone(), ref_root_rot.clone()
+    )
+    torch.testing.assert_close(zero, torch.zeros(2, 3), atol=1e-6, rtol=0)
+
+
+def test_mimic_add_root_displacement_features_appended_when_enabled(monkeypatch):
+    num_envs = 2
+    ref_pos = torch.tensor(
+        [
+            [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+            [[2.0, 3.0, 4.0], [5.0, 6.0, 7.0]],
+        ]
+    )
+    cur_pos = ref_pos - 0.5
+    ref_rot = torch.stack(
+        [_yaw_quat(math.pi / 2).expand(2, 4), _yaw_quat(0.0).expand(2, 4)]
+    ).clone()
+    cur_rot = torch.stack(
+        [_yaw_quat(0.0).expand(2, 4), _yaw_quat(0.0).expand(2, 4)]
+    ).clone()
+    env = SimpleNamespace(
+        motion_manager=SimpleNamespace(
+            motion_times=torch.tensor([0.1, 0.2]),
+            motion_ids=torch.tensor([1, 2]),
+        ),
+        motion_lib=SimpleNamespace(
+            get_motion_state=lambda motion_ids, motion_times: _state(
+                ref_pos.clone(), ref_rot.clone()
+            )
+        ),
+        get_spawn_to_ref_pose_offset_with_terrain_height_correction=lambda pos: torch.zeros_like(
+            pos
+        ),
+        terrain=SimpleNamespace(
+            get_ground_heights=lambda roots: roots[:, 2] * 0.0,
+        ),
+        simulator=SimpleNamespace(
+            get_bodies_state=lambda: _state(cur_pos.clone(), cur_rot.clone())
+        ),
+    )
+    agent = MimicADD.__new__(MimicADD)
+    agent.env = env
+    agent.num_envs = num_envs
+    agent.config = SimpleNamespace(add_root_displacement_features=True)
+
+    monkeypatch.setattr(
+        agent_add.AMP,
+        "add_agent_info_to_obs",
+        lambda self, obs: obs,
+    )
+    monkeypatch.setattr(
+        agent_add,
+        "compute_humanoid_max_coords_observations",
+        lambda body_pos, ground_height, **kwargs: body_pos.reshape(num_envs, -1),
+    )
+
+    obs = agent.add_agent_info_to_obs({})
+    diff = obs["mimic_target_poses_diff"]
+
+    pose_diff = (ref_pos - cur_pos).reshape(num_envs, -1)
+    # Ordering: pose differential first, then the 3 root-displacement channels.
+    assert diff.shape == (num_envs, pose_diff.shape[1] + NUM_ROOT_DISPLACEMENT_FEATURES)
+    torch.testing.assert_close(diff[:, : pose_diff.shape[1]], pose_diff)
+
+    expected_feats = compute_root_displacement_features(
+        ref_root_pos=ref_pos[:, 0],
+        ref_root_rot=ref_rot[:, 0],
+        current_root_pos=cur_pos[:, 0],
+        current_root_rot=cur_rot[:, 0],
+    )
+    torch.testing.assert_close(diff[:, -3:], expected_feats)
+    # Env 0: xy error 0.5, 0.5 in heading frame (cur heading 0), heading err pi/2.
+    torch.testing.assert_close(
+        diff[0, -3:], torch.tensor([0.5, 0.5, math.pi / 2]), atol=1e-5, rtol=0
+    )
+
+
+def test_mimic_add_root_displacement_features_off_by_default(monkeypatch):
+    """Without the flag (or without config at all) behavior is unchanged."""
+    num_envs = 1
+    ref_pos = torch.ones(num_envs, 2, 3)
+    cur_pos = torch.zeros(num_envs, 2, 3)
+    env = SimpleNamespace(
+        motion_manager=SimpleNamespace(
+            motion_times=torch.tensor([0.1]),
+            motion_ids=torch.tensor([0]),
+        ),
+        motion_lib=SimpleNamespace(
+            get_motion_state=lambda motion_ids, motion_times: _state(ref_pos.clone())
+        ),
+        get_spawn_to_ref_pose_offset_with_terrain_height_correction=lambda pos: torch.zeros_like(
+            pos
+        ),
+        terrain=SimpleNamespace(get_ground_heights=lambda roots: roots[:, 2] * 0.0),
+        simulator=SimpleNamespace(get_bodies_state=lambda: _state(cur_pos.clone())),
+    )
+    agent = MimicADD.__new__(MimicADD)
+    agent.env = env
+    agent.num_envs = num_envs
+
+    monkeypatch.setattr(agent_add.AMP, "add_agent_info_to_obs", lambda self, obs: obs)
+    monkeypatch.setattr(
+        agent_add,
+        "compute_humanoid_max_coords_observations",
+        lambda body_pos, ground_height, **kwargs: body_pos.reshape(num_envs, -1),
+    )
+
+    obs = agent.add_agent_info_to_obs({})
+    assert obs["mimic_target_poses_diff"].shape == (num_envs, 6)
+
+
+def test_mimic_add_expert_disc_obs_extends_dim_when_features_enabled(monkeypatch):
+    agent = MimicADD.__new__(MimicADD)
+    agent.device = torch.device("cpu")
+    agent.config = SimpleNamespace(add_root_displacement_features=True)
+    agent.env = SimpleNamespace(
+        observation_manager=SimpleNamespace(
+            observation_history_buffers={
+                "max_coords_obs": SimpleNamespace(data=torch.zeros(4, 5))
+            }
+        )
+    )
+    monkeypatch.setattr(
+        agent_add.AMP,
+        "get_expert_disc_obs",
+        lambda self, num_samples: {"max_coords_obs": torch.ones(num_samples, 40)},
+    )
+
+    obs = agent.get_expert_disc_obs(3)
+
+    # Expert positives stay all-zero, extended by the 3 displacement channels.
+    assert torch.equal(
+        obs["mimic_target_poses_diff"],
+        torch.zeros(3, 5 + NUM_ROOT_DISPLACEMENT_FEATURES),
     )
 
 
