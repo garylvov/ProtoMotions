@@ -363,9 +363,8 @@ class SupervisedAgent(BaseAgent):
         batch_td = TensorDict(batch_dict, batch_size=batch_dict["action"].shape[0])
         batch_td = self.training_model(batch_td)
 
-        supervised_loss, supervised_log_dict = compute_supervision_loss(
+        supervised_loss, supervised_log_dict = self._compute_supervision_loss(
             batch_td,
-            self.config.loss,
         )
         actions = (
             batch_td["privileged_action"]
@@ -395,6 +394,46 @@ class SupervisedAgent(BaseAgent):
         log_dict.update(extra_log_dict)
 
         return loss, log_dict
+
+    def _compute_supervision_loss(self, batch_td: TensorDict) -> Tuple[Tensor, Dict]:
+        """Configured supervision loss, with optional per-dim MSE weighting.
+
+        Track C: ``action_dim_weights`` (getattr: old pickles predate the
+        field) re-weights the imitation MSE per action dim (robot dof order),
+        normalized by the mean weight so the total loss scale matches the
+        unweighted MSE. Uniform weights reproduce F.mse_loss exactly.
+        """
+        loss_config = self.config.loss
+        dim_weights = getattr(self.config, "action_dim_weights", None)
+        if dim_weights is None or not loss_config.enabled:
+            return compute_supervision_loss(batch_td, loss_config)
+
+        from protomotions.agents.common.supervision import SupervisionLossType
+
+        if SupervisionLossType(loss_config.loss_type) != SupervisionLossType.MSE:
+            raise ValueError(
+                "action_dim_weights is only supported for loss_type=mse, got "
+                f"{loss_config.loss_type}"
+            )
+
+        prediction = batch_td[loss_config.prediction_key]
+        target = batch_td[loss_config.target_key]
+        weights = torch.as_tensor(
+            dim_weights, dtype=prediction.dtype, device=prediction.device
+        )
+        if weights.shape != prediction.shape[-1:]:
+            raise ValueError(
+                f"action_dim_weights length {tuple(weights.shape)} does not "
+                f"match action dim {prediction.shape[-1]}"
+            )
+        weights = weights / weights.mean()
+        raw_loss = ((prediction - target).pow(2) * weights).mean()
+        weighted_loss = raw_loss * loss_config.weight
+        prefix = loss_config.log_prefix
+        return weighted_loss, {
+            f"{prefix}/mse": raw_loss.detach(),
+            f"{prefix}/loss": weighted_loss.detach(),
+        }
 
     def calculate_extra_loss(self, batch_dict, actions) -> Tuple[Tensor, Dict]:
         extra_loss = torch.tensor(0.0, device=self.device)

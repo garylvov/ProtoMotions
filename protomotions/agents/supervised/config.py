@@ -90,7 +90,21 @@ class SupervisedAgentConfig(BaseAgentConfig):
                 "Temporal smoothness penalty on the supervised prediction: "
                 "weight * mean((prediction - previous_actions)^2). Requires a "
                 "'previous_actions' key in the training batch (standard env "
-                "obs component, history_steps=1)."
+                "obs component, history_steps=1). NOTE: intentionally NOT "
+                "affected by action_dim_weights — smoothness stays uniform "
+                "across joints."
+            )
+        },
+    )
+    action_dim_weights: Optional[list] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional per-action-dim weights (length = number_of_actions, "
+                "robot dof order) for the supervised imitation MSE. "
+                "Normalized by their mean inside the loss so the total loss "
+                "scale stays comparable to the unweighted MSE. None (default) "
+                "= stock uniform MSE. Only valid with loss_type=mse."
             )
         },
     )
