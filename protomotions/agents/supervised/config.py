@@ -96,6 +96,21 @@ class SupervisedAgentConfig(BaseAgentConfig):
             )
         },
     )
+    expert_action_delta_weight: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "Action-delta matching loss: weight * mean(dimw * "
+                "((pred_t - prev_action_t) - (expert_t - expert_prev_t))^2). "
+                "Supervises velocity gain/direction in action space (wrist "
+                "under-response fix). Uses action_dim_weights (mean-normalized) "
+                "when set. Requires an external expert; when > 0 the agent "
+                "stores expert_prev_actions in the rollout buffer. Samples "
+                "with an all-zero previous_actions (fresh episode) are masked "
+                "out. Complements (does not replace) action_rate_weight."
+            )
+        },
+    )
     action_dim_weights: Optional[list] = field(
         default=None,
         metadata={

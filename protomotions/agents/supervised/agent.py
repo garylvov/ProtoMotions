@@ -231,6 +231,22 @@ class SupervisedAgent(BaseAgent):
                 "expert_actions",
                 shape=(self.env.robot_config.number_of_actions,),
             )
+            # Track C action-delta matching: store the expert's PREVIOUS
+            # action per step so the loss can supervise action deltas
+            # (velocity gain/direction). Only registered when the term is on
+            # so stock runs keep an identical buffer layout. The tracker
+            # tensor persists across epochs (epoch boundaries are not episode
+            # boundaries); fresh-episode samples are masked in the loss via
+            # the all-zero previous_actions heuristic.
+            if getattr(self.config, "expert_action_delta_weight", 0.0) > 0:
+                num_actions = self.env.robot_config.number_of_actions
+                self.experience_buffer.register_key(
+                    "expert_prev_actions",
+                    shape=(num_actions,),
+                )
+                self._expert_prev_actions = torch.zeros(
+                    self.num_envs, num_actions, device=self.device
+                )
 
     def register_algorithm_experience_buffer_keys_from_obs(self, obs_td: TensorDict):
         target_key = self.config.loss.target_key
@@ -335,6 +351,15 @@ class SupervisedAgent(BaseAgent):
             self.experience_buffer.update_data(
                 "expert_actions", step, output_td["expert_actions"]
             )
+
+        # Action-delta matching: write e_{t-1} for this step, then roll the
+        # tracker forward to e_t for the next step.
+        expert_prev = getattr(self, "_expert_prev_actions", None)
+        if expert_prev is not None and "expert_actions" in output_td.keys():
+            self.experience_buffer.update_data(
+                "expert_prev_actions", step, expert_prev
+            )
+            self._expert_prev_actions = output_td["expert_actions"].detach().clone()
 
         output_td["action"] = action
         return output_td
@@ -453,7 +478,72 @@ class SupervisedAgent(BaseAgent):
             extra_loss = extra_loss + action_rate_weight * action_rate_loss
             log_dict["supervised/action_rate_loss"] = action_rate_loss.detach()
 
+        # Track C: action-delta matching against the expert (velocity gain).
+        delta_weight = getattr(self.config, "expert_action_delta_weight", 0.0)
+        if delta_weight > 0:
+            delta_loss = self._calculate_action_delta_loss(batch_dict, actions)
+            extra_loss = extra_loss + delta_weight * delta_loss
+            log_dict["supervised/action_delta_loss"] = delta_loss.detach()
+
         return extra_loss, log_dict
+
+    def _previous_actions_from_batch(self, batch_td, actions: Tensor) -> Tensor:
+        if "previous_actions" not in batch_td.keys():
+            raise KeyError(
+                "This loss term requires a 'previous_actions' key in the "
+                f"training batch. Available keys: {list(batch_td.keys())}"
+            )
+        previous_actions = batch_td["previous_actions"]
+        if previous_actions.shape != actions.shape:
+            # flattened action history (history_steps > 1), most recent first
+            previous_actions = previous_actions.reshape(actions.shape[0], -1)[
+                :, : actions.shape[-1]
+            ]
+        return previous_actions
+
+    def _calculate_action_delta_loss(self, batch_td, actions: Tensor) -> Tensor:
+        """Match the student's per-step action delta to the expert's.
+
+        L = mean( dimw * ((a_t - a_{t-1}) - (e_t - e_{t-1}))^2 ) over samples
+        with a valid previous step. previous_actions is exactly all-zero right
+        after an episode reset (StateHistoryBuffer zeroes the action history),
+        which also covers the tracker's stale e_{t-1} on those samples — both
+        are masked out together.
+        """
+        for key in ("expert_actions", "expert_prev_actions"):
+            if key not in batch_td.keys():
+                raise KeyError(
+                    f"expert_action_delta_weight > 0 requires '{key}' in the "
+                    "training batch (registered by the supervised agent when "
+                    "the term is enabled). Available keys: "
+                    f"{list(batch_td.keys())}"
+                )
+        previous_actions = self._previous_actions_from_batch(batch_td, actions)
+        expert_actions = batch_td["expert_actions"]
+        expert_prev_actions = batch_td["expert_prev_actions"]
+
+        delta_err = (
+            (actions - previous_actions.detach())
+            - (expert_actions - expert_prev_actions).detach()
+        ).pow(2)
+
+        dim_weights = getattr(self.config, "action_dim_weights", None)
+        if dim_weights is not None:
+            weights = torch.as_tensor(
+                dim_weights, dtype=delta_err.dtype, device=delta_err.device
+            )
+            if weights.shape != delta_err.shape[-1:]:
+                raise ValueError(
+                    f"action_dim_weights length {tuple(weights.shape)} does "
+                    f"not match action dim {delta_err.shape[-1]}"
+                )
+            delta_err = delta_err * (weights / weights.mean())
+
+        valid = (previous_actions.abs().sum(dim=-1, keepdim=True) > 0).to(
+            delta_err.dtype
+        )
+        denom = (valid.sum() * delta_err.shape[-1]).clamp_min(1.0)
+        return (delta_err * valid).sum() / denom
 
     def _calculate_action_rate_loss(self, batch_td, actions: Tensor) -> Tensor:
         """Temporal smoothness: mean((prediction_t - action_{t-1})^2).
@@ -463,19 +553,7 @@ class SupervisedAgent(BaseAgent):
         the action applied at t-1 (previous_actions_factory(history_steps=1)),
         so the difference is the per-step action rate of the student.
         """
-        if "previous_actions" not in batch_td.keys():
-            raise KeyError(
-                "action_rate_weight > 0 requires a 'previous_actions' key in "
-                f"the training batch. Available keys: {list(batch_td.keys())}"
-            )
-        previous_actions = batch_td["previous_actions"]
-        if previous_actions.shape != actions.shape:
-            # previous_actions may be a flattened action history
-            # (history_steps > 1); the state-history buffer is ordered most
-            # recent first, so take the leading action_dim slice.
-            previous_actions = previous_actions.reshape(actions.shape[0], -1)[
-                :, : actions.shape[-1]
-            ]
+        previous_actions = self._previous_actions_from_batch(batch_td, actions)
         return (actions - previous_actions.detach()).pow(2).mean()
 
     def _calculate_l2c2_loss(self, batch_td: TensorDict) -> Tensor:
