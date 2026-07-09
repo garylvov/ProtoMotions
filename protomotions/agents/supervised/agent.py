@@ -397,14 +397,47 @@ class SupervisedAgent(BaseAgent):
         return loss, log_dict
 
     def calculate_extra_loss(self, batch_dict, actions) -> Tuple[Tensor, Dict]:
-        l2c2_weight = self.config.l2c2_weight
-        if l2c2_weight <= 0:
-            return torch.tensor(0.0, device=self.device), {}
+        extra_loss = torch.tensor(0.0, device=self.device)
+        log_dict: Dict = {}
 
-        l2c2_loss = self._calculate_l2c2_loss(batch_dict)
-        return l2c2_weight * l2c2_loss, {
-            "supervised/l2c2_loss": l2c2_loss.detach(),
-        }
+        l2c2_weight = self.config.l2c2_weight
+        if l2c2_weight > 0:
+            l2c2_loss = self._calculate_l2c2_loss(batch_dict)
+            extra_loss = extra_loss + l2c2_weight * l2c2_loss
+            log_dict["supervised/l2c2_loss"] = l2c2_loss.detach()
+
+        # Track C: action-rate penalty (getattr: old resolved_configs pickles
+        # predate the field; treat missing as 0.0 / off).
+        action_rate_weight = getattr(self.config, "action_rate_weight", 0.0)
+        if action_rate_weight > 0:
+            action_rate_loss = self._calculate_action_rate_loss(batch_dict, actions)
+            extra_loss = extra_loss + action_rate_weight * action_rate_loss
+            log_dict["supervised/action_rate_loss"] = action_rate_loss.detach()
+
+        return extra_loss, log_dict
+
+    def _calculate_action_rate_loss(self, batch_td, actions: Tensor) -> Tensor:
+        """Temporal smoothness: mean((prediction_t - action_{t-1})^2).
+
+        ``actions`` is the supervised prediction for step t (privileged_action
+        when present). ``previous_actions`` is the env obs component holding
+        the action applied at t-1 (previous_actions_factory(history_steps=1)),
+        so the difference is the per-step action rate of the student.
+        """
+        if "previous_actions" not in batch_td.keys():
+            raise KeyError(
+                "action_rate_weight > 0 requires a 'previous_actions' key in "
+                f"the training batch. Available keys: {list(batch_td.keys())}"
+            )
+        previous_actions = batch_td["previous_actions"]
+        if previous_actions.shape != actions.shape:
+            # previous_actions may be a flattened action history
+            # (history_steps > 1); the state-history buffer is ordered most
+            # recent first, so take the leading action_dim slice.
+            previous_actions = previous_actions.reshape(actions.shape[0], -1)[
+                :, : actions.shape[-1]
+            ]
+        return (actions - previous_actions.detach()).pow(2).mean()
 
     def _calculate_l2c2_loss(self, batch_td: TensorDict) -> Tensor:
         """L2C2 Lipschitz-ratio regularizer ported from the PPO actor path."""
@@ -464,6 +497,10 @@ class SupervisedAgent(BaseAgent):
             )
 
         output_dist = (prediction - clean_td[prediction_key]).pow(2).mean()
+        # Track C optional MSE form: plain MSE(pred_noisy, pred_clean), no
+        # ratio, no clamp (getattr: old pickles predate the field).
+        if getattr(self.config, "l2c2_mse_form", False):
+            return output_dist
         # Stability (2026-07-08 v2 divergence RCA): the raw Lipschitz ratio
         # exploded to inf by ep10 (TB supervised/l2c2_loss 0.25 -> 3.5 -> inf)
         # and poisoned the weights. Two guards: (a) floor the input distance

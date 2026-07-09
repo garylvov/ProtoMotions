@@ -70,3 +70,27 @@ class SupervisedAgentConfig(BaseAgentConfig):
         default_factory=dict,
         metadata={"help": "Map from noisy supervised obs key to clean counterpart key."},
     )
+    # Track C (2026-07-09) additions. Both default OFF so existing recipes and
+    # already-pickled resolved_configs keep stock behavior (agent.py reads them
+    # via getattr for old pickles that predate these fields).
+    l2c2_mse_form: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If True, the L2C2 term is plain MSE(pred_noisy, pred_clean) "
+                "(no input-distance ratio, no clamp). Only used when "
+                "l2c2_weight > 0."
+            )
+        },
+    )
+    action_rate_weight: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "Temporal smoothness penalty on the supervised prediction: "
+                "weight * mean((prediction - previous_actions)^2). Requires a "
+                "'previous_actions' key in the training batch (standard env "
+                "obs component, history_steps=1)."
+            )
+        },
+    )
