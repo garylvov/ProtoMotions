@@ -158,18 +158,37 @@ class MimicADD(AMP):
             )
 
         obs["mimic_target_poses_diff"] = tracking_diff_obs
+        # Cache the differential width so expert (zero) samples can be built
+        # without re-deriving it from env internals (see get_expert_disc_obs).
+        self._tracking_diff_dim = int(tracking_diff_obs.shape[-1])
         return obs
 
     def get_expert_disc_obs(self, num_samples: int):
-        expert_disc_obs = super().get_expert_disc_obs(num_samples)
-        if "max_coords_obs" in self.env.observation_manager.observation_history_buffers:
-            obs_dim = self.env.observation_manager.observation_history_buffers["max_coords_obs"].data.shape[-1]
+        if getattr(getattr(self, "config", None), "reference_obs_components", True):
+            expert_disc_obs = super().get_expert_disc_obs(num_samples)
         else:
-            obs_dim = expert_disc_obs.get("max_coords_obs", expert_disc_obs.get("historical_max_coords_obs", torch.empty(0))).shape[-1] // 8
-        if self._root_displacement_features_enabled:
-            # Expert (positive) samples are zero differentials — extend by the
-            # appended root-displacement channels to keep dimensions aligned.
-            obs_dim += NUM_ROOT_DISPLACEMENT_FEATURES
+            # ADD positive samples are pure zero differentials: when the
+            # discriminator consumes only ``mimic_target_poses_diff`` there is
+            # nothing to compute from the motion lib, so the base-AMP
+            # requirement for reference_obs_components does not apply.
+            expert_disc_obs = {}
+        cached = getattr(self, "_tracking_diff_dim", None)
+        if cached is not None:
+            # Set by add_agent_info_to_obs during collection (always runs
+            # before dataset augmentation) — already includes the appended
+            # root-displacement channels when enabled.
+            obs_dim = cached
+        else:
+            obs_manager = getattr(self.env, "observation_manager", None)
+            hist = getattr(obs_manager, "observation_history_buffers", {}) if obs_manager else {}
+            if "max_coords_obs" in hist:
+                obs_dim = hist["max_coords_obs"].data.shape[-1]
+            else:
+                obs_dim = expert_disc_obs.get("max_coords_obs", expert_disc_obs.get("historical_max_coords_obs", torch.empty(0))).shape[-1] // 8
+            if self._root_displacement_features_enabled:
+                # Expert (positive) samples are zero differentials — extend by
+                # the appended root-displacement channels to stay aligned.
+                obs_dim += NUM_ROOT_DISPLACEMENT_FEATURES
         tracking_diff_obs = torch.zeros(
             [num_samples, obs_dim],
             device=self.device,
