@@ -7,7 +7,7 @@ This module defines configurations for the AMP algorithm which uses a discrimina
 to learn motion priors from reference motions.
 """
 
-from typing import List, Dict, Any, TYPE_CHECKING
+from typing import List, Dict, Any, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from protomotions.envs.mdp_component import MdpComponent
@@ -139,10 +139,51 @@ class AMPAgentConfig(PPOAgentConfig):
         default=False,
         metadata={
             "help": (
-                "MimicADD only (Track D, dormant by default): append root xy "
-                "displacement error (heading frame, 2D) and wrapped heading error "
-                "(1D) to the mimic_target_poses_diff discriminator input. "
+                "MimicADD only (Track D, dormant by default; A/B option — the "
+                "2026-07-10 final design carries xy+heading pressure in the "
+                "task-reward channel instead): append the wrapped root heading "
+                "error (1D) to the mimic_target_poses_diff discriminator input "
+                "(plus heading-frame xy 2D when add_root_xy_features is set). "
                 "Expert positive samples get matching zero channels."
+            )
+        },
+    )
+    add_root_xy_features: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "MimicADD only (A/B sub-option of add_root_displacement_"
+                "features): additionally append the heading-frame root xy "
+                "error channels (legacy 3-channel form)."
+            )
+        },
+    )
+    global_diff_bodies: Optional[List[str]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "MimicADD only (dormant; A/B option, rejected as Track D "
+                "default 2026-07-10 — couples hand precision to deploy-time "
+                "odom quality): body-name regexes whose position diff keeps "
+                "the FULL world-frame error (root displacement included); "
+                "all other bodies get root-stripped (articulation-relative) "
+                "position diffs. None = stock diff computation."
+            )
+        },
+    )
+    add_diff_feature_scales: Optional[Dict[str, float]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "MimicADD only (Track D per-body saliency bias, dormant by "
+                "default): map of body-name regex -> scale applied to that "
+                "body's channels in mimic_target_poses_diff (special key "
+                "'root_displacement' scales the appended root channels). "
+                "Unmatched bodies scale 1.0. A saliency bias on ADD's "
+                "auto-balancing, not a hard weight; with normalize_obs=True "
+                "on the discriminator the bias is strongest early in "
+                "training (running normalizer absorbs static scales "
+                "asymptotically)."
             )
         },
     )

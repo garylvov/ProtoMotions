@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
+import re
+
 import torch
 
 from protomotions.agents.amp.agent import AMP
@@ -14,9 +16,16 @@ from protomotions.envs.base_env.env import BaseEnv
 
 log = logging.getLogger(__name__)
 
-# Number of extra differential features appended to ``mimic_target_poses_diff``
-# when ``add_root_displacement_features`` is enabled: root xy error in the
-# current heading frame (2) + wrapped heading error (1).
+# Channels produced by ``compute_root_displacement_features``: root xy error
+# in the current heading frame (2) + wrapped heading error (1).  How many are
+# APPENDED to ``mimic_target_poses_diff`` is config-dependent:
+# ``add_root_displacement_features`` appends the heading channel only;
+# ``add_root_xy_features`` additionally appends the xy channels.  Track D
+# final design (user decision 2026-07-10) ships BOTH OFF: xy+heading pressure
+# lives in the task-reward channel (root_xy_displacement_rew /
+# root_heading_rew factories) — training-time-only privileged signals,
+# decoupled from deploy-time odometry quality. These flags remain as A/B
+# options.
 NUM_ROOT_DISPLACEMENT_FEATURES = 3
 
 
@@ -66,18 +75,155 @@ def compute_root_displacement_features(
     return torch.cat([xy_err_local, heading_err.unsqueeze(-1)], dim=-1)
 
 
+def build_diff_feature_scale_vector(
+    body_names,
+    scales_spec: dict,
+    num_appended_root_channels: int,
+    device,
+) -> torch.Tensor:
+    """Per-feature scale vector for the ADD tracking differential.
+
+    Feature layout (``compute_humanoid_max_coords_observations`` with
+    ``local_obs=False, root_height_obs=True, observe_contacts=False`` — see
+    ``protomotions/envs/obs/humanoid.py:229``):
+
+        [root_h (1) | body pos, bodies 1..B-1 (3 each) | body rot tan-norm,
+         bodies 0..B-1 (6 each) | body lin vel (3 each) | body ang vel
+         (3 each) | appended root channels (0, 1 or 3)]
+
+    ``scales_spec`` maps BODY-NAME REGEX -> scale (first matching pattern in
+    insertion order wins; unmatched bodies scale 1.0). The special key
+    ``"root_displacement"`` scales the appended root channels (when enabled);
+    the root_h channel takes body 0's scale.
+
+    Scaling is a SALIENCY BIAS on ADD's auto-balancing, not a hard weight —
+    the discriminator still adapts. NOTE: with ``normalize_obs=True`` on the
+    discriminator input, a static per-feature scale is asymptotically
+    absorbed by the per-feature running normalizer (the bias is strongest
+    early in training); set ``normalize_obs=False`` on the discriminator to
+    make it permanent. Zero positives stay zero under any scaling.
+    """
+    body_scales = []
+    patterns = [(k, float(v)) for k, v in scales_spec.items()
+                if k != "root_displacement"]
+    for name in body_names:
+        s = 1.0
+        for pat, val in patterns:
+            if re.search(pat, name):
+                s = val
+                break
+        body_scales.append(s)
+    b = len(body_names)
+    root_disp_scale = float(scales_spec.get("root_displacement", 1.0))
+
+    parts = [torch.tensor([body_scales[0]])]                            # root_h
+    parts.append(torch.tensor(body_scales[1:]).repeat_interleave(3))    # pos
+    parts.append(torch.tensor(body_scales).repeat_interleave(6))        # rot
+    parts.append(torch.tensor(body_scales).repeat_interleave(3))        # vel
+    parts.append(torch.tensor(body_scales).repeat_interleave(3))        # angvel
+    if num_appended_root_channels > 0:
+        parts.append(torch.full((num_appended_root_channels,), root_disp_scale))
+    vec = torch.cat(parts).to(device=device, dtype=torch.float32)
+    expected = 1 + 3 * (b - 1) + 6 * b + 3 * b + 3 * b + num_appended_root_channels
+    assert vec.shape[0] == expected, (vec.shape, expected)
+    return vec
+
+
 class MimicADD(AMP):
     def __init__(
         self, fabric: Fabric, env: BaseEnv, config, root_dir: Optional[Path] = None
     ):
         super().__init__(fabric, env, config, root_dir)
 
+    # -----------------------------
+    # Config-gated Track D extensions (all default OFF -> stock behavior)
+    # -----------------------------
     @property
     def _root_displacement_features_enabled(self) -> bool:
-        """Config-gated Track D extension, default OFF (no behavior change)."""
+        """A/B option (default OFF): append root-error channels to the diff."""
         return bool(
             getattr(getattr(self, "config", None), "add_root_displacement_features", False)
         )
+
+    @property
+    def _root_xy_features_enabled(self) -> bool:
+        """A/B sub-option: also append the heading-frame xy channels (legacy
+        3-channel form); otherwise only the heading channel is appended."""
+        return bool(
+            getattr(getattr(self, "config", None), "add_root_xy_features", False)
+        )
+
+    @property
+    def _num_appended_root_channels(self) -> int:
+        if not self._root_displacement_features_enabled:
+            return 0
+        return NUM_ROOT_DISPLACEMENT_FEATURES if self._root_xy_features_enabled else 1
+
+    @property
+    def _global_diff_bodies(self):
+        """A/B option (default OFF — user decision 2026-07-10): bodies whose
+        position diff keeps the FULL world-frame error (root displacement
+        included). Rejected as the Track D default because a heavily-weighted
+        GLOBAL wrist channel couples the top-priority precision signal to
+        deploy-time frame-estimate quality (odom slip -> phantom offsets);
+        root-stripped hand error depends only on proprioception."""
+        return getattr(getattr(self, "config", None), "global_diff_bodies", None)
+
+    @property
+    def _diff_feature_scales_spec(self):
+        return getattr(getattr(self, "config", None), "add_diff_feature_scales", None)
+
+    def _env_body_names(self):
+        robot_config = getattr(self.env, "robot_config", None)
+        if robot_config is None:
+            return None
+        return list(robot_config.kinematic_info.body_names)
+
+    def _global_diff_body_mask(self, num_bodies: int, device) -> torch.Tensor:
+        """Bool mask [num_bodies] of bodies whose position diff stays GLOBAL."""
+        cached = getattr(self, "_global_body_mask_cache", None)
+        if cached is not None and cached.shape[0] == num_bodies:
+            return cached.to(device)
+        names = self._env_body_names()
+        assert names is not None and len(names) == num_bodies, (
+            "global_diff_bodies requires env.robot_config body names matching "
+            f"the state tensor ({num_bodies} bodies)"
+        )
+        mask = torch.zeros(num_bodies, dtype=torch.bool)
+        for i, n in enumerate(names):
+            for pat in self._global_diff_bodies:
+                if re.search(pat, n):
+                    mask[i] = True
+                    break
+        assert mask.any(), (
+            f"global_diff_bodies {self._global_diff_bodies} matched no body in "
+            f"{names}"
+        )
+        self._global_body_mask_cache = mask
+        return mask.to(device)
+
+    def _diff_feature_scale_vector(self, total_dim: int, device):
+        cached = getattr(self, "_diff_scale_vec_cache", None)
+        if cached is not None and cached.shape[0] == total_dim:
+            return cached.to(device)
+        names = self._env_body_names()
+        assert names is not None, (
+            "add_diff_feature_scales requires env.robot_config body names"
+        )
+        vec = build_diff_feature_scale_vector(
+            names,
+            self._diff_feature_scales_spec,
+            self._num_appended_root_channels,
+            device,
+        )
+        assert vec.shape[0] == total_dim, (
+            "add_diff_feature_scales: layout mismatch — expected diff dim "
+            f"{vec.shape[0]} from the max-coords layout, got {total_dim}. "
+            "The scale vector assumes local_obs=False, root_height_obs=True, "
+            "observe_contacts=False."
+        )
+        self._diff_scale_vec_cache = vec
+        return vec
 
     # -----------------------------
     # Environment Interaction and Data Updates
@@ -143,9 +289,32 @@ class MimicADD(AMP):
         tracking_diff_obs = ref_pose - current_pose
         tracking_diff_obs = tracking_diff_obs.view(self.num_envs, -1)
 
+        if self._global_diff_bodies:
+            # A/B option (default OFF): rebuild the body-position diff block
+            # so the listed bodies keep the FULL world-frame position error
+            # (root displacement included — drift + articulation together),
+            # while every other body is root-stripped (articulation-relative
+            # error only). Layout: the pos block covers bodies 1..B-1 at
+            # channels [1 : 1+3*(B-1)].
+            ref_pos = ref_state_gt
+            cur_pos = current_state.rigid_body_pos.reshape(self.num_envs, -1, 3)
+            num_bodies = cur_pos.shape[1]
+            mask = self._global_diff_body_mask(num_bodies, cur_pos.device)
+            glob_diff = ref_pos - cur_pos
+            rel_diff = (ref_pos - ref_pos[:, :1]) - (cur_pos - cur_pos[:, :1])
+            pos_diff = torch.where(mask.view(1, -1, 1), glob_diff, rel_diff)
+            pos_block_end = 1 + 3 * (num_bodies - 1)
+            assert tracking_diff_obs.shape[-1] >= pos_block_end, (
+                tracking_diff_obs.shape, num_bodies
+            )
+            tracking_diff_obs = tracking_diff_obs.clone()
+            tracking_diff_obs[:, 1:pos_block_end] = pos_diff[:, 1:].reshape(
+                self.num_envs, -1
+            )
+
         if self._root_displacement_features_enabled:
-            # Track D: append root xy displacement error (heading frame) and
-            # wrapped heading error as extra differential channels.
+            # A/B option (default OFF): append root-error channels. Heading
+            # only by default; add_root_xy_features restores the xy channels.
             root_displacement_features = compute_root_displacement_features(
                 ref_root_pos=ref_state_gt[:, 0],
                 ref_root_rot=ref_state.rigid_body_rot.reshape(self.num_envs, -1, 4)[:, 0],
@@ -153,15 +322,95 @@ class MimicADD(AMP):
                 current_root_rot=current_state.rigid_body_rot[:, 0],
                 w_last=True,
             )
+            if not self._root_xy_features_enabled:
+                root_displacement_features = root_displacement_features[:, 2:3]
             tracking_diff_obs = torch.cat(
                 [tracking_diff_obs, root_displacement_features], dim=-1
             )
+
+        if self._diff_feature_scales_spec:
+            # Track D per-body saliency bias (wrists > head > rest).
+            scale_vec = self._diff_feature_scale_vector(
+                tracking_diff_obs.shape[-1], tracking_diff_obs.device
+            )
+            tracking_diff_obs = tracking_diff_obs * scale_vec
 
         obs["mimic_target_poses_diff"] = tracking_diff_obs
         # Cache the differential width so expert (zero) samples can be built
         # without re-deriving it from env internals (see get_expert_disc_obs).
         self._tracking_diff_dim = int(tracking_diff_obs.shape[-1])
         return obs
+
+    # -----------------------------
+    # Track D comprehensive logging (2026-07-10): reward economics + DR force
+    # events as cheap per-epoch TB scalars — nothing about the run's internal
+    # economics should be invisible afterward (the L2C2/action-rate lesson).
+    # -----------------------------
+    def post_epoch_logging(self, training_log_dict):
+        try:
+            self._add_reward_economics_logging(training_log_dict)
+        except Exception as exc:  # noqa: BLE001 — logging must never kill training
+            log.debug("reward economics logging skipped: %s", exc)
+        try:
+            self._add_dr_force_logging(training_log_dict)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("dr force logging skipped: %s", exc)
+        super().post_epoch_logging(training_log_dict)
+
+    def _add_reward_economics_logging(self, training_log_dict):
+        """Per-term reward magnitudes vs the dominant (disc) term.
+
+        Emits ``reward_ratios/<term>_vs_disc`` = |scaled env term per-step
+        mean| / |weighted disc reward per-step mean| for every scaled env
+        reward component, plus ``reward_ratios/task_total_vs_disc`` — the
+        standing scale-drift monitor.
+        """
+        buf = getattr(self, "experience_buffer", None)
+        if buf is None or not hasattr(buf, "amp_rewards"):
+            return
+        disc_w = float(self.config.amp_parameters.discriminator_reward_w)
+        disc_mean = abs(float(buf.amp_rewards.mean())) * disc_w
+        training_log_dict["reward_ratios/disc_per_step_abs"] = disc_mean
+        denom = max(disc_mean, 1e-9)
+        env_means = self.episode_env_tensors.mean()
+        task_total = 0.0
+        for key, value in env_means.items():
+            if not key.startswith("scaled_r/"):
+                continue
+            name = key[len("scaled_r/"):]
+            v = abs(float(value))
+            task_total += float(value)
+            training_log_dict[f"reward_ratios/{name}_vs_disc"] = v / denom
+        training_log_dict["reward_ratios/task_total_vs_disc"] = (
+            abs(task_total) * float(self.config.task_reward_w) / denom
+        )
+
+    def _add_dr_force_logging(self, training_log_dict):
+        """Persistent-force / wrench DR event snapshot (per scheduler entry).
+
+        For each active wrench-class scheduler: fraction of envs currently
+        loaded, mean/max applied force magnitude over loaded envs, and the
+        configured cap — keyed by direction mode + first body name so the
+        curriculum stage's DR scale is visible directly in TB.
+        """
+        sim = getattr(self.env, "simulator", None)
+        if not getattr(sim, "_wrench_enabled", False):
+            return
+        for sched in sim._wrench_scheds:
+            cfg = sched["cfg"]
+            entry_names = sched.get("entry_names") or (cfg.body_names or ["body"])
+            mode = getattr(cfg, "direction_mode", "uniform")
+            tag = f"dr_force/{mode}_{entry_names[0]}"
+            active = sched["active"]
+            frac = float(active.float().mean())
+            training_log_dict[f"{tag}/active_frac"] = frac
+            training_log_dict[f"{tag}/cap_n"] = float(cfg.force_magnitude_range[1])
+            if bool(active.any()):
+                mags = sched["forces"][active].norm(dim=-1)
+                mags = mags[mags > 0]
+                if mags.numel():
+                    training_log_dict[f"{tag}/applied_mag_mean_n"] = float(mags.mean())
+                    training_log_dict[f"{tag}/applied_mag_max_n"] = float(mags.max())
 
     def get_expert_disc_obs(self, num_samples: int):
         if getattr(getattr(self, "config", None), "reference_obs_components", True):
@@ -175,8 +424,8 @@ class MimicADD(AMP):
         cached = getattr(self, "_tracking_diff_dim", None)
         if cached is not None:
             # Set by add_agent_info_to_obs during collection (always runs
-            # before dataset augmentation) — already includes the appended
-            # root-displacement channels when enabled.
+            # before dataset augmentation) — already includes any appended
+            # root channels and per-feature scaling (zeros stay zero).
             obs_dim = cached
         else:
             obs_manager = getattr(self.env, "observation_manager", None)
@@ -185,10 +434,9 @@ class MimicADD(AMP):
                 obs_dim = hist["max_coords_obs"].data.shape[-1]
             else:
                 obs_dim = expert_disc_obs.get("max_coords_obs", expert_disc_obs.get("historical_max_coords_obs", torch.empty(0))).shape[-1] // 8
-            if self._root_displacement_features_enabled:
-                # Expert (positive) samples are zero differentials — extend by
-                # the appended root-displacement channels to stay aligned.
-                obs_dim += NUM_ROOT_DISPLACEMENT_FEATURES
+            # Expert (positive) samples are zero differentials — extend by
+            # the appended root channels to stay dimension-aligned.
+            obs_dim += self._num_appended_root_channels
         tracking_diff_obs = torch.zeros(
             [num_samples, obs_dim],
             device=self.device,

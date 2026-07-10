@@ -3,12 +3,13 @@
 
 """Unit smokes for the dormant Track D reward kernels.
 
-Covers:
-- OmniH2O-style per-step max-feet-height reward (apex tracked across a fake
-  swing, touchdown-only emission, cap).
-- Displacement-per-step reward (micro-step dead-zone, cap, touchdown-only).
-- Episode-reset state handling via progress_buf.
-- Root xy displacement / heading exp-kernel rewards (Option-B fallback).
+REWORKED 2026-07-10 (OmniH2O code-audit economics fix). Covers:
+- Swing-apex SHORTFALL penalty (shuffle steps cost, target-height steps free,
+  touchdown-only emission, reset handling).
+- Ref-motion-GATED displacement-per-step reward (dead-zone, cap,
+  touchdown-only, stationary-reference gate, anchor behavior across gating).
+- Continuous in_the_air penalty.
+- Root xy displacement / heading exp-kernel rewards (task-reward channel).
 - Factory construction (dormant weight=0.0 defaults).
 """
 
@@ -19,6 +20,7 @@ import torch
 from protomotions.envs.rewards.big_step import (
     FeetApexHeightReward,
     StepDisplacementReward,
+    compute_in_the_air_penalty,
 )
 from protomotions.envs.rewards.tracking import (
     compute_root_heading_rew,
@@ -29,6 +31,11 @@ NUM_ENVS = 2
 NUM_BODIES = 4
 FOOT_IDS = torch.tensor([2, 3])
 GROUND = torch.zeros(NUM_ENVS)
+
+# Reference body velocities [NUM_ENVS, NUM_BODIES, 3]: moving / stationary.
+REF_VEL_MOVING = torch.zeros(NUM_ENVS, NUM_BODIES, 3)
+REF_VEL_MOVING[:, 0, 0] = 1.0  # root moving 1 m/s in x
+REF_VEL_STATIC = torch.zeros(NUM_ENVS, NUM_BODIES, 3)
 
 
 def _positions(foot0_xy=(0.0, 0.0), foot0_z=0.0, foot1_xy=(0.0, 0.1), foot1_z=0.0):
@@ -52,110 +59,176 @@ def _yaw_quat(yaw: float) -> torch.Tensor:
     return torch.tensor([0.0, 0.0, math.sin(yaw / 2), math.cos(yaw / 2)])
 
 
-def test_feet_apex_height_reward_tracks_apex_and_emits_only_at_touchdown():
-    rew = FeetApexHeightReward(apex_height_cap=0.15)
+def test_apex_shortfall_shuffle_costs_and_emits_only_at_touchdown():
+    rew = FeetApexHeightReward(apex_target_height=0.25)
     progress = torch.tensor([1, 1])
 
     # Step 1: both feet planted (state init) -> 0.
     r = rew(_contacts(True), _positions(), GROUND, FOOT_IDS, progress)
     assert torch.equal(r, torch.zeros(NUM_ENVS))
 
-    # Fake swing of foot 0: rises to 0.12 then descends. No reward while airborne.
-    for z in (0.05, 0.12, 0.08):
+    # Fake SHUFFLE swing of foot 0: apex only 0.05 m. Nothing while airborne.
+    for z in (0.02, 0.05, 0.03):
         progress = progress + 1
         r = rew(_contacts(False), _positions(foot0_z=z), GROUND, FOOT_IDS, progress)
-        assert torch.equal(r, torch.zeros(NUM_ENVS)), "no reward during swing"
+        assert torch.equal(r, torch.zeros(NUM_ENVS)), "no emission during swing"
 
-    # Touchdown: apex (0.12, below cap) paid exactly once, env 0 only.
+    # Touchdown: shortfall 0.25 - 0.05 = 0.20 paid exactly once, env 0 only.
     progress = progress + 1
     r = rew(_contacts(True), _positions(foot0_z=0.0), GROUND, FOOT_IDS, progress)
-    torch.testing.assert_close(r, torch.tensor([0.12, 0.0]))
+    torch.testing.assert_close(r, torch.tensor([0.20, 0.0]))
 
-    # Next step, still planted -> nothing more.
+    # Next step, still planted -> nothing more (standing costs nothing).
     progress = progress + 1
     r = rew(_contacts(True), _positions(), GROUND, FOOT_IDS, progress)
     assert torch.equal(r, torch.zeros(NUM_ENVS))
 
 
-def test_feet_apex_height_reward_caps_apex():
-    rew = FeetApexHeightReward(apex_height_cap=0.15)
+def test_apex_shortfall_zero_at_or_above_target():
+    rew = FeetApexHeightReward(apex_target_height=0.25)
     progress = torch.tensor([1, 1])
     rew(_contacts(True), _positions(), GROUND, FOOT_IDS, progress)
 
+    # High step: apex 0.30 >= 0.25 target -> zero shortfall at touchdown.
     progress = progress + 1
     rew(_contacts(False), _positions(foot0_z=0.30), GROUND, FOOT_IDS, progress)
     progress = progress + 1
     r = rew(_contacts(True), _positions(foot0_z=0.0), GROUND, FOOT_IDS, progress)
-    torch.testing.assert_close(r, torch.tensor([0.15, 0.0]))
+    torch.testing.assert_close(r, torch.tensor([0.0, 0.0]))
 
 
-def test_feet_apex_height_reward_reset_clears_state_and_suppresses_touchdown():
-    rew = FeetApexHeightReward(apex_height_cap=0.15)
+def test_apex_shortfall_reset_clears_state_and_suppresses_touchdown():
+    rew = FeetApexHeightReward(apex_target_height=0.25)
     progress = torch.tensor([5, 5])
     rew(_contacts(True), _positions(), GROUND, FOOT_IDS, progress)
     progress = progress + 1
-    rew(_contacts(False), _positions(foot0_z=0.12), GROUND, FOOT_IDS, progress)
+    rew(_contacts(False), _positions(foot0_z=0.05), GROUND, FOOT_IDS, progress)
 
     # Env 0 resets mid-swing (progress does not advance): the landed-looking
-    # transition must NOT pay the stale apex.
+    # transition must NOT charge the stale shortfall.
     progress = torch.tensor([1, 7])
     r = rew(_contacts(True), _positions(foot0_z=0.0), GROUND, FOOT_IDS, progress)
     assert torch.equal(r, torch.zeros(NUM_ENVS))
 
-    # A fresh swing after the reset works normally.
+    # A fresh swing after the reset works normally (apex 0.07 -> 0.18 cost).
     progress = torch.tensor([2, 8])
     rew(_contacts(False), _positions(foot0_z=0.07), GROUND, FOOT_IDS, progress)
     progress = torch.tensor([3, 9])
     r = rew(_contacts(True), _positions(foot0_z=0.0), GROUND, FOOT_IDS, progress)
-    torch.testing.assert_close(r, torch.tensor([0.07, 0.0]))
+    torch.testing.assert_close(r, torch.tensor([0.18, 0.0]))
 
 
-def test_step_displacement_reward_thresholds_and_caps():
-    rew = StepDisplacementReward(min_step_length=0.1, reward_cap=0.5)
+def test_step_displacement_reward_thresholds_and_caps_when_ref_moving():
+    rew = StepDisplacementReward(min_step_length=0.1, reward_cap=0.5,
+                                 min_ref_speed=0.1)
     progress = torch.tensor([1, 1])
-    rew(_contacts(True), _positions(), FOOT_IDS, progress)
+    rew(_contacts(True), _positions(), FOOT_IDS, progress,
+        ref_rigid_body_vel=REF_VEL_MOVING)
 
-    def swing_and_land(start_progress, landing_xy):
+    def swing_and_land(start_progress, landing_xy, ref_vel):
         p = start_progress + 1
-        rew(_contacts(False), _positions(foot0_xy=landing_xy, foot0_z=0.1), FOOT_IDS, p)
+        rew(_contacts(False), _positions(foot0_xy=landing_xy, foot0_z=0.1),
+            FOOT_IDS, p, ref_rigid_body_vel=ref_vel)
         p = p + 1
-        r = rew(_contacts(True), _positions(foot0_xy=landing_xy), FOOT_IDS, p)
+        r = rew(_contacts(True), _positions(foot0_xy=landing_xy), FOOT_IDS, p,
+                ref_rigid_body_vel=ref_vel)
         return r, p
 
-    # Nominal 0.4 m step: reward 0.4 - 0.1 = 0.3, env 0 only, at touchdown only.
-    r, progress = swing_and_land(progress, (0.4, 0.0))
+    # Nominal 0.4 m step with a MOVING reference: 0.4 - 0.1 = 0.3.
+    r, progress = swing_and_land(progress, (0.4, 0.0), REF_VEL_MOVING)
     torch.testing.assert_close(r, torch.tensor([0.3, 0.0]))
 
-    # Micro-step of 0.05 m (from x=0.4 to 0.45): inside dead-zone -> 0.
-    r, progress = swing_and_land(progress, (0.45, 0.0))
+    # Micro-step of 0.05 m: inside dead-zone -> 0.
+    r, progress = swing_and_land(progress, (0.45, 0.0), REF_VEL_MOVING)
     torch.testing.assert_close(r, torch.tensor([0.0, 0.0]))
 
-    # Lunge of 0.8 m: reward min(0.8 - 0.1, 0.5) = 0.5.
-    r, progress = swing_and_land(progress, (1.25, 0.0))
+    # Lunge of 0.8 m: min(0.8 - 0.1, 0.5) = 0.5.
+    r, progress = swing_and_land(progress, (1.25, 0.0), REF_VEL_MOVING)
     torch.testing.assert_close(r, torch.tensor([0.5, 0.0]))
 
     # Planted step after touchdown: no continuous emission.
     progress = progress + 1
-    r = rew(_contacts(True), _positions(foot0_xy=(1.25, 0.0)), FOOT_IDS, progress)
+    r = rew(_contacts(True), _positions(foot0_xy=(1.25, 0.0)), FOOT_IDS, progress,
+            ref_rigid_body_vel=REF_VEL_MOVING)
     assert torch.equal(r, torch.zeros(NUM_ENVS))
 
 
-def test_step_displacement_reward_reset_reanchors_touchdown_position():
+def test_step_displacement_pays_nothing_on_stationary_reference():
+    """The gate: a big step under a STATIONARY reference earns zero — no step
+    income on frozen/stationary refs — and the touchdown anchor still moves
+    so a later gated-open step is measured from its true previous touchdown."""
+    rew = StepDisplacementReward(min_step_length=0.1, reward_cap=0.5,
+                                 min_ref_speed=0.1)
+    progress = torch.tensor([1, 1])
+    rew(_contacts(True), _positions(), FOOT_IDS, progress,
+        ref_rigid_body_vel=REF_VEL_STATIC)
+
+    # 0.4 m step under a stationary ref -> 0.
+    progress = progress + 1
+    rew(_contacts(False), _positions(foot0_xy=(0.4, 0.0), foot0_z=0.1),
+        FOOT_IDS, progress, ref_rigid_body_vel=REF_VEL_STATIC)
+    progress = progress + 1
+    r = rew(_contacts(True), _positions(foot0_xy=(0.4, 0.0)), FOOT_IDS, progress,
+            ref_rigid_body_vel=REF_VEL_STATIC)
+    torch.testing.assert_close(r, torch.tensor([0.0, 0.0]))
+
+    # Reference starts moving; next 0.3 m step is measured from x=0.4 (the
+    # anchored gated touchdown), not from x=0.
+    progress = progress + 1
+    rew(_contacts(False), _positions(foot0_xy=(0.7, 0.0), foot0_z=0.1),
+        FOOT_IDS, progress, ref_rigid_body_vel=REF_VEL_MOVING)
+    progress = progress + 1
+    r = rew(_contacts(True), _positions(foot0_xy=(0.7, 0.0)), FOOT_IDS, progress,
+            ref_rigid_body_vel=REF_VEL_MOVING)
+    torch.testing.assert_close(r, torch.tensor([0.3 - 0.1, 0.0]))
+
+
+def test_step_displacement_gate_disabled_with_zero_min_ref_speed():
+    rew = StepDisplacementReward(min_step_length=0.1, reward_cap=0.5,
+                                 min_ref_speed=0.0)
+    progress = torch.tensor([1, 1])
+    rew(_contacts(True), _positions(), FOOT_IDS, progress,
+        ref_rigid_body_vel=REF_VEL_STATIC)
+    progress = progress + 1
+    rew(_contacts(False), _positions(foot0_xy=(0.4, 0.0), foot0_z=0.1),
+        FOOT_IDS, progress, ref_rigid_body_vel=REF_VEL_STATIC)
+    progress = progress + 1
+    r = rew(_contacts(True), _positions(foot0_xy=(0.4, 0.0)), FOOT_IDS, progress,
+            ref_rigid_body_vel=REF_VEL_STATIC)
+    torch.testing.assert_close(r, torch.tensor([0.3, 0.0]))
+
+
+def test_step_displacement_reset_reanchors_touchdown_position():
     rew = StepDisplacementReward(min_step_length=0.1, reward_cap=0.5)
     progress = torch.tensor([3, 3])
-    rew(_contacts(True), _positions(), FOOT_IDS, progress)
+    rew(_contacts(True), _positions(), FOOT_IDS, progress,
+        ref_rigid_body_vel=REF_VEL_MOVING)
 
-    # Reset env 0: it respawns with foot 0 at x=5.0. Distance from the stale
-    # anchor (x=0) must not be paid, and the anchor must move to x=5.0.
+    # Reset env 0: respawns with foot 0 at x=5.0. Stale-anchor distance not
+    # paid; anchor moves to x=5.0.
     progress = torch.tensor([1, 4])
-    r = rew(_contacts(True), _positions(foot0_xy=(5.0, 0.0)), FOOT_IDS, progress)
+    r = rew(_contacts(True), _positions(foot0_xy=(5.0, 0.0)), FOOT_IDS, progress,
+            ref_rigid_body_vel=REF_VEL_MOVING)
     assert torch.equal(r, torch.zeros(NUM_ENVS))
 
     progress = torch.tensor([2, 5])
-    rew(_contacts(False), _positions(foot0_xy=(5.2, 0.0), foot0_z=0.1), FOOT_IDS, progress)
+    rew(_contacts(False), _positions(foot0_xy=(5.2, 0.0), foot0_z=0.1),
+        FOOT_IDS, progress, ref_rigid_body_vel=REF_VEL_MOVING)
     progress = torch.tensor([3, 6])
-    r = rew(_contacts(True), _positions(foot0_xy=(5.3, 0.0)), FOOT_IDS, progress)
+    r = rew(_contacts(True), _positions(foot0_xy=(5.3, 0.0)), FOOT_IDS, progress,
+            ref_rigid_body_vel=REF_VEL_MOVING)
     torch.testing.assert_close(r, torch.tensor([0.3 - 0.1, 0.0]))
+
+
+def test_in_the_air_penalty_continuous_indicator():
+    # Both feet airborne -> 1.0 (env 0); env 1 planted -> 0.
+    r = compute_in_the_air_penalty(_contacts(False, False), FOOT_IDS)
+    torch.testing.assert_close(r, torch.tensor([1.0, 0.0]))
+    # One foot down -> 0.
+    r = compute_in_the_air_penalty(_contacts(False, True), FOOT_IDS)
+    torch.testing.assert_close(r, torch.tensor([0.0, 0.0]))
+    r = compute_in_the_air_penalty(_contacts(True, True), FOOT_IDS)
+    torch.testing.assert_close(r, torch.tensor([0.0, 0.0]))
 
 
 def test_compute_root_xy_displacement_rew():
@@ -194,6 +267,7 @@ def test_compute_root_heading_rew_wraps_angle():
 
 def test_track_d_factories_are_dormant_by_default():
     from protomotions.envs.component_factories import (
+        in_the_air_penalty_factory,
         max_feet_height_rew_factory,
         root_heading_rew_factory,
         root_xy_displacement_rew_factory,
@@ -206,13 +280,14 @@ def test_track_d_factories_are_dormant_by_default():
         root_heading_rew_factory,
         max_feet_height_rew_factory,
         step_displacement_rew_factory,
+        in_the_air_penalty_factory,
     ):
         component = factory()
         assert isinstance(component, MdpComponent)
         assert component.static_params["weight"] == 0.0
 
-    apex = max_feet_height_rew_factory(weight=0.1, apex_height_cap=0.2)
-    assert apex.compute_func.apex_height_cap == 0.2
+    apex = max_feet_height_rew_factory(weight=-8.0, apex_target_height=0.25)
+    assert apex.compute_func.apex_target_height == 0.25
     assert set(apex.dynamic_vars) == {
         "sim_contacts",
         "rigid_body_pos",
@@ -221,6 +296,10 @@ def test_track_d_factories_are_dormant_by_default():
         "progress_buf",
     }
 
-    step = step_displacement_rew_factory(min_step_length=0.2, reward_cap=0.6)
+    step = step_displacement_rew_factory(
+        min_step_length=0.2, reward_cap=0.6, min_ref_speed=0.15
+    )
     assert step.compute_func.min_step_length == 0.2
     assert step.compute_func.reward_cap == 0.6
+    assert step.compute_func.min_ref_speed == 0.15
+    assert "ref_rigid_body_vel" in step.dynamic_vars

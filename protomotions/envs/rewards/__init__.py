@@ -60,6 +60,7 @@ from protomotions.envs.rewards.tracking import (
 from protomotions.envs.rewards.big_step import (
     FeetApexHeightReward,
     StepDisplacementReward,
+    compute_in_the_air_penalty,
 )
 
 # Task reward kernels
@@ -125,6 +126,7 @@ __all__ = [
     # Big-step reward kernels (Track D, OmniH2O-style, dormant)
     "FeetApexHeightReward",
     "StepDisplacementReward",
+    "compute_in_the_air_penalty",
     # Task reward kernels
     "compute_heading_velocity_rew",
     "compute_path_following_rew",

@@ -946,30 +946,36 @@ def reference_contact_liftoff_penalty_factory(
 
 def max_feet_height_rew_factory(
     weight: float = 0.0,
-    apex_height_cap: float = 0.15,
+    apex_target_height: float = 0.25,
     zero_during_grace_period: bool = True,
 ) -> MdpComponent:
-    """Factory for the OmniH2O-style per-step max-feet-height reward (dormant).
+    """Factory for the OmniH2O per-step swing-apex SHORTFALL penalty (dormant).
 
-    Track D objective 2 (arXiv 2406.08858): tracks each foot's swing apex
-    between touchdowns and rewards ``min(apex, apex_height_cap)`` ONCE at the
-    touchdown transition — never continuously, since continuous feet-height /
-    air-time rewards cause stomping instead of standing (per the paper).
-    Stateful kernel; per-env state resets automatically with the episode via
-    ``progress_buf``.  Default ``weight=0.0`` and not registered in any recipe.
+    Track D objective 2, REWORKED 2026-07-10 per the OmniH2O code audit
+    (arXiv 2406.08858; their yaml ships a raw −2500 apex-shortfall term,
+    un-gated): tracks each foot's swing apex between touchdowns and emits
+    ``max(0, apex_target_height - apex)`` ONCE at the touchdown transition —
+    never continuously (continuous feet-height / air-time terms cause
+    stomping; their continuous feet-height term ships at weight 0). Weight it
+    NEGATIVELY: shuffle steps cost their shortfall, target-height steps cost
+    nothing, standing still emits nothing. Stateful kernel; per-env state
+    resets automatically with the episode via ``progress_buf``. Default
+    ``weight=0.0`` = dormant.
 
     Args:
-        weight: Reward weight (default 0.0 = dormant; positive to enable).
-        apex_height_cap: Cap on the rewarded swing apex height in meters.
+        weight: Reward weight (default 0.0 = dormant; NEGATIVE to enable —
+            the kernel emits a positive shortfall).
+        apex_target_height: Target swing apex height in meters (shortfall is
+            measured against this).
         zero_during_grace_period: Zero the reward during post-reset grace.
 
     Returns:
-        MdpComponent configured for the per-step max-feet-height reward.
+        MdpComponent configured for the swing-apex shortfall penalty.
     """
     from protomotions.envs.rewards import FeetApexHeightReward
 
     return MdpComponent(
-        compute_func=FeetApexHeightReward(apex_height_cap=apex_height_cap),
+        compute_func=FeetApexHeightReward(apex_target_height=apex_target_height),
         dynamic_vars={
             "sim_contacts": EnvContext.current.rigid_body_contacts,
             "rigid_body_pos": EnvContext.current.rigid_body_pos,
@@ -988,38 +994,79 @@ def step_displacement_rew_factory(
     weight: float = 0.0,
     min_step_length: float = 0.1,
     reward_cap: float = 0.5,
+    min_ref_speed: float = 0.1,
     zero_during_grace_period: bool = True,
 ) -> MdpComponent:
-    """Factory for the displacement-per-step reward (dormant).
+    """Factory for the ref-motion-GATED displacement-per-step reward (dormant).
 
-    Track D anti-shuffle term: at each foot touchdown, rewards
-    ``min(max(0, step_length - min_step_length), reward_cap)`` where
-    ``step_length`` is the foot's xy travel since its previous touchdown.
-    The dead-zone below ``min_step_length`` makes micro/shuffle steps
-    worthless.  Stateful kernel; per-env state resets automatically with the
-    episode via ``progress_buf``.  Default ``weight=0.0`` and not registered
-    in any recipe.
+    Track D anti-shuffle term, REWORKED 2026-07-10: at each foot touchdown,
+    rewards ``min(max(0, step_length - min_step_length), reward_cap)`` where
+    ``step_length`` is the foot's xy travel since its previous touchdown —
+    but ONLY while the reference root xy speed exceeds ``min_ref_speed``
+    (OmniH2O gates their step-encouraging feet-air-time term on reference
+    speed the same way; no step income on stationary / frozen-lower-body
+    references). The dead-zone below ``min_step_length`` makes micro/shuffle
+    steps worthless. Stateful kernel; per-env state resets automatically with
+    the episode via ``progress_buf``. Default ``weight=0.0`` = dormant.
+    Requires a mimic control component (reads the reference body velocities).
 
     Args:
         weight: Reward weight (default 0.0 = dormant; positive to enable).
         min_step_length: Step-length dead-zone in meters (default 0.1).
         reward_cap: Cap on the per-touchdown reward in meters (default 0.5).
+        min_ref_speed: Reference root xy speed gate in m/s (default 0.1;
+            0.0 disables the gate).
         zero_during_grace_period: Zero the reward during post-reset grace.
 
     Returns:
-        MdpComponent configured for the displacement-per-step reward.
+        MdpComponent configured for the gated displacement-per-step reward.
     """
     from protomotions.envs.rewards import StepDisplacementReward
 
     return MdpComponent(
         compute_func=StepDisplacementReward(
-            min_step_length=min_step_length, reward_cap=reward_cap
+            min_step_length=min_step_length,
+            reward_cap=reward_cap,
+            min_ref_speed=min_ref_speed,
         ),
         dynamic_vars={
             "sim_contacts": EnvContext.current.rigid_body_contacts,
             "rigid_body_pos": EnvContext.current.rigid_body_pos,
             "contact_body_ids": EnvContext.contact_body_ids,
             "progress_buf": EnvContext.progress_buf,
+            "ref_rigid_body_vel": EnvContext.mimic.ref_state.rigid_body_vel,
+        },
+        static_params={
+            "weight": weight,
+            "zero_during_grace_period": zero_during_grace_period,
+        },
+    )
+
+
+def in_the_air_penalty_factory(
+    weight: float = 0.0,
+    zero_during_grace_period: bool = True,
+) -> MdpComponent:
+    """Factory for the continuous both-feet-airborne penalty (dormant).
+
+    OmniH2O teacher ``in_the_air`` term (audit 2026-07-10): emits 1.0 for
+    every step in which no configured contact body touches the ground. Weight
+    with a small NEGATIVE weight. Default ``weight=0.0`` = dormant.
+
+    Args:
+        weight: Reward weight (default 0.0 = dormant; NEGATIVE to enable).
+        zero_during_grace_period: Zero the reward during post-reset grace.
+
+    Returns:
+        MdpComponent configured for the in-the-air penalty.
+    """
+    from protomotions.envs.rewards import compute_in_the_air_penalty
+
+    return MdpComponent(
+        compute_func=compute_in_the_air_penalty,
+        dynamic_vars={
+            "sim_contacts": EnvContext.current.rigid_body_contacts,
+            "contact_body_ids": EnvContext.contact_body_ids,
         },
         static_params={
             "weight": weight,
