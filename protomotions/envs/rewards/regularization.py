@@ -73,6 +73,36 @@ def compute_action_smoothness(
     return result
 
 
+def compute_action_smoothness_graced(
+    current_processed_action: Tensor,
+    previous_processed_action: Tensor,
+    perturbation_grace_mask: Tensor = None,
+) -> Tensor:
+    """Action smoothness penalty with a perturbation grace window (Track D).
+
+    Identical to ``compute_action_smoothness`` except the penalty is ZEROED
+    for envs whose ``perturbation_grace_mask`` is True — the post-push window
+    and persistent-force ramp-in/plateau phases (the OmniH2O grace pattern
+    applied to the smoothness penalty instead of termination): decisive
+    recovery swings are untaxed exactly when they are needed. With no grace
+    source configured (mask None) it reduces to the stock penalty.
+
+    Args:
+        current_processed_action: Current processed action [num_envs, dim].
+        previous_processed_action: Previous processed action [num_envs, dim].
+        perturbation_grace_mask: Bool [num_envs] or None (no grace).
+
+    Returns:
+        Smoothness penalty tensor [num_envs] (zeroed where graced).
+    """
+    result = compute_action_smoothness(
+        current_processed_action, previous_processed_action
+    )
+    if perturbation_grace_mask is not None:
+        result = result * (~perturbation_grace_mask.bool()).float()
+    return result
+
+
 def compute_action_smoothness_logmeanexp(
     current_processed_action: Tensor,
     previous_processed_action: Tensor,

@@ -583,6 +583,11 @@ class EnvContext:
     odom_scale: Tensor = FieldPath()
     odom_yaw_cos_sin: Tensor = FieldPath()
 
+    # Track D action-rate grace (2026-07-10): per-env bool mask from the
+    # perturbation schedulers (post-push window / persistent-force
+    # ramp-in+plateau). None when no grace source is configured.
+    perturbation_grace_mask: Optional[Tensor] = FieldPath()
+
     # Control-specific contexts (populated by controllers via populate_context)
     mimic: Optional[MimicContext] = NestedField(MimicContext)
     masked_mimic: Optional[MaskedMimicContext] = NestedField(MaskedMimicContext)
@@ -612,6 +617,7 @@ class EnvContext:
         non_termination_contact_body_ids: Optional[Tensor] = None,
         odom_scale: Optional[Tensor] = None,
         odom_yaw_cos_sin: Optional[Tensor] = None,
+        perturbation_grace_mask: Optional[Tensor] = None,
         mimic: Optional[MimicContext] = None,
         masked_mimic: Optional[MaskedMimicContext] = None,
         steering: Optional[SteeringContext] = None,
@@ -678,6 +684,7 @@ class EnvContext:
         # Per-episode odometer corruption parameters
         self.odom_scale = odom_scale
         self.odom_yaw_cos_sin = odom_yaw_cos_sin
+        self.perturbation_grace_mask = perturbation_grace_mask
 
         # Control-specific views
         self.mimic = mimic

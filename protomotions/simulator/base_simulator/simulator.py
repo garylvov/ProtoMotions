@@ -302,6 +302,21 @@ class Simulator(RecordingMixin, ABC):
             )
             self._schedule_push(torch.arange(self.num_envs, device=self.device))
 
+        # Post-push action-rate grace (Track D 2026-07-10): per-env countdown
+        # of control steps during which the action-rate penalty is suspended
+        # (getattr: pickles predating the field must keep loading).
+        grace_sec = (
+            float(getattr(push_cfg, "action_rate_grace_sec", 0.0) or 0.0)
+            if push_cfg is not None
+            else 0.0
+        )
+        self._push_grace_steps = (
+            max(1, int(round(grace_sec / self.dt))) if grace_sec > 0.0 else 0
+        )
+        self._push_grace_left = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
+
     def _schedule_push(self, env_ids: torch.Tensor) -> None:
         """Schedule next push time for specified environments."""
         if not self._push_enabled or len(env_ids) == 0:
@@ -336,6 +351,9 @@ class Simulator(RecordingMixin, ABC):
         ) * self._push_max_ang_vel
 
         self._apply_root_velocity_impulse(lin_vel, ang_vel, due_env_ids)
+        if getattr(self, "_push_grace_steps", 0) > 0:
+            # Arm the post-push action-rate grace window for the pushed envs.
+            self._push_grace_left[due_env_ids] = self._push_grace_steps
         self._schedule_push(due_env_ids)
 
     # -------------------------
@@ -672,8 +690,39 @@ class Simulator(RecordingMixin, ABC):
         if changed:
             self._apply_external_wrenches(*self._summed_wrench_buffers())
 
+    def get_action_rate_grace_mask(self):
+        """Per-env mask suspending the action-rate penalty (Track D grace).
+
+        True while (a) the post-push grace countdown is running
+        (``PushDomainRandomizationConfig.action_rate_grace_sec``) or (b) any
+        persistent-force event of a class flagged
+        ``action_rate_grace=True`` is in its ramp-in or PLATEAU phase (the
+        ease-out is taxed again — the robot should settle smoothly).
+        Returns None when no grace source is configured (component treats
+        None as no grace).
+        """
+        pieces = []
+        if getattr(self, "_push_grace_steps", 0) > 0:
+            pieces.append(self._push_grace_left > 0)
+        if getattr(self, "_wrench_enabled", False):
+            for sched in self._wrench_scheds:
+                if not getattr(sched["cfg"], "action_rate_grace", False):
+                    continue
+                in_event = sched["active"] & torch.isfinite(sched["end_time"])
+                # ramp-in + plateau only: before end_time - ramp_out.
+                pre_ease_out = sched["time"] < (sched["end_time"] - sched["ramp_out"])
+                pieces.append(in_event & pre_ease_out)
+        if not pieces:
+            return None
+        mask = pieces[0]
+        for p in pieces[1:]:
+            mask = mask | p
+        return mask
+
     def _reset_wrench_randomization(self, env_ids: torch.Tensor) -> None:
         """Clear active wrenches (all classes) and reschedule for reset envs."""
+        if getattr(self, "_push_grace_steps", 0) > 0 and len(env_ids) > 0:
+            self._push_grace_left[env_ids] = 0
         if not self._wrench_enabled or len(env_ids) == 0:
             return
         need_apply = False
@@ -1074,6 +1123,8 @@ class Simulator(RecordingMixin, ABC):
         if self._push_enabled:
             self._simulation_time += self.dt
             self._apply_push_if_due()
+        if getattr(self, "_push_grace_steps", 0) > 0:
+            self._push_grace_left.clamp_(min=0).sub_(1).clamp_(min=0)
 
         # Update external wrench randomization (random force/torque bursts)
         self._update_wrench_randomization()

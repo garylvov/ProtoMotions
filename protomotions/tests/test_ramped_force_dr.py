@@ -297,3 +297,55 @@ def test_stage_scale_persistent_cohort_and_downward_bias():
     h = f[:, :2].norm(dim=-1)
     assert bool((h >= 49.0 * 0.10 - 1e-4).all())
     assert bool((h <= 49.0 * 0.18 + 1e-4).all())
+
+
+def test_action_rate_grace_mask_wrench_phases():
+    """Grace mask True during ramp-in + plateau of a flagged class, False
+    during ease-out and idle; None when nothing is configured."""
+    torch.manual_seed(5)
+    cfg = _ramped_cfg(action_rate_grace=True)
+    host = _Host(wrench_cfg=cfg, num_envs=2)
+    host._init_wrench_randomization()
+    host._push_grace_steps = 0  # no push source
+    sched = host._wrench_scheds[0]
+
+    saw_grace_in_event, saw_no_grace_ease_out = False, False
+    for _ in range(int(3.0 / host.dt)):
+        host._update_wrench_randomization()
+        mask = Simulator.get_action_rate_grace_mask(host)
+        assert mask is not None
+        active = bool(sched["active"][0])
+        if active:
+            t_left = float(sched["end_time"][0] - sched["time"][0])
+            in_ease_out = t_left < float(sched["ramp_out"][0])
+            if not in_ease_out:
+                assert bool(mask[0]), "grace ON during ramp-in/plateau"
+                saw_grace_in_event = True
+            else:
+                assert not bool(mask[0]), "grace OFF during ease-out"
+                saw_no_grace_ease_out = True
+        else:
+            assert not bool(mask[0]), "grace OFF while idle"
+    assert saw_grace_in_event and saw_no_grace_ease_out
+
+    # Unflagged class -> no grace source -> None.
+    host2 = _Host(wrench_cfg=_ramped_cfg(), num_envs=2)
+    host2._init_wrench_randomization()
+    host2._push_grace_steps = 0
+    assert Simulator.get_action_rate_grace_mask(host2) is None
+
+
+def test_push_grace_countdown_and_reset():
+    """Post-push grace countdown arms per env and clears on reset."""
+    host = _Host(wrench_cfg=_ramped_cfg(action_rate_grace=False), num_envs=4)
+    host._init_wrench_randomization()
+    host._push_grace_steps = 60
+    host._push_grace_left = torch.zeros(4, dtype=torch.long)
+    host._push_grace_left[1] = 60  # env 1 just got pushed
+    mask = Simulator.get_action_rate_grace_mask(host)
+    assert mask is not None
+    assert bool(mask[1]) and not bool(mask[0])
+    # Reset clears the countdown for the reset env.
+    Simulator._reset_wrench_randomization(host, torch.tensor([1]))
+    mask = Simulator.get_action_rate_grace_mask(host)
+    assert not bool(mask[1])

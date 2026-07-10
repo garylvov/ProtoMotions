@@ -303,3 +303,32 @@ def test_track_d_factories_are_dormant_by_default():
     assert step.compute_func.reward_cap == 0.6
     assert step.compute_func.min_ref_speed == 0.15
     assert "ref_rigid_body_vel" in step.dynamic_vars
+
+
+def test_graced_action_smoothness_zeroes_masked_envs():
+    from protomotions.envs.rewards.regularization import (
+        compute_action_smoothness,
+        compute_action_smoothness_graced,
+    )
+
+    cur = torch.tensor([[1.0, 0.0], [1.0, 0.0]])
+    prev = torch.zeros(2, 2)
+    base = compute_action_smoothness(cur, prev)
+    # No mask -> identical to stock.
+    torch.testing.assert_close(
+        compute_action_smoothness_graced(cur, prev, None), base)
+    # Masked env 0 pays nothing; env 1 unchanged.
+    graced = compute_action_smoothness_graced(
+        cur, prev, torch.tensor([True, False]))
+    torch.testing.assert_close(graced[0], torch.tensor(0.0))
+    torch.testing.assert_close(graced[1], base[1])
+
+
+def test_graced_action_smoothness_factory_dormantable():
+    from protomotions.envs.component_factories import (
+        graced_action_smoothness_factory,
+    )
+
+    comp = graced_action_smoothness_factory(weight=-0.1)
+    assert comp.static_params["weight"] == -0.1
+    assert "perturbation_grace_mask" in comp.dynamic_vars

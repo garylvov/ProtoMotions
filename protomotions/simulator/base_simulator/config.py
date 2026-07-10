@@ -457,6 +457,18 @@ class PushDomainRandomizationConfig:
         default=(0.0, 0.0, 0.0),
         metadata={"help": "Max angular velocity impulse (roll, pitch, yaw) in rad/s."},
     )
+    action_rate_grace_sec: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "Track D post-push grace window: seconds after each impulse "
+                "push during which the env-side action-rate penalty is "
+                "suspended for the pushed envs (decisive recovery swings go "
+                "untaxed; see Simulator.get_action_rate_grace_mask). "
+                "0.0 (default) = no grace."
+            )
+        },
+    )
 
     def __post_init__(self):
         if self.push_interval_range[0] <= 0 or self.push_interval_range[1] <= 0:
@@ -566,6 +578,18 @@ class WrenchDomainRandomizationConfig:
                 "per-env scheduler (events overlap: sometimes one body loaded, "
                 "sometimes several — asymmetric and full carries). False "
                 "(default) = one body chosen per event (previous behavior)."
+            )
+        },
+    )
+    action_rate_grace: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Track D grace window: while an event of this class is in its "
+                "ramp-in or plateau phase, the env-side action-rate penalty is "
+                "suspended for the affected envs (see "
+                "Simulator.get_action_rate_grace_mask and the graced action-"
+                "smoothness reward). Default False = no grace contribution."
             )
         },
     )

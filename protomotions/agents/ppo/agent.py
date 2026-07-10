@@ -573,7 +573,14 @@ class PPO(BaseAgent):
             mu_clean = clean_td["mean_action"]
 
             output_dist = (mu_noisy - mu_clean).pow(2).mean()
-            l2c2_loss = output_dist / (input_dist + 1e-8)
+            # Stability guards ported from the supervised-path 2026-07-08
+            # divergence RCA (protomotions/agents/supervised/agent.py): the
+            # raw Lipschitz ratio explodes when the noisy-clean input gap is
+            # near zero (post-reset noisy-cache fallback steps) — (a) floor
+            # the input distance at 1e-4, (b) clamp the ratio at 10 so one
+            # bad batch cannot dominate the gradient. Neither guard binds in
+            # the healthy regime (ratio O(0.1-1)).
+            l2c2_loss = (output_dist / input_dist.clamp_min(1e-4)).clamp_max(10.0)
             l2c2_weighted = self.config.l2c2.lambda_l2c2 * l2c2_loss
 
             extra_loss = extra_loss + l2c2_weighted

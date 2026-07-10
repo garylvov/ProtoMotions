@@ -518,6 +518,38 @@ def action_smoothness_factory(weight: float = -0.02) -> MdpComponent:
     )
 
 
+def graced_action_smoothness_factory(weight: float = -0.02) -> MdpComponent:
+    """Factory for the grace-windowed action smoothness reward (Track D).
+
+    Stock action-rate penalty, but SUSPENDED (zeroed) per env while the
+    perturbation schedulers report a grace phase: ~1.2 s after each impulse
+    push (``PushDomainRandomizationConfig.action_rate_grace_sec``) and during
+    the ramp-in + plateau of persistent-force events flagged
+    ``action_rate_grace=True``. Resolves the smoothness-vs-decisive-recovery
+    tension structurally: the old flat −0.1 taxed a fast recovery swing at
+    10-100x the anti-shuffle incentive (Track D audit root cause #1); the
+    grace removes the tax exactly during recovery. With no grace source
+    configured this is identical to ``action_smoothness_factory``.
+
+    Args:
+        weight: Reward weight (typically negative).
+
+    Returns:
+        MdpComponent configured for the graced action smoothness reward.
+    """
+    from protomotions.envs.rewards import compute_action_smoothness_graced
+
+    return MdpComponent(
+        compute_func=compute_action_smoothness_graced,
+        dynamic_vars={
+            "current_processed_action": EnvContext.current_processed_action,
+            "previous_processed_action": EnvContext.previous_processed_action,
+            "perturbation_grace_mask": EnvContext.perturbation_grace_mask,
+        },
+        static_params={"weight": weight},
+    )
+
+
 def gt_rew_factory(weight: float = 0.5, coefficient: float = -100.0) -> MdpComponent:
     """Factory for position tracking reward.
 

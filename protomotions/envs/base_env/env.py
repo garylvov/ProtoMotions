@@ -1116,6 +1116,13 @@ class BaseEnv:
             # Per-episode odometer corruption parameters
             odom_scale=self.odom_scale,
             odom_yaw_cos_sin=self.odom_yaw_cos_sin,
+            # Track D action-rate grace mask from the perturbation schedulers
+            # (None when no grace source is configured).
+            perturbation_grace_mask=(
+                self.simulator.get_action_rate_grace_mask()
+                if hasattr(self.simulator, "get_action_rate_grace_mask")
+                else None
+            ),
         )
 
         # Controllers populate their task-specific views

@@ -339,6 +339,29 @@ class MimicADD(AMP):
         # Cache the differential width so expert (zero) samples can be built
         # without re-deriving it from env internals (see get_expert_disc_obs).
         self._tracking_diff_dim = int(tracking_diff_obs.shape[-1])
+
+        # Track D observability: accumulate per-channel |feature| (PRE disc
+        # normalizer, post-scaling) + the grace-mask fraction for the
+        # per-epoch disc-input / grace TB scalars (cheap: one abs-mean per
+        # collection step).
+        with torch.no_grad():
+            absmean = tracking_diff_obs.detach().abs().mean(dim=0)
+            acc = getattr(self, "_diff_absmean_acc", None)
+            if acc is None or acc.shape != absmean.shape:
+                self._diff_absmean_acc = absmean.clone()
+                self._diff_absmean_n = 1
+            else:
+                self._diff_absmean_acc += absmean
+                self._diff_absmean_n += 1
+            grace_fn = getattr(self.env.simulator, "get_action_rate_grace_mask", None)
+            if grace_fn is not None:
+                mask = grace_fn()
+                if mask is not None:
+                    self._grace_frac_acc = (
+                        getattr(self, "_grace_frac_acc", 0.0)
+                        + float(mask.float().mean())
+                    )
+                    self._grace_frac_n = getattr(self, "_grace_frac_n", 0) + 1
         return obs
 
     # -----------------------------
@@ -355,7 +378,95 @@ class MimicADD(AMP):
             self._add_dr_force_logging(training_log_dict)
         except Exception as exc:  # noqa: BLE001
             log.debug("dr force logging skipped: %s", exc)
+        try:
+            self._add_disc_input_group_logging(training_log_dict)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("disc input group logging skipped: %s", exc)
         super().post_epoch_logging(training_log_dict)
+
+    _DIFF_GROUP_PATTERNS = (
+        ("wrists", r".*_wrist_yaw_link"),
+        ("wrist_aux", r".*_wrist_(roll|pitch)_link"),
+        ("head", r".*head.*"),
+        ("feet", r".*_ankle_roll_link"),
+    )
+
+    def _diff_channel_group_indices(self, dim: int):
+        """Channel index lists per body group over the diff layout (cached)."""
+        cached = getattr(self, "_diff_group_idx_cache", None)
+        if cached is not None and cached[0] == dim:
+            return cached[1]
+        names = self._env_body_names()
+        if names is None:
+            return None
+        b = len(names)
+        layout_dim = 1 + 3 * (b - 1) + 6 * b + 3 * b + 3 * b
+        appended = dim - layout_dim
+        if appended < 0:
+            return None
+
+        def group_of(name):
+            for gname, pat in self._DIFF_GROUP_PATTERNS:
+                if re.search(pat, name):
+                    return gname
+            return "other"
+
+        groups = ["other"]  # root_h
+        for n in names[1:]:
+            groups += [group_of(n)] * 3
+        for block in (6, 3, 3):
+            for n in names:
+                groups += [group_of(n)] * block
+        groups += ["appended_root"] * appended
+        idx = {}
+        for i, g in enumerate(groups):
+            idx.setdefault(g, []).append(i)
+        idx = {g: torch.tensor(ii, dtype=torch.long) for g, ii in idx.items()}
+        self._diff_group_idx_cache = (dim, idx)
+        return idx
+
+    def _add_disc_input_group_logging(self, training_log_dict):
+        """Per-body-group disc-input |feature| PRE and POST normalizer.
+
+        The continuously-logged saliency curve: pre-normalizer group means
+        show the scaled raw error magnitudes; post-normalizer (pre / running
+        sigma) shows what the discriminator effectively sees — i.e. how much
+        of the wrists-3x bias the running normalizer has absorbed so far.
+        """
+        acc = getattr(self, "_diff_absmean_acc", None)
+        n = getattr(self, "_diff_absmean_n", 0)
+        if acc is None or n == 0:
+            return
+        pre = acc / n
+        self._diff_absmean_acc = None
+        self._diff_absmean_n = 0
+        idx = self._diff_channel_group_indices(pre.shape[0])
+        if idx is None:
+            return
+        # Disc running normalizer sigma (post = pre / sigma).
+        sigma = None
+        try:
+            sd = self.model.state_dict()
+            var = sd.get("_discriminator.models.0.norm.running_obs_norm.var")
+            if var is not None and var.shape == pre.shape:
+                sigma = torch.sqrt(var.to(pre.device) + 1e-5)
+        except Exception:  # noqa: BLE001
+            sigma = None
+        for g, ii in idx.items():
+            ii = ii.to(pre.device)
+            training_log_dict[f"disc_input/{g}_absmean_pre"] = float(
+                pre[ii].mean())
+            if sigma is not None:
+                training_log_dict[f"disc_input/{g}_absmean_post"] = float(
+                    (pre[ii] / sigma[ii]).mean())
+        # Grace-window activation fraction (action-rate suspension).
+        gn = getattr(self, "_grace_frac_n", 0)
+        if gn > 0:
+            training_log_dict["dr_force/action_rate_grace_frac"] = (
+                getattr(self, "_grace_frac_acc", 0.0) / gn
+            )
+            self._grace_frac_acc = 0.0
+            self._grace_frac_n = 0
 
     def _add_reward_economics_logging(self, training_log_dict):
         """Per-term reward magnitudes vs the dominant (disc) term.
