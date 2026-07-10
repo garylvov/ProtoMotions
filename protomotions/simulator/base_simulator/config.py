@@ -581,6 +581,18 @@ class WrenchDomainRandomizationConfig:
             )
         },
     )
+    all_bodies_prob: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "Per-event probability that ALL candidate bodies are loaded "
+                "TOGETHER, with the sampled magnitude split equally across "
+                "them (two-hand drag/pull posture); otherwise one body is "
+                "chosen as usual. Ignored with independent_bodies=True. "
+                "0.0 (default) = previous behavior."
+            )
+        },
+    )
     action_rate_grace: bool = field(
         default=False,
         metadata={
@@ -590,6 +602,17 @@ class WrenchDomainRandomizationConfig:
                 "suspended for the affected envs (see "
                 "Simulator.get_action_rate_grace_mask and the graced action-"
                 "smoothness reward). Default False = no grace contribution."
+            )
+        },
+    )
+    action_rate_grace_ramp_in_only: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Grace the action-rate penalty ONLY during the ramp-in (load "
+                "onset / load-shift) of this class's events, not the plateau "
+                "(steady carrying/pulling should stay smooth). Implies grace "
+                "even when action_rate_grace is False."
             )
         },
     )
@@ -642,6 +665,8 @@ class WrenchDomainRandomizationConfig:
                 raise ValueError(f"{name} values must be non-negative.")
             if rng[0] > rng[1]:
                 raise ValueError(f"{name}[0] must be <= {name}[1].")
+        if not (0.0 <= self.all_bodies_prob <= 1.0):
+            raise ValueError("all_bodies_prob must be in [0, 1].")
         if self.direction_mode not in ("uniform", "horizontal", "downward"):
             raise ValueError(
                 "direction_mode must be one of 'uniform', 'horizontal', 'downward'."
@@ -825,6 +850,18 @@ class DomainRandomizationConfig:
                 "SUMMED before the single backend application call (backends "
                 "overwrite, they do not accumulate). Default None = off; existing "
                 "configs and checkpoints are unaffected."
+            )
+        },
+    )
+    additional_wrenches: List[WrenchDomainRandomizationConfig] = field(
+        default_factory=list,
+        metadata={
+            "help": (
+                "Extra independent wrench/persistent-force classes beyond the "
+                "two named slots (Track D 2026-07-10: e.g. wrist DRAG pulls "
+                "alongside chest forces and wrist payloads). Each entry runs "
+                "its own scheduler; all classes' forces are SUMMED before the "
+                "single backend application call. Default empty = off."
             )
         },
     )

@@ -442,3 +442,62 @@ def test_diff_feature_scales_applied_and_dormant_by_default(monkeypatch):
     agent.add_agent_info_to_obs({})
     expert = agent.get_expert_disc_obs(2)
     assert torch.equal(expert["mimic_target_poses_diff"], torch.zeros(2, total))
+
+
+def test_translation_probe_root_relative_frame_fix(monkeypatch):
+    """PERMANENT frame probe (plan 'ADD paper faithfulness' flag 1, fixed
+    2026-07-10): a pure 0.5 m root translation must read ~0 in every
+    body-position diff channel when root_relative_position_diff=True, while
+    the xy/heading reward inputs still respond. The stock path (flag off)
+    reads the translation at FULL magnitude in every channel — the
+    numerically-verified world-frame leak this flag exists to fix."""
+    num_envs = 1
+    body_names = ["pelvis", "left_wrist_yaw_link", "left_foot"]
+    b = len(body_names)
+    cur_pos = torch.tensor([[[0.0, 0.0, 1.0], [0.3, 0.2, 1.2], [0.1, 0.0, 0.05]]])
+    t = torch.tensor([0.5, 0.0, 0.0])
+    ref_pos = cur_pos + t  # pure whole-body (root) translation
+
+    def build(config):
+        agent = MimicADD.__new__(MimicADD)
+        agent.env = _mini_env(ref_pos, cur_pos, body_names, num_envs)
+        agent.num_envs = num_envs
+        if config is not None:
+            agent.config = config
+        return agent
+
+    monkeypatch.setattr(agent_add.AMP, "add_agent_info_to_obs", lambda self, obs: obs)
+    # Layout-faithful fake pos block: [root_h | world body pos 1..B-1].
+    monkeypatch.setattr(
+        agent_add,
+        "compute_humanoid_max_coords_observations",
+        lambda body_pos, ground_height, **kwargs: torch.cat(
+            [body_pos[:, 0, 2:3], body_pos[:, 1:].reshape(num_envs, -1)], dim=-1
+        ),
+    )
+
+    # STOCK path: translation appears at FULL magnitude in every channel.
+    stock = build(None).add_agent_info_to_obs({})["mimic_target_poses_diff"]
+    torch.testing.assert_close(stock[0, 1:4], torch.tensor([0.5, 0.0, 0.0]))
+    torch.testing.assert_close(stock[0, 4:7], torch.tensor([0.5, 0.0, 0.0]))
+
+    # FIXED path: body-pos channels read ~0 (root-relative).
+    fixed = build(
+        SimpleNamespace(root_relative_position_diff=True)
+    ).add_agent_info_to_obs({})["mimic_target_poses_diff"]
+    torch.testing.assert_close(fixed[0, 1:7], torch.zeros(6))
+
+    # The drift pressure channels still respond to the same translation:
+    feats = compute_root_displacement_features(
+        ref_root_pos=ref_pos[:, 0],
+        ref_root_rot=torch.tensor([[0.0, 0.0, 0.0, 1.0]]),
+        current_root_pos=cur_pos[:, 0],
+        current_root_rot=torch.tensor([[0.0, 0.0, 0.0, 1.0]]),
+    )
+    torch.testing.assert_close(feats[0, :2], torch.tensor([0.5, 0.0]))
+    from protomotions.envs.rewards.tracking import (
+        compute_root_xy_displacement_rew,
+    )
+    r = compute_root_xy_displacement_rew(
+        cur_pos[:, 0], ref_pos, coefficient=-20.0)
+    assert float(r[0]) < 0.1, "xy task kernel penalizes the drift"

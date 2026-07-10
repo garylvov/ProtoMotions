@@ -349,3 +349,58 @@ def test_push_grace_countdown_and_reset():
     Simulator._reset_wrench_randomization(host, torch.tensor([1]))
     mask = Simulator.get_action_rate_grace_mask(host)
     assert not bool(mask[1])
+
+
+def test_all_bodies_prob_two_hand_split_and_ramp_in_only_grace():
+    """Drag family mechanics: two-hand events split the sampled magnitude
+    across all candidate bodies; ramp-in-only grace covers ONLY the onset."""
+    torch.manual_seed(7)
+    cfg = _ramped_cfg(
+        body_names=["lw", "rw"],
+        force_magnitude_range=(120.0, 120.0),
+        all_bodies_prob=1.0,           # force the two-hand branch
+        action_rate_grace_ramp_in_only=True,
+        action_rate_grace=False,
+    )
+    host = _Host(wrench_cfg=cfg, num_envs=4)
+    host._init_wrench_randomization()
+    host._push_grace_steps = 0
+    sched = host._wrench_scheds[0]
+
+    saw_split, saw_onset_grace, saw_plateau_ungraced = False, False, False
+    for _ in range(int(3.0 / host.dt)):
+        host._update_wrench_randomization()
+        mask = Simulator.get_action_rate_grace_mask(host)
+        if bool(sched["active"][0]):
+            tgt = sched["target_forces"][0]
+            mags = tgt.norm(dim=-1)
+            loaded = (mags > 1.0).sum()
+            if int(loaded) == 2:
+                # Split: each hand carries half the sampled 120 N.
+                torch.testing.assert_close(
+                    mags[mags > 1.0],
+                    torch.full((2,), 60.0), atol=1e-3, rtol=0)
+                saw_split = True
+            t_rel = float(sched["time"][0] - sched["start_time"][0])
+            in_ramp_in = t_rel < float(sched["ramp_in"][0])
+            if in_ramp_in and bool(mask[0]):
+                saw_onset_grace = True
+            if not in_ramp_in and mask is not None and not bool(mask[0]):
+                saw_plateau_ungraced = True
+    assert saw_split, "two-hand split events occur"
+    assert saw_onset_grace, "grace ON during load onset ramp"
+    assert saw_plateau_ungraced, "grace OFF during plateau (ramp-in-only)"
+
+
+def test_additional_wrenches_slot_schedules():
+    """The additional_wrenches list creates its own scheduler entries."""
+    torch.manual_seed(8)
+    chest = _ramped_cfg()
+    drag = _ramped_cfg(body_names=["lw", "rw"], all_bodies_prob=0.5)
+    host = _Host(wrench_cfg=chest, num_envs=2)
+    host.config.domain_randomization.additional_wrenches = [drag]
+    host._init_wrench_randomization()
+    assert len(host._wrench_scheds) == 2
+    for _ in range(int(2.0 / host.dt)):
+        host._update_wrench_randomization()
+    assert any(bool(s["active"].any()) for s in host._wrench_scheds)

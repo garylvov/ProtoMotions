@@ -51,6 +51,19 @@ class AMPParametersConfig:
         default=5.0,
         metadata={"help": "Gradient penalty coefficient for discriminator stability.", "min": 0.0}
     )
+    gp_on_agent_samples: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Apply the gradient penalty to the NEGATIVE (agent) samples "
+                "instead of the positive/expert samples. Paper-faithful for "
+                "ADD (arXiv 2505.04961 Eq. 8-9: GP on negatives because ADD "
+                "has a single positive sample; Fig. 9 ablation puts Pos-only "
+                "in the same failure tier as no-GP). Default False = stock "
+                "ProtoMotions expert-side placement."
+            )
+        },
+    )
     discriminator_optimization_ratio: int = field(
         default=1,
         metadata={"help": "Ratio of discriminator updates to policy updates.", "min": 1}
@@ -168,6 +181,23 @@ class AMPAgentConfig(PPOAgentConfig):
                 "the FULL world-frame error (root displacement included); "
                 "all other bodies get root-stripped (articulation-relative) "
                 "position diffs. None = stock diff computation."
+            )
+        },
+    )
+    root_relative_position_diff: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "MimicADD only (Track D frame fix 2026-07-10, dormant by "
+                "default): strip ROOT TRANSLATION from the body-position "
+                "channels of mimic_target_poses_diff (positions become "
+                "root-relative, matching the ADD paper's root-local joint "
+                "positions, arXiv 2505.04961 §5.1). The stock world-frame "
+                "path leaks root drift into EVERY body-pos channel (verified "
+                "numerically 2026-07-10). Rotation/velocity channels are "
+                "untouched (heading stays represented). Bodies listed in "
+                "global_diff_bodies keep world-frame diffs even when this "
+                "is set."
             )
         },
     )

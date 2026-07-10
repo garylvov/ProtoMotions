@@ -521,12 +521,21 @@ class AMPTrainingComponent:
         }
 
     def discriminator_step(self, batch_dict):
+        gp_on_agent = getattr(
+            self.config.amp_parameters, "gp_on_agent_samples", False
+        )
         agent_obs = {}
         for key in batch_dict.keys():
             if "agent_" in key:
-                agent_obs[key.replace("agent_", "")] = batch_dict[key][
+                val = batch_dict[key][
                     : self.config.amp_parameters.discriminator_batch_size
                 ]
+                if gp_on_agent and val.is_floating_point():
+                    # Negative-sample GP (ADD paper placement): grads must
+                    # flow to the agent inputs. Clone so the flag never
+                    # leaks onto the shared batch tensors.
+                    val = val.clone().requires_grad_(True)
+                agent_obs[key.replace("agent_", "")] = val
         replay_obs = {}
         for key in batch_dict.keys():
             if "replay_" in key:
@@ -594,10 +603,25 @@ class AMPTrainingComponent:
             negative_loss = 0.5 * (unlabeled_loss + replay_loss)
         class_loss = 0.5 * (expert_loss + negative_loss)
 
+        # Gradient-penalty placement (Track D 2026-07-10): stock ProtoMotions
+        # penalizes the POSITIVE/expert samples (AMP convention, Peng et
+        # al.); the ADD paper (arXiv 2505.04961 Eq. 8-9, Fig. 9 ablation)
+        # applies it to the NEGATIVE samples because ADD has a single
+        # positive — Pos-only lands in the same failure tier as no-GP there.
+        # getattr: configs pickled before the field existed keep loading.
+        if gp_on_agent:
+            gp_logits = agent_logits
+            gp_inputs = [
+                agent_obs_td[key]
+                for key in self.discriminator.module._grad_penalty_keys
+            ]
+        else:
+            gp_logits = expert_logits
+            gp_inputs = expert_norm_obs
         disc_grads = torch.autograd.grad(
-            expert_logits,
-            expert_norm_obs,
-            grad_outputs=torch.ones_like(expert_logits),
+            gp_logits,
+            gp_inputs,
+            grad_outputs=torch.ones_like(gp_logits),
             create_graph=True,
             retain_graph=True,
             only_inputs=True,
@@ -609,7 +633,7 @@ class AMPTrainingComponent:
                 for g in disc_grads
                 if g is not None
             ),
-            torch.zeros(expert_logits.shape[0], device=expert_logits.device),
+            torch.zeros(gp_logits.shape[0], device=gp_logits.device),
         )
         disc_grad_penalty = torch.mean(disc_grad_norm)
         grad_loss = (

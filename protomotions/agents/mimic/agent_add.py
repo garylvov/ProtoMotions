@@ -289,20 +289,31 @@ class MimicADD(AMP):
         tracking_diff_obs = ref_pose - current_pose
         tracking_diff_obs = tracking_diff_obs.view(self.num_envs, -1)
 
-        if self._global_diff_bodies:
-            # A/B option (default OFF): rebuild the body-position diff block
-            # so the listed bodies keep the FULL world-frame position error
-            # (root displacement included — drift + articulation together),
-            # while every other body is root-stripped (articulation-relative
-            # error only). Layout: the pos block covers bodies 1..B-1 at
-            # channels [1 : 1+3*(B-1)].
+        root_relative = bool(
+            getattr(getattr(self, "config", None), "root_relative_position_diff", False)
+        )
+        if root_relative or self._global_diff_bodies:
+            # Track D FRAME FIX (2026-07-10): the stock max-coords diff keeps
+            # body positions in the WORLD frame (verified numerically: a pure
+            # 0.5 m root translation appears at full magnitude in every
+            # body-pos diff channel), so root drift leaks into all position
+            # channels. With root_relative_position_diff=True the pos block
+            # is rebuilt ROOT-RELATIVE (ADD paper §5.1: joint positions in
+            # the character's local frame; drift pressure then lives in the
+            # xy/heading task kernels — no double counting). Bodies listed in
+            # global_diff_bodies (A/B) keep the world-frame error. Layout:
+            # the pos block covers bodies 1..B-1 at channels [1 : 1+3*(B-1)].
             ref_pos = ref_state_gt
             cur_pos = current_state.rigid_body_pos.reshape(self.num_envs, -1, 3)
             num_bodies = cur_pos.shape[1]
-            mask = self._global_diff_body_mask(num_bodies, cur_pos.device)
             glob_diff = ref_pos - cur_pos
             rel_diff = (ref_pos - ref_pos[:, :1]) - (cur_pos - cur_pos[:, :1])
-            pos_diff = torch.where(mask.view(1, -1, 1), glob_diff, rel_diff)
+            if self._global_diff_bodies:
+                # Listed bodies world-frame; everything else root-relative.
+                mask = self._global_diff_body_mask(num_bodies, cur_pos.device)
+                pos_diff = torch.where(mask.view(1, -1, 1), glob_diff, rel_diff)
+            else:
+                pos_diff = rel_diff
             pos_block_end = 1 + 3 * (num_bodies - 1)
             assert tracking_diff_obs.shape[-1] >= pos_block_end, (
                 tracking_diff_obs.shape, num_bodies

@@ -381,6 +381,11 @@ class Simulator(RecordingMixin, ABC):
                 cfg = getattr(dr, attr, None)
                 if cfg is not None and cfg.has_wrench():
                     cfgs.append(cfg)
+            # Extra classes (Track D: e.g. wrist drag); getattr keeps
+            # pre-field pickles loading.
+            for cfg in getattr(dr, "additional_wrenches", None) or []:
+                if cfg is not None and cfg.has_wrench():
+                    cfgs.append(cfg)
 
         self._wrench_enabled = len(cfgs) > 0
         if not self._wrench_enabled:
@@ -622,6 +627,23 @@ class Simulator(RecordingMixin, ABC):
                 sched["target_torques"][due_ids] = 0.0
                 sched["target_forces"][due_ids, body_choice] = forces
                 sched["target_torques"][due_ids, body_choice] = torques
+                # Two-hand posture (Track D drag): with all_bodies_prob, some
+                # events load ALL candidate bodies together, the sampled
+                # magnitude split equally across them.
+                all_p = getattr(cfg, "all_bodies_prob", 0.0) or 0.0
+                if all_p > 0.0 and len(sched["cols"]) > 1:
+                    all_mask = (
+                        torch.rand(num_due, device=self.device) < all_p
+                    )
+                    if all_mask.any():
+                        ids = due_ids[all_mask]
+                        per_f = forces[all_mask] / len(sched["cols"])
+                        per_t = torques[all_mask] / len(sched["cols"])
+                        sched["target_forces"][ids] = 0.0
+                        sched["target_torques"][ids] = 0.0
+                        for col in sched["cols"]:
+                            sched["target_forces"][ids, col] = per_f
+                            sched["target_torques"][ids, col] = per_t
                 dur_min, dur_max = cfg.duration_range
                 durations = (
                     torch.rand(num_due, device=self.device) * (dur_max - dur_min)
@@ -706,12 +728,22 @@ class Simulator(RecordingMixin, ABC):
             pieces.append(self._push_grace_left > 0)
         if getattr(self, "_wrench_enabled", False):
             for sched in self._wrench_scheds:
-                if not getattr(sched["cfg"], "action_rate_grace", False):
+                cfg = sched["cfg"]
+                ramp_in_only = getattr(cfg, "action_rate_grace_ramp_in_only", False)
+                if not (getattr(cfg, "action_rate_grace", False) or ramp_in_only):
                     continue
                 in_event = sched["active"] & torch.isfinite(sched["end_time"])
-                # ramp-in + plateau only: before end_time - ramp_out.
-                pre_ease_out = sched["time"] < (sched["end_time"] - sched["ramp_out"])
-                pieces.append(in_event & pre_ease_out)
+                if ramp_in_only:
+                    # Load onset / load-shift only: grace during the ramp-in;
+                    # steady carrying/pulling stays taxed.
+                    t_rel = sched["time"] - sched["start_time"]
+                    pieces.append(in_event & (t_rel < sched["ramp_in"]))
+                else:
+                    # ramp-in + plateau: before end_time - ramp_out.
+                    pre_ease_out = sched["time"] < (
+                        sched["end_time"] - sched["ramp_out"]
+                    )
+                    pieces.append(in_event & pre_ease_out)
         if not pieces:
             return None
         mask = pieces[0]
