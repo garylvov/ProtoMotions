@@ -522,6 +522,70 @@ class WrenchDomainRandomizationConfig:
             )
         },
     )
+    # ---- Ramped persistent forces (Track D 2026-07-10). Defaults preserve
+    # the previous step-profile behavior exactly. ----
+    ramp_in_range: Tuple[float, float] = field(
+        default=(0.0, 0.0),
+        metadata={
+            "help": (
+                "Range (min, max) seconds of cosine ease-IN before the hold "
+                "phase. (0, 0) = instant onset (previous behavior). Sampled "
+                "per event per env; total event = ramp_in + hold(duration_"
+                "range) + ramp_out."
+            )
+        },
+    )
+    ramp_out_range: Tuple[float, float] = field(
+        default=(0.0, 0.0),
+        metadata={
+            "help": (
+                "Range (min, max) seconds of cosine ease-OUT after the hold "
+                "phase. (0, 0) = instant release (previous behavior)."
+            )
+        },
+    )
+    direction_mode: str = field(
+        default="uniform",
+        metadata={
+            "help": (
+                "Force direction sampling: 'uniform' = uniform on the sphere "
+                "(previous behavior); 'horizontal' = mostly horizontal (z "
+                "shrunk 4x before normalization — chest persistent forces); "
+                "'downward' = PAYLOAD: full sampled magnitude locked to "
+                "constant -z (payload weight) plus a small horizontal "
+                "component (10-18% of magnitude, constant per event = "
+                "temporally-correlated bag swing/inertia)."
+            )
+        },
+    )
+    independent_bodies: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "When True, EVERY body in body_names gets its own independent "
+                "per-env scheduler (events overlap: sometimes one body loaded, "
+                "sometimes several — asymmetric and full carries). False "
+                "(default) = one body chosen per event (previous behavior)."
+            )
+        },
+    )
+    magnitude_scale: float = field(
+        default=1.0,
+        metadata={
+            "help": (
+                "STAGE-SCALE knob: global multiplier on every sampled force "
+                "AND torque magnitude of this wrench class (applied after "
+                "direction/magnitude sampling; 0.0 silences the class without "
+                "disabling its scheduler). Exists so the DR curriculum "
+                "ladder's stage patcher can ramp a family by rewriting ONE "
+                "scalar in resolved_configs.pt (same mechanism as the other "
+                "DR stage patches). Track D teacher schedule: chest "
+                "0 -> 1/3 -> 2/3 -> 1 of the 120 N cap; wrist payload "
+                "0 -> 25 -> 50 -> 75 -> 98 N per hand (= scale of the 98 N "
+                "cap). 1.0 (default) = configured ranges apply unscaled."
+            )
+        },
+    )
 
     def __post_init__(self):
         for name, rng in (
@@ -546,6 +610,20 @@ class WrenchDomainRandomizationConfig:
             )
         if not (0.0 <= self.persistent_fraction <= 1.0):
             raise ValueError("persistent_fraction must be in [0, 1].")
+        for name, rng in (
+            ("ramp_in_range", self.ramp_in_range),
+            ("ramp_out_range", self.ramp_out_range),
+        ):
+            if rng[0] < 0 or rng[1] < 0:
+                raise ValueError(f"{name} values must be non-negative.")
+            if rng[0] > rng[1]:
+                raise ValueError(f"{name}[0] must be <= {name}[1].")
+        if self.direction_mode not in ("uniform", "horizontal", "downward"):
+            raise ValueError(
+                "direction_mode must be one of 'uniform', 'horizontal', 'downward'."
+            )
+        if self.magnitude_scale < 0.0:
+            raise ValueError("magnitude_scale must be non-negative.")
 
     def has_wrench(self) -> bool:
         """Check if any wrench magnitude is configured (non-zero)."""
