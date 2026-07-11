@@ -128,6 +128,11 @@ class MockContext:
         import torch
 
         self.current = _MockState(num_envs, num_dofs, num_bodies, anchor_idx)
+        # noisy.*: observation-noise view of the robot state. At inference the
+        # noise is unconfigured, so the noisy view aliases the clean tensors
+        # (see protomotions.envs.obs.observation_noise.NoisyObservations) --
+        # the same alias is correct for export tracing.
+        self.noisy = self.current
         self.mimic   = _MockMimic(num_envs, num_future_steps, num_dofs, num_bodies)
         self.historical = _MockHistorical(num_envs, history_steps, num_dofs)
         # body_contacts: used by max_coords_obs observe_contacts
