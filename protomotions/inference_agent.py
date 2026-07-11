@@ -377,6 +377,21 @@ def main():
         app_launcher = AppLauncher(app_launcher_flags)
         simulator_extra_params["simulation_app"] = app_launcher.app
 
+    if args.simulator == "newton":
+        # Newton's SolverMuJoCo auto-enables a CUDA graph capture path whenever
+        # wp.is_mempool_enabled() is True (see simulator/newton/simulator.py). On some
+        # GPU/driver combos that capture hangs indefinitely at "Using CUDA graph
+        # (BUILT_IN_PD)" with no error and no progress. Disabling the mempool makes
+        # Newton skip CUDA graphs entirely, trading some perf for actually completing.
+        import warp as wp
+
+        wp.init()
+        wp.set_mempool_enabled(wp.get_device(), False)
+        print(
+            "[imprint] Disabled CUDA mempool for the newton simulator (skips a CUDA "
+            "graph capture path that hangs on some GPU/driver combos)."
+        )
+
     # Convert friction for simulator compatibility
     from protomotions.simulator.base_simulator.utils import (
         convert_friction_for_simulator,
