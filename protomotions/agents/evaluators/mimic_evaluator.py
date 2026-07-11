@@ -91,7 +91,15 @@ class MimicEvaluator(BaseEvaluator):
         Args:
             failed_motions: List of motion IDs that failed tracking
             epoch: Current epoch number
+
+        Note:
+            When the motion lib is rank-sharded (MOTION_LIB_SHARD_PER_RANK=1),
+            IDs are translated from shard-local to GLOBAL pack IDs before
+            writing, so the files stay meaningful across ranks and runs.
         """
+        if getattr(self.motion_lib, "sharded_across_ranks", False):
+            gids = self.motion_lib.global_motion_ids
+            failed_motions = [int(gids[m].item()) for m in failed_motions]
         filename = f"failed_motions_epoch_{epoch}_rank_{self.fabric.global_rank}.txt"
         self._save_list_to_file(failed_motions, filename, subdirectory="failed_motions")
 

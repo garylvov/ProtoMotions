@@ -309,6 +309,64 @@ class CenterOfMassDomainRandomizationConfig:
 
 
 @dataclass
+class MassScaleDomainRandomizationConfig:
+    """Configuration for robot body-mass scale domain randomization (MASS-DR).
+
+    Gary directive 2026-07-10: a computer + gear will be mounted on the robot,
+    so the MAIN BODY mass runs up to ~1.3x spec. Samples a per-env
+    MULTIPLICATIVE mass scale for the configured bodies (typically the torso
+    link) from ``mass_scale_range`` and, optionally, a small independent
+    multiplier for ALL links from ``all_links_scale_range`` (manufacturing /
+    model-error spread). Multipliers COMPOSE on the configured main bodies.
+
+    Applied once after robot creation (per-env static assignment — a mounted
+    computer is a permanent condition, not a per-episode event; across
+    thousands of envs the population covers the range densely). Uses the
+    PhysX articulation view mass API (``get_masses``/``set_masses``) that was
+    unavailable when the heavydr/superdr recipes were written (their
+    docstrings list per-link mass as an unavailable axis).
+    """
+
+    mass_scale_range: Tuple[float, float] = field(
+        default=(1.0, 1.3),
+        metadata={
+            "help": "Multiplicative mass-scale range (min, max) for the main bodies."
+        },
+    )
+    body_names: Optional[List[str]] = field(
+        default=None,
+        metadata={"help": "Main-body names to scale (e.g. ['torso_link'])."},
+    )
+    body_indices: Optional[List[int]] = field(
+        default=None, metadata={"help": "Main-body indices to scale."}
+    )
+    all_links_scale_range: Optional[Tuple[float, float]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional independent multiplicative range applied to EVERY "
+                "link (e.g. (0.95, 1.05)); None = main bodies only."
+            )
+        },
+    )
+
+    def __post_init__(self):
+        if self.body_names is None and self.body_indices is None:
+            raise ValueError("Either body_names or body_indices must be provided.")
+        if self.body_names is not None and self.body_indices is not None:
+            raise ValueError("Only one of body_names or body_indices must be provided.")
+        for name, rng in (
+            ("mass_scale_range", self.mass_scale_range),
+            ("all_links_scale_range", self.all_links_scale_range),
+        ):
+            if rng is None:
+                continue
+            lo, hi = rng
+            if not (0.0 < lo <= hi):
+                raise ValueError(f"{name} must satisfy 0 < min <= max, got {rng}.")
+
+
+@dataclass
 class RobotNoiseConfig:
     """Configuration for robot state noise.
 
@@ -850,6 +908,18 @@ class DomainRandomizationConfig:
                 "SUMMED before the single backend application call (backends "
                 "overwrite, they do not accumulate). Default None = off; existing "
                 "configs and checkpoints are unaffected."
+            )
+        },
+    )
+    mass_scale: Optional[MassScaleDomainRandomizationConfig] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Robot body-mass scale DR (MASS-DR, Gary 2026-07-10: mounted "
+                "computer/gear -> main-body mass up to 1.3x spec). Per-env "
+                "multiplicative scales applied once after robot creation. "
+                "Default None = off; read via getattr(dr, 'mass_scale', None) "
+                "for pre-field pickles."
             )
         },
     )

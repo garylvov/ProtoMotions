@@ -505,6 +505,54 @@ class IsaacLabSimulator(Simulator):
             # Set the new COMs.
             self._robot.root_physx_view.set_coms(coms, all_env_ids)
 
+        if (
+            self._domain_randomization is not None
+            and "mass_scale" in self._domain_randomization
+        ):
+            # MASS-DR (Gary 2026-07-10): per-env multiplicative body-mass
+            # scales, applied once after robot creation via the PhysX
+            # articulation-view mass API. get_masses returns [num_envs,
+            # num_links] in the PhysX link order; robot-config body indices
+            # are remapped through find_bodies (the friction path's safe
+            # pattern — the two orderings are NOT guaranteed identical).
+            mass_dr = self._domain_randomization["mass_scale"]
+            masses = self._robot.root_physx_view.get_masses().clone()
+            default_masses = masses.clone()
+
+            if mass_dr.get("all_links_scales") is not None:
+                # All-links multiplier, sampled in robot-config body order ->
+                # remap to PhysX link order.
+                cfg_body_names = self.robot_config.kinematic_info.body_names
+                lab_ids, _ = self._robot.find_bodies(
+                    cfg_body_names, preserve_order=True
+                )
+                masses[:, lab_ids] *= mass_dr["all_links_scales"].to(masses.device)
+
+            main_body_names = [
+                self.robot_config.kinematic_info.body_names[i]
+                for i in mass_dr["body_indices"]
+            ]
+            main_lab_ids, _ = self._robot.find_bodies(
+                main_body_names, preserve_order=True
+            )
+            masses[:, main_lab_ids] *= mass_dr["scales"].to(masses.device)
+
+            self._robot.root_physx_view.set_masses(masses, all_env_ids)
+
+            before = default_masses[:, main_lab_ids].mean().item()
+            after_t = masses[:, main_lab_ids]
+            total_before = default_masses.sum(dim=-1)
+            total_after = masses.sum(dim=-1)
+            print(
+                f"[mass-dr] applied: main_bodies={main_body_names} "
+                f"default_mass={before:.3f} kg -> scaled mean/min/max="
+                f"{after_t.mean().item():.3f}/{after_t.min().item():.3f}/"
+                f"{after_t.max().item():.3f} kg; total robot mass "
+                f"mean/min/max={total_after.mean().item():.3f}/"
+                f"{total_after.min().item():.3f}/{total_after.max().item():.3f} kg "
+                f"(default {total_before.mean().item():.3f} kg)"
+            )
+
         self._apply_scene_object_properties_after_spawn(all_env_ids)
 
     def _apply_scene_object_properties_after_spawn(

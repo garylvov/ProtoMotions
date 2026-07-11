@@ -1215,6 +1215,123 @@ def fall_penalty_factory(
     )
 
 
+def hold_balance_bonus_factory(
+    weight: float = 0.0,
+    left_foot_body_ids: "Tensor" = None,
+    right_foot_body_ids: "Tensor" = None,
+    vel_coefficient: float = -4.0,
+    upright_coefficient: float = -10.0,
+) -> MdpComponent:
+    """Factory for the HOLD-FIX quiet-stance bonus (dormant).
+
+    Small positive reward paid ONLY during reference-still windows
+    (``EnvContext.reference_still_mask``, maintained by the env's HOLD-FIX
+    stillness tracker) for upright pelvis x both-feet-planted x low pelvis
+    velocity — Gary's balance spec: pays for BALANCING during holds, never
+    for zero actuation (no action term in the kernel). Injected by the env
+    when ``HOLD_BALANCE_BONUS=<float>`` is set; default ``weight=0.0`` =
+    dormant and not registered in any recipe.
+
+    Args:
+        weight: Reward weight (default 0.0 = dormant; positive to enable).
+        left_foot_body_ids: Long tensor of left-foot collision body indices.
+        right_foot_body_ids: Long tensor of right-foot collision body indices.
+        vel_coefficient: Exp coefficient on squared pelvis speed (negative).
+        upright_coefficient: Exp coefficient on squared pelvis tilt (negative).
+
+    Returns:
+        MdpComponent configured for the hold balance bonus.
+    """
+    from protomotions.envs.base_env.hold_fix import compute_hold_balance_bonus
+
+    return MdpComponent(
+        compute_func=compute_hold_balance_bonus,
+        dynamic_vars={
+            "reference_still_mask": EnvContext.reference_still_mask,
+            "root_rot": EnvContext.current.root_rot,
+            "root_vel": EnvContext.current.root_vel,
+            "sim_contacts": EnvContext.current.rigid_body_contacts,
+        },
+        static_params={
+            "weight": weight,
+            "left_foot_body_ids": left_foot_body_ids,
+            "right_foot_body_ids": right_foot_body_ids,
+            "vel_coefficient": vel_coefficient,
+            "upright_coefficient": upright_coefficient,
+            "zero_during_grace_period": True,
+        },
+    )
+
+
+def root_gain_rew_factory(weight: float = 0.0) -> MdpComponent:
+    """Factory for the ROOT-GAIN displacement-gain reward (dormant).
+
+    Routes the env-computed per-step root displacement-gain value
+    (``EnvContext.root_gain_reward``: windowed-displacement projected gain
+    ``clamp((dx_root_policy . dx_root_ref)/||dx_root_ref||^2, 0, 1)``, active
+    only where the reference root actually traveled) through the standard
+    reward plumbing. Pays for MATCHING the reference's progress in its
+    direction — matched progress 1.0, overshoot no bonus, backward 0.
+    Injected by the env when ``ROOT_GAIN_REWARD=<w>`` is set; default
+    ``weight=0.0`` = dormant. Targets the measured fwd_gain 0.464
+    displacement-undershoot axis (Gary 2026-07-10).
+
+    Args:
+        weight: Reward weight (default 0.0 = dormant; positive to enable;
+            suggested 0.03-0.05 vs the ~0.1/step disc scale — on locomotion
+            active_frac ~ 1 so the term pays up to its full weight/step;
+            0.03 respects the <=30%-of-dominant economics law, 0.05 is the
+            aggressive arm).
+
+    Returns:
+        MdpComponent configured for the root displacement-gain reward.
+    """
+    from protomotions.envs.base_env.hold_fix import passthrough_root_gain_reward
+
+    return MdpComponent(
+        compute_func=passthrough_root_gain_reward,
+        dynamic_vars={
+            "root_gain_reward": EnvContext.root_gain_reward,
+        },
+        static_params={
+            "weight": weight,
+            "zero_during_grace_period": True,
+        },
+    )
+
+
+def wrist_dir_rew_factory(weight: float = 0.0) -> MdpComponent:
+    """Factory for the WRIST-DIR direction-agreement reward (dormant).
+
+    Routes the env-computed per-step wrist direction-agreement value
+    (``EnvContext.wrist_dir_reward``, maintained by the env's WristDirTracker
+    — windowed-displacement cosine between policy and reference wrist travel,
+    relu-shaped, active only where the reference wrist moved) through the
+    standard reward plumbing. Injected by the env when
+    ``WRIST_DIR_REWARD=<w>`` is set; default ``weight=0.0`` = dormant and not
+    registered in any recipe. Targets the measured dir_cos 0.61 weak axis.
+
+    Args:
+        weight: Reward weight (default 0.0 = dormant; positive to enable;
+            suggested 0.03 vs the ~0.1/step disc scale).
+
+    Returns:
+        MdpComponent configured for the wrist direction-agreement reward.
+    """
+    from protomotions.envs.base_env.hold_fix import passthrough_wrist_dir_reward
+
+    return MdpComponent(
+        compute_func=passthrough_wrist_dir_reward,
+        dynamic_vars={
+            "wrist_dir_reward": EnvContext.wrist_dir_reward,
+        },
+        static_params={
+            "weight": weight,
+            "zero_during_grace_period": True,
+        },
+    )
+
+
 def target_reward_factory(
     weight: float = 1.0, pos_err_scale: float = 0.42
 ) -> MdpComponent:
@@ -1874,6 +1991,11 @@ __all__ = [
     # Track D big-step reward factories (OmniH2O-style, dormant)
     "max_feet_height_rew_factory",
     "step_displacement_rew_factory",
+    # HOLD-FIX factories (dormant; env-gated injection via base_env/hold_fix.py)
+    "fall_penalty_factory",
+    "hold_balance_bonus_factory",
+    "wrist_dir_rew_factory",
+    "root_gain_rew_factory",
     "mimic_tracking_rewards_factory",
     # Odometer observation factory
     "corrupted_xy_offset_factory",

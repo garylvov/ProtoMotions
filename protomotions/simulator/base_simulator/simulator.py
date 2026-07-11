@@ -1878,6 +1878,13 @@ class Simulator(RecordingMixin, ABC):
                     self.config.domain_randomization.object_assets
                 )
             )
+        # getattr: resolved-config pickles persisted before this field exist.
+        if getattr(self.config.domain_randomization, "mass_scale", None) is not None:
+            domain_randomization_dict["mass_scale"] = (
+                self._process_mass_scale_domain_randomization(
+                    self.config.domain_randomization.mass_scale
+                )
+            )
 
         return domain_randomization_dict
 
@@ -1990,6 +1997,59 @@ class Simulator(RecordingMixin, ABC):
 
         com_dict = {"body_indices": body_indices, "com": com}
         return com_dict
+
+    def _process_mass_scale_domain_randomization(
+        self, domain_randomization: "MassScaleDomainRandomizationConfig"
+    ) -> Dict[str, Any]:
+        """Sample per-env body-mass scale multipliers (MASS-DR).
+
+        Samples [num_envs, num_matching_bodies] main-body multipliers from
+        ``mass_scale_range`` and, when ``all_links_scale_range`` is set,
+        [num_envs, num_bodies] all-links multipliers. Backend apply paths
+        compose them multiplicatively on the default masses. Logs
+        ``[mass-dr]`` sample statistics for dump-verify.
+        """
+        body_indices = get_matching_indices(
+            self.robot_config.kinematic_info.body_names,
+            domain_randomization.body_names,
+            domain_randomization.body_indices,
+        )
+        num_matching_bodies = len(body_indices)
+        lo, hi = domain_randomization.mass_scale_range
+        scales = (
+            torch.rand(self.num_envs, num_matching_bodies) * (hi - lo) + lo
+        )
+
+        all_links_scales = None
+        if domain_randomization.all_links_scale_range is not None:
+            alo, ahi = domain_randomization.all_links_scale_range
+            num_bodies = len(self.robot_config.kinematic_info.body_names)
+            all_links_scales = (
+                torch.rand(self.num_envs, num_bodies) * (ahi - alo) + alo
+            )
+
+        body_names = [
+            self.robot_config.kinematic_info.body_names[i] for i in body_indices
+        ]
+        print(
+            f"[mass-dr] enabled: main_bodies={body_names} range=({lo}, {hi}) "
+            f"sampled mean/min/max="
+            f"{scales.mean().item():.4f}/{scales.min().item():.4f}/"
+            f"{scales.max().item():.4f} over {self.num_envs} envs; "
+            f"all_links_range={domain_randomization.all_links_scale_range}"
+            + (
+                f" all_links mean/min/max={all_links_scales.mean().item():.4f}/"
+                f"{all_links_scales.min().item():.4f}/{all_links_scales.max().item():.4f}"
+                if all_links_scales is not None
+                else ""
+            )
+        )
+
+        return {
+            "body_indices": body_indices,
+            "scales": scales,
+            "all_links_scales": all_links_scales,
+        }
 
     def _process_object_asset_domain_randomization(
         self, domain_randomization: ObjectAssetDomainRandomizationConfig

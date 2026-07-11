@@ -18,6 +18,7 @@ Key Features:
     - Distributed training support
 """
 
+import json
 import logging
 import os
 import re
@@ -42,6 +43,160 @@ from protomotions.utils.motion_interpolation_utils import (
 )
 
 log = logging.getLogger(__name__)
+
+# --- Per-rank motion-lib sharding (env-gated, default off) -------------------
+#
+# When MOTION_LIB_SHARD_PER_RANK=1 and torch.distributed is initialized with
+# world_size > 1, each DDP rank loads only an interleaved shard of a packaged
+# (.pt) motion library (motions[rank::world_size]) instead of holding the full
+# pack GPU-resident. Sampling weights are renormalized per class (class
+# boundaries from the pack's "<pack>.mix.json" sidecar) so that each rank's
+# per-class sampling mass fractions exactly match the global pack.
+_MOTION_SHARD_ENV = "MOTION_LIB_SHARD_PER_RANK"
+_MOTION_SHARD_SIDECAR_ENV = "MOTION_LIB_SHARD_SIDECAR"
+
+# Fields indexed by frame along dim 0 (concatenated across motions).
+_SHARD_FRAME_FIELDS = (
+    "gts",
+    "grs",
+    "gvs",
+    "gavs",
+    "dvs",
+    "dps",
+    "contacts",
+    "lrs",
+    "goal_states",
+)
+# Fields indexed by motion along dim 0.
+_SHARD_MOTION_FIELDS = ("motion_lengths", "motion_dt", "motion_num_frames")
+
+
+def motion_lib_shard_enabled() -> bool:
+    """True when per-rank motion-lib sharding is requested via env var."""
+    return os.environ.get(_MOTION_SHARD_ENV, "0") == "1"
+
+
+def load_shard_class_boundaries(sidecar_path, expected_num_motions):
+    """Load per-class motion-index boundaries from a pack's .mix.json sidecar.
+
+    The pack builder (wbc_push/scripts/training/motion_aug/build_track_d_train_pack.py)
+    concatenates the base corpus followed by each augmentation class in the
+    sidecar's ``mix`` insertion order, so cumulative ``kept`` counts give exact
+    contiguous [start, end) index ranges per class.
+
+    Returns:
+        List of (class_name, start, end) tuples, or None if the sidecar is
+        missing/unusable (callers fall back to plain interleave, no renorm).
+    """
+    if sidecar_path is None or not os.path.isfile(sidecar_path):
+        return None
+    try:
+        with open(sidecar_path, "r") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        log.warning(f"[motion-shard] failed to read sidecar {sidecar_path}: {e}")
+        return None
+    mix = data.get("mix")
+    if not mix:
+        log.warning(f"[motion-shard] sidecar {sidecar_path} has no 'mix' section")
+        return None
+    boundaries = []
+    start = 0
+    for name, info in mix.items():
+        kept = int(info["kept"])
+        boundaries.append((name, start, start + kept))
+        start += kept
+    if start != expected_num_motions:
+        log.warning(
+            f"[motion-shard] sidecar {sidecar_path} class counts sum to {start} "
+            f"but pack has {expected_num_motions} motions; ignoring sidecar"
+        )
+        return None
+    sidecar_n = data.get("num_motions")
+    if sidecar_n is not None and int(sidecar_n) != expected_num_motions:
+        log.warning(
+            f"[motion-shard] sidecar num_motions={sidecar_n} != pack "
+            f"{expected_num_motions}; ignoring sidecar"
+        )
+        return None
+    return boundaries
+
+
+def compute_rank_shard(
+    num_motions, motion_weights, rank, world_size, class_boundaries=None
+):
+    """Compute a rank's interleaved motion shard and renormalized weights.
+
+    Pure function (no torch.distributed) so it is unit-testable on CPU.
+
+    Shard split: ``local_indices = arange(rank, num_motions, world_size)``.
+    Weight handling: with ``class_boundaries``, each class's local weights are
+    scaled by (global_class_mass / local_class_mass) so every rank's per-class
+    sampling mass fractions exactly equal the global pack's (torch.multinomial
+    normalizes, so only relative mass matters). Without boundaries, weights are
+    plain-sliced (approximate mass preservation only).
+
+    Args:
+        num_motions: Global motion count N.
+        motion_weights: Global weight tensor [N].
+        rank: This rank's index in [0, world_size).
+        world_size: Number of ranks.
+        class_boundaries: Optional list of (name, start, end) from
+            load_shard_class_boundaries.
+
+    Returns:
+        (local_indices [n_local] LongTensor, local_weights [n_local] float32,
+         report dict with per-class counts/mass fractions for dump-verification)
+    """
+    assert 0 <= rank < world_size, f"rank {rank} not in [0, {world_size})"
+    assert num_motions >= world_size, (
+        f"cannot shard {num_motions} motions across {world_size} ranks"
+    )
+    local_indices = torch.arange(rank, num_motions, world_size, dtype=torch.long)
+    w_global = motion_weights.detach().to(dtype=torch.float64, device="cpu")
+    assert w_global.shape[0] == num_motions, (
+        f"weights len {w_global.shape[0]} != num_motions {num_motions}"
+    )
+    local_w = w_global[local_indices].clone()
+
+    report = {
+        "rank": rank,
+        "world_size": world_size,
+        "num_motions_global": int(num_motions),
+        "num_motions_local": int(local_indices.numel()),
+        "renormalized": class_boundaries is not None,
+        "classes": [],
+    }
+
+    if class_boundaries is not None:
+        global_total = float(w_global.sum())
+        assert global_total > 0, "global sampling mass is zero"
+        for name, start, end in class_boundaries:
+            global_mass = float(w_global[start:end].sum())
+            in_class = (local_indices >= start) & (local_indices < end)
+            n_local = int(in_class.sum())
+            assert n_local > 0, (
+                f"[motion-shard] rank {rank}: class '{name}' has 0 motions in "
+                f"shard (class size {end - start}, world_size {world_size})"
+            )
+            local_mass = float(local_w[in_class].sum())
+            assert local_mass > 0, (
+                f"[motion-shard] rank {rank}: class '{name}' has zero local "
+                f"sampling mass before renorm"
+            )
+            local_w[in_class] *= global_mass / local_mass
+            report["classes"].append(
+                {
+                    "name": name,
+                    "global_count": end - start,
+                    "local_count": n_local,
+                    "global_mass_fraction": global_mass / global_total,
+                }
+            )
+        # After renorm each class's local mass equals its global mass, so local
+        # fractions match global fractions exactly (up to float64 rounding).
+    return local_indices, local_w.to(torch.float32), report
+
 
 # Mapping from MotionLib (packaged motion) field names to RobotState (single motion/sim state) field names
 _motion_field_mapping = {
@@ -167,25 +322,47 @@ class MotionLib:
 
         self.get_motion_state_use_blend = config.get_motion_state_use_blend
         self.different_motion_files_across_ranks = False
+        self.sharded_across_ranks = False
+        self.global_motion_ids = None
+        self.shard_rank = None
+        self.shard_world_size = None
 
         motion_file = config.motion_file
 
         if str(motion_file).split(".")[-1] == "pt":
             print("Loading motions from packaged file which is faster")
             motion_file = self.process_packaged_motion_file_name_multi_gpu(motion_file)
-            self.load_from_file(motion_file)
+            if motion_lib_shard_enabled():
+                self.load_from_file_sharded(motion_file)
+            else:
+                self.load_from_file(motion_file)
         else:
+            assert not motion_lib_shard_enabled(), (
+                f"{_MOTION_SHARD_ENV}=1 requires a packaged .pt motion file, "
+                f"got: {motion_file}"
+            )
             print(
                 "Loading motions from yaml/npy file or Directory of motions which is slower"
             )
             self._load_motions(motion_file)
 
         self.motion_file = motion_file
+        if self.sharded_across_ranks:
+            # Per-rank suffix makes env-checkpoint task ids unique per rank and
+            # lets MotionManager.load_state_dict's name-equality guard reject
+            # stale (unsharded / differently-sharded) motion_weights on resume.
+            self.motion_file = (
+                f"{motion_file}#shard{self.shard_rank}of{self.shard_world_size}"
+            )
 
     def _create_empty(self):
         """Create an empty motion library with no motions."""
         self.get_motion_state_use_blend = False
         self.different_motion_files_across_ranks = False
+        self.sharded_across_ranks = False
+        self.global_motion_ids = None
+        self.shard_rank = None
+        self.shard_world_size = None
         self.motion_file = None
 
         # Create empty tensors
@@ -720,6 +897,220 @@ class MotionLib:
                 "Discarding contacts — any component reading ref contacts will error."
             )
             self.contacts = None
+
+    def load_from_file_sharded(self, file_path):
+        """Load only this rank's interleaved shard of a packaged (.pt) library.
+
+        Env-gated via MOTION_LIB_SHARD_PER_RANK=1. Loads the pack on CPU
+        (mmap'd when possible so only the shard's pages are ever read), slices
+        motions[rank::world_size], renormalizes sampling weights per class
+        (sidecar: <pack>.mix.json, override via MOTION_LIB_SHARD_SIDECAR), and
+        only then moves tensors to self.device. Per-rank GPU (and CPU) residency
+        is therefore ~pack_size / world_size, which is what allows packs larger
+        than a single rank's VRAM budget.
+
+        After this call, motion ids everywhere on this rank are SHARD-LOCAL.
+        self.global_motion_ids maps local id -> global pack id.
+        """
+        assert (
+            torch.distributed.is_available() and torch.distributed.is_initialized()
+        ), (
+            f"{_MOTION_SHARD_ENV}=1 requires torch.distributed to be initialized"
+        )
+        assert not self.different_motion_files_across_ranks, (
+            f"{_MOTION_SHARD_ENV}=1 cannot be combined with 'slurmrank' "
+            "per-rank motion files"
+        )
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+        if world_size <= 1:
+            log.warning(
+                f"[motion-shard] {_MOTION_SHARD_ENV}=1 with world_size=1; "
+                "loading full library (no sharding)"
+            )
+            self.load_from_file(file_path)
+            return
+
+        print(
+            f"[motion-shard][rank {rank}] loading shard {rank}/{world_size} "
+            f"of {file_path}"
+        )
+        try:
+            loaded_data = torch.load(
+                file_path, map_location="cpu", weights_only=False, mmap=True
+            )
+        except Exception as e:  # mmap unsupported for some save formats
+            log.warning(
+                f"[motion-shard] mmap load failed ({e}); falling back to plain "
+                "CPU load (transient full-pack CPU RAM per rank)"
+            )
+            loaded_data = torch.load(file_path, map_location="cpu", weights_only=False)
+
+        num_motions_global = int(loaded_data["motion_num_frames"].shape[0])
+
+        sidecar_path = os.environ.get(_MOTION_SHARD_SIDECAR_ENV) or (
+            str(file_path) + ".mix.json"
+        )
+        class_boundaries = load_shard_class_boundaries(
+            sidecar_path, num_motions_global
+        )
+        if class_boundaries is None:
+            log.warning(
+                f"[motion-shard][rank {rank}] no usable sidecar at {sidecar_path}: "
+                "plain interleave WITHOUT per-class mass renormalization "
+                "(global class sampling mass only approximately preserved)"
+            )
+
+        local_indices, local_weights, report = compute_rank_shard(
+            num_motions_global,
+            loaded_data["motion_weights"],
+            rank,
+            world_size,
+            class_boundaries,
+        )
+
+        # Frame gather index for this shard (global frame indices).
+        global_num_frames = loaded_data["motion_num_frames"].to(torch.long)
+        global_starts = loaded_data["length_starts"].to(torch.long)
+        frame_idx = torch.cat(
+            [
+                torch.arange(global_starts[m], global_starts[m] + global_num_frames[m])
+                for m in local_indices.tolist()
+            ]
+        )
+
+        # Pre-initialize all fields to None (mirrors load_from_file).
+        for field_name in self._fields:
+            if not hasattr(self, field_name):
+                setattr(self, field_name, None)
+
+        for field_name in self._fields:
+            if field_name not in loaded_data:
+                continue
+            value = loaded_data[field_name]
+            if field_name in _SHARD_FRAME_FIELDS:
+                setattr(
+                    self, field_name, value.index_select(0, frame_idx).to(self.device)
+                )
+            elif field_name in _SHARD_MOTION_FIELDS:
+                setattr(
+                    self,
+                    field_name,
+                    value.index_select(0, local_indices).to(self.device),
+                )
+            elif field_name == "motion_weights":
+                self.motion_weights = local_weights.to(self.device)
+            elif field_name == "motion_files":
+                self.motion_files = tuple(value[m] for m in local_indices.tolist())
+            elif field_name == "length_starts":
+                pass  # recomputed below for the local shard
+            else:
+                setattr(self, field_name, value)
+
+        # Recompute local length_starts from local frame counts.
+        lengths_shifted = self.motion_num_frames.roll(1)
+        lengths_shifted[0] = 0
+        self.length_starts = lengths_shifted.cumsum(0)
+
+        del loaded_data, frame_idx
+
+        if (
+            self.contacts is not None
+            and self.contacts.numel() > 0
+            and not self.contacts.any()
+        ):
+            log.warning(
+                "All contact labels in packaged motion library are zero. "
+                "Discarding contacts — any component reading ref contacts will error."
+            )
+            self.contacts = None
+
+        self.sharded_across_ranks = True
+        self.shard_rank = rank
+        self.shard_world_size = world_size
+        self.global_motion_ids = local_indices.to(self.device)
+
+        self._shard_launch_asserts(num_motions_global, class_boundaries, report)
+
+    def _shard_launch_asserts(self, num_motions_global, class_boundaries, report):
+        """Dump-verify the shard at init: log everything, hard-assert invariants.
+
+        A. sum of per-rank motion counts across ranks == global N (all_reduce).
+        B. every sidecar class present with >0 mass on this rank (checked in
+           compute_rank_shard).
+        C. per-class post-renorm mass fractions identical across ranks and equal
+           to the global fractions (all_gather, tol 1e-5).
+        D. local frame tensors consistent with motion_num_frames/length_starts.
+        """
+        rank, world_size = self.shard_rank, self.shard_world_size
+        n_local = self.num_motions()
+
+        # D: frame bookkeeping.
+        frames_expected = int(self.motion_num_frames.sum().item())
+        assert self.gts.shape[0] == frames_expected, (
+            f"[motion-shard][rank {rank}] frame slice mismatch: gts has "
+            f"{self.gts.shape[0]} frames, motion_num_frames sums to {frames_expected}"
+        )
+        assert (
+            int(self.length_starts[-1].item())
+            + int(self.motion_num_frames[-1].item())
+            == frames_expected
+        ), f"[motion-shard][rank {rank}] length_starts inconsistent"
+        assert len(self.motion_files) == n_local and self.motion_weights.shape[0] == (
+            n_local
+        ), f"[motion-shard][rank {rank}] motion-level field length mismatch"
+
+        # Collectives: use a CUDA tensor for NCCL, CPU otherwise.
+        backend = torch.distributed.get_backend()
+        coll_device = self.device if str(backend) == "nccl" else "cpu"
+
+        # A: global motion-count conservation.
+        count = torch.tensor([n_local], dtype=torch.long, device=coll_device)
+        torch.distributed.all_reduce(count, op=torch.distributed.ReduceOp.SUM)
+        assert int(count.item()) == num_motions_global, (
+            f"[motion-shard][rank {rank}] shards do not partition the pack: "
+            f"sum of per-rank counts {int(count.item())} != {num_motions_global}"
+        )
+
+        # C: global per-class sampling-mass check.
+        frac_str = "n/a (no sidecar)"
+        if class_boundaries is not None:
+            w = self.motion_weights.to(dtype=torch.float64, device=coll_device)
+            gids = self.global_motion_ids.to(coll_device)
+            total = w.sum()
+            local_fracs = torch.stack(
+                [
+                    w[(gids >= start) & (gids < end)].sum() / total
+                    for _, start, end in class_boundaries
+                ]
+            )
+            gathered = [torch.zeros_like(local_fracs) for _ in range(world_size)]
+            torch.distributed.all_gather(gathered, local_fracs)
+            global_fracs = torch.tensor(
+                [c["global_mass_fraction"] for c in report["classes"]],
+                dtype=torch.float64,
+                device=coll_device,
+            )
+            max_dev = max(
+                float((g - global_fracs).abs().max().item()) for g in gathered
+            )
+            assert max_dev < 1e-5, (
+                f"[motion-shard][rank {rank}] per-class sampling-mass drift "
+                f"{max_dev:.3e} >= 1e-5 across ranks"
+            )
+            frac_str = ", ".join(
+                f"{c['name']}={f:.4f}(n={c['local_count']}/{c['global_count']})"
+                for c, f in zip(
+                    report["classes"], local_fracs.cpu().tolist()
+                )
+            ) + f" | max cross-rank mass dev {max_dev:.2e}"
+
+        print(
+            f"[motion-shard][rank {rank}] OK: {n_local} local motions of "
+            f"{num_motions_global} global (world_size {world_size}, "
+            f"renormalized={report['renormalized']}), "
+            f"{frames_expected} local frames | class mass: {frac_str}"
+        )
 
     def smooth_contacts(self, window_size: int):
         """

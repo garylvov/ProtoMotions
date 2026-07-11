@@ -588,6 +588,21 @@ class EnvContext:
     # ramp-in+plateau). None when no grace source is configured.
     perturbation_grace_mask: Optional[Tensor] = FieldPath()
 
+    # HOLD-FIX (2026-07-10): per-env bool mask — True while the reference is
+    # still (hold window). Maintained by the env's RefStillnessTracker; None
+    # when no HOLD-FIX gate is enabled.
+    reference_still_mask: Optional[Tensor] = FieldPath()
+
+    # WRIST-DIR (2026-07-10): per-env wrist direction-agreement reward,
+    # computed once per step by the env's WristDirTracker (stateful K-frame
+    # displacement window). None when WRIST_DIR_REWARD is not set.
+    wrist_dir_reward: Optional[Tensor] = FieldPath()
+
+    # ROOT-GAIN (2026-07-10): per-env root displacement-gain reward, computed
+    # once per step by the env's root-gain tracker (windowed ring, gain_proj
+    # shaping). None when ROOT_GAIN_REWARD is not set.
+    root_gain_reward: Optional[Tensor] = FieldPath()
+
     # Control-specific contexts (populated by controllers via populate_context)
     mimic: Optional[MimicContext] = NestedField(MimicContext)
     masked_mimic: Optional[MaskedMimicContext] = NestedField(MaskedMimicContext)
@@ -618,6 +633,9 @@ class EnvContext:
         odom_scale: Optional[Tensor] = None,
         odom_yaw_cos_sin: Optional[Tensor] = None,
         perturbation_grace_mask: Optional[Tensor] = None,
+        reference_still_mask: Optional[Tensor] = None,
+        wrist_dir_reward: Optional[Tensor] = None,
+        root_gain_reward: Optional[Tensor] = None,
         mimic: Optional[MimicContext] = None,
         masked_mimic: Optional[MaskedMimicContext] = None,
         steering: Optional[SteeringContext] = None,
@@ -685,6 +703,9 @@ class EnvContext:
         self.odom_scale = odom_scale
         self.odom_yaw_cos_sin = odom_yaw_cos_sin
         self.perturbation_grace_mask = perturbation_grace_mask
+        self.reference_still_mask = reference_still_mask
+        self.wrist_dir_reward = wrist_dir_reward
+        self.root_gain_reward = root_gain_reward
 
         # Control-specific views
         self.mimic = mimic

@@ -271,6 +271,11 @@ class BaseEnv:
         else:
             self.motion_manager = None
 
+        # HOLD-FIX (env-gated, all off by default): hold-conditioning grace /
+        # fall penalty / balance bonus. Must run BEFORE the component manager
+        # so injected reward components are live from the first step.
+        self._init_hold_fix()
+
         self.terrain_obs_cb = TerrainObs(self.terrain.config, self)
         self.scene_obs_cb = SceneObs(self.config.scene_obs, self)
 
@@ -349,6 +354,41 @@ class BaseEnv:
         clearing needed).
         """
         cfg = self._get_delay_cfg()
+
+        # DELAY-DR partial exposure (env-gated, Gary 2026-07-10): a FRACTION
+        # of envs get a small per-env action delay, the rest run clean —
+        # the bootstrap-on-clean lever the laneb v1 global-delay failure
+        # motivated. Synthesizes a delay config when none exists; when a
+        # config IS present (laneb-style), only the SAMPLING distribution is
+        # overridden (observation delay untouched either way).
+        from protomotions.envs.base_env.hold_fix import load_action_delay_settings
+
+        self._delay_partial = load_action_delay_settings()
+        if self._delay_partial.enabled:
+            from protomotions.simulator.base_simulator.config import (
+                DelayDomainRandomizationConfig,
+            )
+
+            if cfg is None:
+                cfg = DelayDomainRandomizationConfig(
+                    action_delay_steps=(0, self._delay_partial.steps_max)
+                )
+                print(
+                    f"[delay-dr] ACTION_DELAY_DR armed: synthesized action-delay "
+                    f"config, frac={self._delay_partial.frac} exposed envs get "
+                    f"uniform{{1..{self._delay_partial.steps_max}}} control-step "
+                    f"delay, rest clean; resampled per env at reset; "
+                    f"observation delay OFF"
+                )
+            else:
+                print(
+                    f"[delay-dr] ACTION_DELAY_DR armed over EXISTING delay "
+                    f"config (max={cfg.max_action_delay()}): partial-exposure "
+                    f"sampling frac={self._delay_partial.frac}, "
+                    f"steps_max={self._delay_partial.steps_max}; observation "
+                    f"delay left as configured"
+                )
+
         self._delay_cfg = cfg
         self._has_action_delay = bool(cfg is not None and cfg.has_action_delay())
         self._has_obs_delay = bool(cfg is not None and cfg.has_observation_delay())
@@ -397,9 +437,25 @@ class BaseEnv:
         if self._has_action_delay:
             lo, _ = cfg.action_delay_steps
             hi = cfg.effective_max_action_delay(self._current_epoch)
-            self._action_delay[env_ids] = torch.randint(
-                int(lo), int(hi) + 1, (n,), dtype=torch.long, device=self.device
-            )
+            partial = getattr(self, "_delay_partial", None)
+            if partial is not None and partial.enabled:
+                # DELAY-DR partial exposure: with prob frac an env is
+                # EXPOSED (delay uniform {1..min(steps_max, hi)}), else
+                # clean (0). Assignment fixed per env per episode.
+                eff_hi = min(int(partial.steps_max), max(int(hi), 1))
+                exposed = (
+                    torch.rand(n, device=self.device) < partial.frac
+                )
+                delays = torch.randint(
+                    1, eff_hi + 1, (n,), dtype=torch.long, device=self.device
+                )
+                self._action_delay[env_ids] = torch.where(
+                    exposed, delays, torch.zeros_like(delays)
+                )
+            else:
+                self._action_delay[env_ids] = torch.randint(
+                    int(lo), int(hi) + 1, (n,), dtype=torch.long, device=self.device
+                )
         if self._has_obs_delay:
             lo, _ = cfg.observation_delay_steps
             hi = cfg.effective_max_observation_delay(self._current_epoch)
@@ -939,6 +995,12 @@ class BaseEnv:
         # Build context once and reuse for observations, rewards, and terminations
         self._current_context = self._build_global_context()
 
+        # HOLD-FIX: advance the reference-stillness tracker exactly once per
+        # env step and (if HOLD_ACTION_GRACE) OR the mask into the context's
+        # perturbation grace mask BEFORE rewards are computed. No-op when all
+        # HOLD-FIX gates are off.
+        self._apply_hold_fix(self._current_context)
+
         self.compute_observations(context=self._current_context)
         self.compute_reward(context=self._current_context)
         self.reset_buf[:], self.terminate_buf[:] = self.check_resets_and_terminations(
@@ -946,6 +1008,18 @@ class BaseEnv:
         )
 
         self.extras["terminate"] = self.terminate_buf
+
+        # DELAY-DR instrumentation (no-op unless ACTION_DELAY_DR armed).
+        self._log_delay_dr_extras()
+
+        # FALL-PENALTY visibility (2026-07-10 convene follow-up): the per-env
+        # raw_r mean dilutes rare falls to 0.000 at TB precision; log the raw
+        # firing COUNT per step across the batch so the tag is visibly alive.
+        hf = getattr(self, "_hold_fix", None)
+        if hf is not None and hf.fall_term_penalty > 0.0:
+            fall_flags = self.extras.get("termination/fall")
+            if fall_flags is not None:
+                self.extras["hold_fix/fall_fired_count"] = fall_flags.sum()
 
         rbs: RobotState = self.simulator.get_robot_state()
         for k, _ in rbs.get_shape_mapping(flattened=True).items():
@@ -1123,6 +1197,16 @@ class BaseEnv:
                 if hasattr(self.simulator, "get_action_rate_grace_mask")
                 else None
             ),
+            # HOLD-FIX: persistent per-env reference-stillness mask buffer
+            # (None unless a HOLD-FIX gate needing it is enabled). Updated
+            # once per step in post_physics_step via _apply_hold_fix.
+            reference_still_mask=getattr(self, "_hold_still_mask", None),
+            # WRIST-DIR: persistent per-env reward buffer (None unless
+            # WRIST_DIR_REWARD is set); refreshed in _apply_hold_fix.
+            wrist_dir_reward=getattr(self, "_wrist_dir_reward_buf", None),
+            # ROOT-GAIN: persistent per-env reward buffer (None unless
+            # ROOT_GAIN_REWARD is set); refreshed in _apply_hold_fix.
+            root_gain_reward=getattr(self, "_root_gain_reward_buf", None),
         )
 
         # Controllers populate their task-specific views
@@ -1164,6 +1248,278 @@ class BaseEnv:
             neutral_pointclouds=self.scene_lib.get_scene_neutral_pointcloud(env_ids),
             object_valid_mask=self.scene_lib.get_per_object_valid_mask(env_ids),
         )
+
+    ###############################################################
+    # HOLD-FIX (env-gated hold-conditioning interventions)
+    ###############################################################
+    def _init_hold_fix(self):
+        """Parse HOLD-FIX env-var gates and arm the enabled interventions.
+
+        Gates (all OFF by default, independently deployable):
+          HOLD_ACTION_GRACE=1     ref-still windows untax action_rate
+          FALL_TERM_PENALTY=<f>   negative terminal reward on fall-termination
+          HOLD_BALANCE_BONUS=<f>  quiet-stance bonus during ref-still windows
+
+        See protomotions/envs/base_env/hold_fix.py for the full spec.
+        With every gate off this allocates nothing and injects nothing
+        (bit-identical stock behavior).
+        """
+        from protomotions.envs.base_env.hold_fix import (
+            load_hold_fix_settings,
+            setup_hold_fix_components,
+            resolve_wrist_body_ids,
+            RefStillnessTracker,
+            WristDirTracker,
+        )
+
+        self._hold_fix = load_hold_fix_settings()
+        self._hold_still_tracker = None
+        self._hold_still_mask = None
+        self._wrist_dir_tracker = None
+        self._wrist_dir_body_ids = None
+        self._wrist_dir_reward_buf = None
+        self._root_gain_tracker = None
+        self._root_gain_reward_buf = None
+
+        if not self._hold_fix.any_enabled:
+            return
+
+        print(
+            f"[hold-fix] gates: HOLD_ACTION_GRACE={int(self._hold_fix.hold_action_grace)} "
+            f"FALL_TERM_PENALTY={self._hold_fix.fall_term_penalty} "
+            f"HOLD_BALANCE_BONUS={self._hold_fix.hold_balance_bonus} "
+            f"WRIST_DIR_REWARD={self._hold_fix.wrist_dir_weight} "
+            f"ROOT_GAIN_REWARD={self._hold_fix.root_gain_weight}"
+        )
+
+        if self._hold_fix.needs_still_mask:
+            if self.motion_manager is None:
+                print(
+                    "[hold-fix] WARNING: stillness-mask gates set but env has no "
+                    "motion manager (no reference to measure) — grace/balance "
+                    "gates NOT armed."
+                )
+                self._hold_fix.hold_action_grace = False
+                self._hold_fix.hold_balance_bonus = 0.0
+            else:
+                self._hold_still_tracker = RefStillnessTracker(
+                    num_envs=self.num_envs,
+                    device=self.device,
+                    root_eps=self._hold_fix.still_root_eps,
+                    rot_eps=self._hold_fix.still_rot_eps,
+                    dof_eps=self._hold_fix.still_dof_eps,
+                    window=self._hold_fix.still_window,
+                )
+                self._hold_still_mask = torch.zeros(
+                    self.num_envs, dtype=torch.bool, device=self.device
+                )
+
+        if self._hold_fix.wrist_dir_weight > 0.0 and self.motion_manager is None:
+            print(
+                "[wrist-dir] WARNING: WRIST_DIR_REWARD set but env has no "
+                "motion manager (no reference wrists) — NOT armed."
+            )
+            self._hold_fix.wrist_dir_weight = 0.0
+        if self._hold_fix.root_gain_weight > 0.0 and self.motion_manager is None:
+            print(
+                "[root-gain] WARNING: ROOT_GAIN_REWARD set but env has no "
+                "motion manager (no reference root) — NOT armed."
+            )
+            self._hold_fix.root_gain_weight = 0.0
+
+        setup_hold_fix_components(
+            settings=self._hold_fix,
+            reward_components=self.config.reward_components,
+            termination_components=self.config.termination_components,
+            body_names=self.robot_config.kinematic_info.body_names,
+            common_naming=getattr(
+                self.robot_config, "common_naming_to_robot_body_names", None
+            ),
+            device=self.device,
+        )
+
+        # setup may have disarmed wrist-dir (unresolvable wrist bodies).
+        if self._hold_fix.wrist_dir_weight > 0.0:
+            self._wrist_dir_body_ids = resolve_wrist_body_ids(
+                self.robot_config.kinematic_info.body_names,
+                getattr(
+                    self.robot_config, "common_naming_to_robot_body_names", None
+                ),
+                self.device,
+            )
+            window_steps = max(
+                1, int(round(self._hold_fix.wrist_dir_window_s / self.dt))
+            )
+            self._wrist_dir_tracker = WristDirTracker(
+                num_envs=self.num_envs,
+                num_wrists=len(self._wrist_dir_body_ids),
+                device=self.device,
+                window_steps=window_steps,
+                window_s=self._hold_fix.wrist_dir_window_s,
+                disp_eps=self._hold_fix.wrist_dir_disp_eps,
+                vel_weight_vmax=self._hold_fix.wrist_dir_vmax,
+                instantaneous=self._hold_fix.wrist_dir_instant,
+                speed_eps=self._hold_fix.wrist_dir_eps,
+                subsample=self._hold_fix.wrist_dir_subsample,
+            )
+            self._wrist_dir_reward_buf = torch.zeros(
+                self.num_envs, device=self.device
+            )
+            tr = self._wrist_dir_tracker
+            print(
+                f"[wrist-dir] window: {self._hold_fix.wrist_dir_window_s} s = "
+                f"K={window_steps} steps @ dt={self.dt}, subsample M={tr.M} "
+                f"-> ring={tr.slots} slots (effective lookback "
+                f"~{tr.slots * tr.M * self.dt:.3f} s) "
+                f"(instantaneous={int(self._hold_fix.wrist_dir_instant)})"
+            )
+
+        if self._hold_fix.root_gain_weight > 0.0:
+            rg_window_steps = max(
+                1, int(round(self._hold_fix.root_gain_window_s / self.dt))
+            )
+            self._root_gain_tracker = WristDirTracker(
+                num_envs=self.num_envs,
+                num_wrists=1,  # single body: the root/pelvis
+                device=self.device,
+                window_steps=rg_window_steps,
+                window_s=self._hold_fix.root_gain_window_s,
+                disp_eps=self._hold_fix.root_gain_disp_eps,
+                subsample=self._hold_fix.root_gain_subsample,
+                shaping="gain_proj",
+            )
+            self._root_gain_reward_buf = torch.zeros(
+                self.num_envs, device=self.device
+            )
+            tr = self._root_gain_tracker
+            print(
+                f"[root-gain] window: {self._hold_fix.root_gain_window_s} s = "
+                f"K={rg_window_steps} steps @ dt={self.dt}, subsample M={tr.M} "
+                f"-> ring={tr.slots} slots (effective lookback "
+                f"~{tr.slots * tr.M * self.dt:.3f} s), shaping=gain_proj"
+            )
+
+    def _apply_hold_fix(self, ctx: EnvContext):
+        """Per-step HOLD-FIX update (called once from post_physics_step).
+
+        Updates the reference-stillness mask in place (the context and any
+        injected reward component see the fresh values through the shared
+        buffer) and ORs it into the perturbation grace mask when
+        HOLD_ACTION_GRACE is armed. Logs per-env mask signals to extras so
+        the fractions land in TB (hold_fix/ref_still_mask, hold_fix/grace_mask).
+        """
+        # getattr-guarded: test harnesses build BaseEnv without running
+        # initialize_simulator (where _init_hold_fix sets these attributes).
+        still_tracker = getattr(self, "_hold_still_tracker", None)
+        wrist_tracker = getattr(self, "_wrist_dir_tracker", None)
+        root_gain_tracker = getattr(self, "_root_gain_tracker", None)
+        if still_tracker is None and wrist_tracker is None and root_gain_tracker is None:
+            return
+        mimic = getattr(ctx, "mimic", None)
+        if mimic is None or mimic.ref_state is None:
+            return
+        ref_state = mimic.ref_state
+
+        if still_tracker is not None:
+            freeze_time_left = getattr(
+                self.motion_manager, "_freeze_time_left", None
+            )
+            freeze_mask = (
+                (freeze_time_left > 0.0) if freeze_time_left is not None else None
+            )
+            still = still_tracker.update(
+                ref_root_pos=ref_state.rigid_body_pos[:, 0],
+                ref_root_rot=ref_state.rigid_body_rot[:, 0],
+                ref_dof_pos=ref_state.dof_pos,
+                dt=self.dt,
+                freeze_mask=freeze_mask,
+            )
+            self._hold_still_mask.copy_(still)
+            self.extras["hold_fix/ref_still_mask"] = (
+                self._hold_still_mask.float().clone()
+            )
+
+            if self._hold_fix.hold_action_grace:
+                if ctx.perturbation_grace_mask is None:
+                    ctx.perturbation_grace_mask = self._hold_still_mask
+                else:
+                    ctx.perturbation_grace_mask = (
+                        ctx.perturbation_grace_mask.bool() | self._hold_still_mask
+                    )
+                self.extras["hold_fix/grace_mask"] = (
+                    ctx.perturbation_grace_mask.float().clone()
+                )
+
+        if wrist_tracker is not None:
+            ids = self._wrist_dir_body_ids
+            wrist_tracker.update(
+                wrist_pos=ctx.current.rigid_body_pos[:, ids],
+                ref_wrist_pos=ref_state.rigid_body_pos[:, ids],
+                wrist_vel=ctx.current.rigid_body_vel[:, ids],
+                ref_wrist_vel=ref_state.rigid_body_vel[:, ids],
+                progress_buf=self.progress_buf,
+            )
+            self._wrist_dir_reward_buf.copy_(wrist_tracker.reward)
+            # RAW signed cos (not relu'd) — watch the dir_cos 0.61 axis move.
+            self.extras["wrist_dir/dir_cos"] = wrist_tracker.dir_cos.clone()
+            self.extras["wrist_dir/active_frac"] = (
+                wrist_tracker.active_frac.clone()
+            )
+
+        if root_gain_tracker is not None:
+            root_gain_tracker.update(
+                wrist_pos=ctx.current.rigid_body_pos[:, 0:1],
+                ref_wrist_pos=ref_state.rigid_body_pos[:, 0:1],
+                wrist_vel=ctx.current.rigid_body_vel[:, 0:1],
+                ref_wrist_vel=ref_state.rigid_body_vel[:, 0:1],
+                progress_buf=self.progress_buf,
+            )
+            self._root_gain_reward_buf.copy_(root_gain_tracker.reward)
+            # RAW uncapped projected gain — watch the fwd_gain 0.464 axis
+            # move (values > 1 = overshoot, visible here, unrewarded).
+            self.extras["root_gain/gain"] = root_gain_tracker.gain.clone()
+            self.extras["root_gain/active_frac"] = (
+                root_gain_tracker.active_frac.clone()
+            )
+
+    def _log_delay_dr_extras(self):
+        """DELAY-DR conviction instrumentation (per delay-bin outcome stats).
+
+        Logs, when ACTION_DELAY_DR is armed: the per-env delay assignment plus
+        per-delay-bin scalar means of reward, termination rate and action
+        delta — the data that answers "is delay what blows things up".
+        TB tags: delay_dr/delay_steps_mean, delay_dr/reward_d{0..max},
+        delay_dr/term_rate_d{0..max}, delay_dr/action_delta_d{0..max}.
+        Empty bins are skipped (with frac=0.25 at production env counts every
+        bin is populated every step).
+        """
+        partial = getattr(self, "_delay_partial", None)
+        if (
+            partial is None
+            or not partial.enabled
+            or not getattr(self, "_has_action_delay", False)
+        ):
+            return
+        delay = self._action_delay
+        self.extras["delay_dr/delay_steps"] = delay.float().clone()
+
+        act_delta = None
+        if self.state_history is not None and self.state_history.num_history_steps >= 1:
+            prev = self.state_history.processed_actions[:, 1]
+            act_delta = (
+                (self._current_processed_action - prev).abs().mean(dim=-1)
+            )
+
+        for d in range(0, partial.steps_max + 1):
+            mask = delay == d
+            if not mask.any():
+                continue
+            self.extras[f"delay_dr/reward_d{d}"] = self.rew_buf[mask].mean().clone()
+            self.extras[f"delay_dr/term_rate_d{d}"] = (
+                self.terminate_buf[mask].float().mean()
+            )
+            if act_delta is not None:
+                self.extras[f"delay_dr/action_delta_d{d}"] = act_delta[mask].mean()
 
     def get_has_reset_grace(self):
         """Check if environments are in the grace period after reset.
