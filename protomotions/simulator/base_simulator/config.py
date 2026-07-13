@@ -881,6 +881,25 @@ class DelayDomainRandomizationConfig:
         },
     )
 
+    observation_delay_probs: Optional[List[float]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional DISCRETE distribution over per-env OBSERVATION delays "
+                "(night13/T3 operator revision 2026-07-13): probs[d] = P(obs "
+                "delay=d control steps), d = 0..len(probs)-1. Mirror of "
+                "action_delay_probs but for the observation-latency axis. When "
+                "set, per-env observation delays are sampled from this "
+                "distribution at reset INSTEAD of uniform over "
+                "observation_delay_steps. Must be non-negative and sum to 1 "
+                "+/- 1e-6. max_observation_delay() becomes len(probs)-1. Ramp "
+                "semantics identical to action_delay_probs (ramp_epochs caps the "
+                "support). Read via getattr(cfg, 'observation_delay_probs', None) "
+                "for pre-field pickles."
+            )
+        },
+    )
+
     def __post_init__(self):
         for name, rng in (
             ("action_delay_steps", self.action_delay_steps),
@@ -902,6 +921,17 @@ class DelayDomainRandomizationConfig:
             if abs(total - 1.0) > 1e-6:
                 raise ValueError(
                     f"action_delay_probs must sum to 1.0 +/- 1e-6, got {total}."
+                )
+        if self.observation_delay_probs is not None:
+            probs = self.observation_delay_probs
+            if len(probs) < 1:
+                raise ValueError("observation_delay_probs must have at least one entry.")
+            if any(p < 0 for p in probs):
+                raise ValueError("observation_delay_probs entries must be non-negative.")
+            total = float(sum(probs))
+            if abs(total - 1.0) > 1e-6:
+                raise ValueError(
+                    f"observation_delay_probs must sum to 1.0 +/- 1e-6, got {total}."
                 )
 
     def effective_max_action_delay(self, current_epoch: int) -> int:
@@ -926,6 +956,9 @@ class DelayDomainRandomizationConfig:
         return int(self.action_delay_steps[1])
 
     def max_observation_delay(self) -> int:
+        probs = getattr(self, "observation_delay_probs", None)
+        if probs is not None:
+            return len(probs) - 1
         return int(self.observation_delay_steps[1])
 
     def has_action_delay(self) -> bool:

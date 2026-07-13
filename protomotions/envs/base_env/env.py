@@ -478,9 +478,25 @@ class BaseEnv:
         if self._has_obs_delay:
             lo, _ = cfg.observation_delay_steps
             hi = cfg.effective_max_observation_delay(self._current_epoch)
-            self._obs_delay[env_ids] = torch.randint(
-                int(lo), int(hi) + 1, (n,), dtype=torch.long, device=self.device
-            )
+            if getattr(cfg, "observation_delay_probs", None) is not None:
+                # Discrete weighted distribution over obs delays (mirror of the
+                # action_delay_probs path): P(obs_delay=d) = probs[d]. The epoch
+                # ramp caps the support at effective_max_observation_delay(epoch)
+                # (truncate + renormalize; multinomial normalizes internally).
+                probs = torch.tensor(
+                    cfg.observation_delay_probs, dtype=torch.float, device=self.device
+                )
+                probs = probs[: int(hi) + 1]
+                if probs.sum() <= 0:
+                    self._obs_delay[env_ids] = 0
+                else:
+                    self._obs_delay[env_ids] = torch.multinomial(
+                        probs, n, replacement=True
+                    ).to(dtype=torch.long)
+            else:
+                self._obs_delay[env_ids] = torch.randint(
+                    int(lo), int(hi) + 1, (n,), dtype=torch.long, device=self.device
+                )
 
     def _apply_action_delay(self, processed_action: Tensor) -> Tensor:
         """Return the PD target to actually send to the sim, applying per-env delay.
