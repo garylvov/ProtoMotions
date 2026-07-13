@@ -1885,6 +1885,13 @@ class Simulator(RecordingMixin, ABC):
                     self.config.domain_randomization.mass_scale
                 )
             )
+        # getattr: resolved-config pickles persisted before this field exist.
+        if getattr(self.config.domain_randomization, "actuator_gain", None) is not None:
+            domain_randomization_dict["actuator_gain"] = (
+                self._process_actuator_gain_domain_randomization(
+                    self.config.domain_randomization.actuator_gain
+                )
+            )
 
         return domain_randomization_dict
 
@@ -2049,6 +2056,68 @@ class Simulator(RecordingMixin, ABC):
             "body_indices": body_indices,
             "scales": scales,
             "all_links_scales": all_links_scales,
+        }
+
+    def _process_actuator_gain_domain_randomization(
+        self, domain_randomization: "ActuatorGainDomainRandomizationConfig"
+    ) -> Dict[str, Any]:
+        """Sample per-env, per-DOF actuator PD-gain scale multipliers (GAIN-DR).
+
+        Samples [num_envs, num_matching_dofs] multiplicative scales for
+        stiffness and damping from their respective ranges and, when
+        ``effort_limit_scale_range`` is set, an additional independent
+        [num_envs, num_matching_dofs] effort-limit scale. Backend apply paths
+        compose these multiplicatively on the nominal (config) gains. Logs
+        ``[gain-dr]`` sample statistics for dump-verify.
+        """
+        dof_indices = get_matching_indices(
+            self.robot_config.kinematic_info.dof_names,
+            domain_randomization.dof_names,
+            domain_randomization.dof_indices,
+        )
+        num_matching_dofs = len(dof_indices)
+
+        s_lo, s_hi = domain_randomization.stiffness_scale_range
+        stiffness_scales = (
+            torch.rand(self.num_envs, num_matching_dofs) * (s_hi - s_lo) + s_lo
+        )
+        d_lo, d_hi = domain_randomization.damping_scale_range
+        damping_scales = (
+            torch.rand(self.num_envs, num_matching_dofs) * (d_hi - d_lo) + d_lo
+        )
+
+        effort_limit_scales = None
+        if domain_randomization.effort_limit_scale_range is not None:
+            e_lo, e_hi = domain_randomization.effort_limit_scale_range
+            effort_limit_scales = (
+                torch.rand(self.num_envs, num_matching_dofs) * (e_hi - e_lo) + e_lo
+            )
+
+        dof_names = [
+            self.robot_config.kinematic_info.dof_names[i] for i in dof_indices
+        ]
+        print(
+            f"[gain-dr] enabled: dofs={dof_names} "
+            f"stiffness_range=({s_lo}, {s_hi}) sampled mean/min/max="
+            f"{stiffness_scales.mean().item():.4f}/{stiffness_scales.min().item():.4f}/"
+            f"{stiffness_scales.max().item():.4f} "
+            f"damping_range=({d_lo}, {d_hi}) sampled mean/min/max="
+            f"{damping_scales.mean().item():.4f}/{damping_scales.min().item():.4f}/"
+            f"{damping_scales.max().item():.4f} over {self.num_envs} envs; "
+            f"effort_limit_range={domain_randomization.effort_limit_scale_range}"
+            + (
+                f" effort_limit mean/min/max={effort_limit_scales.mean().item():.4f}/"
+                f"{effort_limit_scales.min().item():.4f}/{effort_limit_scales.max().item():.4f}"
+                if effort_limit_scales is not None
+                else ""
+            )
+        )
+
+        return {
+            "dof_indices": dof_indices,
+            "stiffness_scales": stiffness_scales,
+            "damping_scales": damping_scales,
+            "effort_limit_scales": effort_limit_scales,
         }
 
     def _process_object_asset_domain_randomization(

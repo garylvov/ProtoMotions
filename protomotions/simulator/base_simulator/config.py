@@ -367,6 +367,77 @@ class MassScaleDomainRandomizationConfig:
 
 
 @dataclass
+class ActuatorGainDomainRandomizationConfig:
+    """Configuration for per-DOF actuator PD-gain domain randomization (GAIN-DR).
+
+    T7 (2026-07-13): motors vary unit-to-unit and drift with wear/temperature,
+    so trained policies should be robust to PD gains that differ from the
+    nominal spec. Samples per-env, per-DOF MULTIPLICATIVE scales for
+    stiffness (``stiffness_scale_range``) and damping
+    (``damping_scale_range``) applied to every actuated DOF. Optionally also
+    scales the per-DOF effort limit (``effort_limit_scale_range``) — the
+    IsaacLab articulation view exposes ``set_dof_max_forces`` via
+    ``write_joint_effort_limit_to_sim`` with the exact same per-env/per-DOF
+    cost profile as the gain setters, so it is included as a third,
+    independently-optional axis rather than skipped.
+
+    Applied once after robot creation (per-env static assignment, mirroring
+    MASS-DR — motor-to-motor variation is a fixed property of the unit, not a
+    per-episode event). Uses the IsaacLab Articulation gain API
+    (``write_joint_stiffness_to_sim`` / ``write_joint_damping_to_sim`` /
+    ``write_joint_effort_limit_to_sim``), which for BUILT_IN_PD
+    (ImplicitActuatorCfg) robots pushes directly into the PhysX implicit PD
+    solver via ``root_physx_view.set_dof_stiffnesses`` / ``set_dof_dampings``
+    / ``set_dof_max_forces`` — same idiom as the MASS-DR mass API.
+    """
+
+    stiffness_scale_range: Tuple[float, float] = field(
+        default=(0.7, 1.3),
+        metadata={
+            "help": "Multiplicative stiffness (P-gain) scale range (min, max), per DOF per env."
+        },
+    )
+    damping_scale_range: Tuple[float, float] = field(
+        default=(0.7, 1.3),
+        metadata={
+            "help": "Multiplicative damping (D-gain) scale range (min, max), per DOF per env."
+        },
+    )
+    effort_limit_scale_range: Optional[Tuple[float, float]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional multiplicative effort-limit scale range (min, max), "
+                "per DOF per env; None = effort limits untouched."
+            )
+        },
+    )
+    dof_names: Optional[List[str]] = field(
+        default=None,
+        metadata={"help": "DOF names to randomize (regex patterns), e.g. ['.*'] for all DOFs."},
+    )
+    dof_indices: Optional[List[int]] = field(
+        default=None, metadata={"help": "DOF indices to randomize."}
+    )
+
+    def __post_init__(self):
+        if self.dof_names is None and self.dof_indices is None:
+            raise ValueError("Either dof_names or dof_indices must be provided.")
+        if self.dof_names is not None and self.dof_indices is not None:
+            raise ValueError("Only one of dof_names or dof_indices must be provided.")
+        for name, rng in (
+            ("stiffness_scale_range", self.stiffness_scale_range),
+            ("damping_scale_range", self.damping_scale_range),
+            ("effort_limit_scale_range", self.effort_limit_scale_range),
+        ):
+            if rng is None:
+                continue
+            lo, hi = rng
+            if not (0.0 < lo <= hi):
+                raise ValueError(f"{name} must satisfy 0 < min <= max, got {rng}.")
+
+
+@dataclass
 class RobotNoiseConfig:
     """Configuration for robot state noise.
 
@@ -920,6 +991,19 @@ class DomainRandomizationConfig:
                 "multiplicative scales applied once after robot creation. "
                 "Default None = off; read via getattr(dr, 'mass_scale', None) "
                 "for pre-field pickles."
+            )
+        },
+    )
+    actuator_gain: Optional[ActuatorGainDomainRandomizationConfig] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Actuator PD-gain scale DR (GAIN-DR, T7 2026-07-13: motor "
+                "unit-to-unit variation / wear). Per-env, per-DOF "
+                "multiplicative stiffness/damping (and optional effort-limit) "
+                "scales applied once after robot creation. Default None = "
+                "off; read via getattr(dr, 'actuator_gain', None) for "
+                "pre-field pickles."
             )
         },
     )

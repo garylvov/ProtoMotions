@@ -553,6 +553,71 @@ class IsaacLabSimulator(Simulator):
                 f"(default {total_before.mean().item():.3f} kg)"
             )
 
+        if (
+            self._domain_randomization is not None
+            and "actuator_gain" in self._domain_randomization
+        ):
+            # GAIN-DR (T7 2026-07-13): per-env, per-DOF multiplicative
+            # stiffness/damping (and optional effort-limit) scales, applied
+            # once after robot creation via the IsaacLab Articulation gain
+            # API. For BUILT_IN_PD (ImplicitActuatorCfg) robots this pushes
+            # straight into the PhysX implicit PD solver
+            # (root_physx_view.set_dof_stiffnesses/set_dof_dampings/
+            # set_dof_max_forces) via write_joint_stiffness_to_sim /
+            # write_joint_damping_to_sim / write_joint_effort_limit_to_sim —
+            # same idiom as MASS-DR's mass API. DOF ordering: robot-config
+            # dof indices are remapped through find_joints (the friction/mass
+            # paths' safe pattern — orderings are NOT guaranteed identical).
+            gain_dr = self._domain_randomization["actuator_gain"]
+            dof_names = [
+                self.robot_config.kinematic_info.dof_names[i]
+                for i in gain_dr["dof_indices"]
+            ]
+            lab_dof_ids, _ = self._robot.find_joints(dof_names, preserve_order=True)
+
+            default_stiffness = self._robot.root_physx_view.get_dof_stiffnesses().clone()
+            default_damping = self._robot.root_physx_view.get_dof_dampings().clone()
+
+            new_stiffness = default_stiffness.clone()
+            new_damping = default_damping.clone()
+            stiffness_scales = gain_dr["stiffness_scales"].to(new_stiffness.device)
+            damping_scales = gain_dr["damping_scales"].to(new_damping.device)
+            new_stiffness[:, lab_dof_ids] *= stiffness_scales
+            new_damping[:, lab_dof_ids] *= damping_scales
+
+            self._robot.write_joint_stiffness_to_sim(new_stiffness)
+            self._robot.write_joint_damping_to_sim(new_damping)
+
+            log_msg = (
+                f"[gain-dr] applied: dofs={dof_names} "
+                f"default_stiffness_mean={default_stiffness[:, lab_dof_ids].mean().item():.3f} "
+                f"-> scaled mean/min/max="
+                f"{new_stiffness[:, lab_dof_ids].mean().item():.3f}/"
+                f"{new_stiffness[:, lab_dof_ids].min().item():.3f}/"
+                f"{new_stiffness[:, lab_dof_ids].max().item():.3f}; "
+                f"default_damping_mean={default_damping[:, lab_dof_ids].mean().item():.3f} "
+                f"-> scaled mean/min/max="
+                f"{new_damping[:, lab_dof_ids].mean().item():.3f}/"
+                f"{new_damping[:, lab_dof_ids].min().item():.3f}/"
+                f"{new_damping[:, lab_dof_ids].max().item():.3f}"
+            )
+
+            if gain_dr.get("effort_limit_scales") is not None:
+                default_effort = self._robot.root_physx_view.get_dof_max_forces().clone()
+                new_effort = default_effort.clone()
+                effort_scales = gain_dr["effort_limit_scales"].to(new_effort.device)
+                new_effort[:, lab_dof_ids] *= effort_scales
+                self._robot.write_joint_effort_limit_to_sim(new_effort)
+                log_msg += (
+                    f"; default_effort_limit_mean="
+                    f"{default_effort[:, lab_dof_ids].mean().item():.3f} -> scaled "
+                    f"mean/min/max={new_effort[:, lab_dof_ids].mean().item():.3f}/"
+                    f"{new_effort[:, lab_dof_ids].min().item():.3f}/"
+                    f"{new_effort[:, lab_dof_ids].max().item():.3f}"
+                )
+
+            print(log_msg)
+
         self._apply_scene_object_properties_after_spawn(all_env_ids)
 
     def _apply_scene_object_properties_after_spawn(
