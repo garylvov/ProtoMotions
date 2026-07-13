@@ -198,6 +198,113 @@ def compute_rank_shard(
     return local_indices, local_w.to(torch.float32), report
 
 
+# --- Runtime target-mass reweighting (env-gated via sidecar presence) --------
+#
+# When a "<pack>.mix_target.json" sidecar sits next to a packaged (.pt) motion
+# library, its per-class target sampling-mass fractions REPLACE the pack's
+# native (as-baked) per-class fractions, without touching pack bytes. This is
+# applied to the GLOBAL weight tensor before any per-rank sharding — a
+# per-rank (local-denominator) rescale would break the cross-rank per-class
+# mass-equality invariant checked by _shard_launch_asserts' assert C, because
+# each rank's local class composition (counts) differs from the global one.
+_MIX_TARGET_SIDECAR_SUFFIX = ".mix_target.json"
+
+
+def load_mix_target(sidecar_path, class_boundaries):
+    """Load and validate a pack's "<pack>.mix_target.json" sidecar.
+
+    Format: {"target_mass": {"<class_name>": <fraction>, ...}}. The class
+    names must exactly match those in ``class_boundaries`` (from the pack's
+    .mix.json), and the fractions must sum to 1.0 within 1e-6.
+
+    Args:
+        sidecar_path: Path to the "<pack>.mix_target.json" file.
+        class_boundaries: List of (name, start, end) from
+            load_shard_class_boundaries; defines the expected class names.
+
+    Returns:
+        Dict mapping class name -> target global mass fraction, or None if
+        the sidecar file does not exist.
+
+    Raises:
+        ValueError: If the sidecar exists but is malformed (missing
+            'target_mass' key, class-name mismatch, or fractions not
+            summing to 1.0 within 1e-6). Errors loudly rather than silently
+            falling back, since a silently-ignored target-mass request would
+            train on the wrong mix.
+    """
+    if not os.path.isfile(sidecar_path):
+        return None
+    with open(sidecar_path, "r") as f:
+        data = json.load(f)
+    target = data.get("target_mass")
+    if not target:
+        raise ValueError(
+            f"[mix-target] {sidecar_path} is missing a non-empty 'target_mass' key"
+        )
+    boundary_names = {name for name, _, _ in class_boundaries}
+    target_names = set(target.keys())
+    if boundary_names != target_names:
+        raise ValueError(
+            f"[mix-target] {sidecar_path} class names {sorted(target_names)} "
+            f"do not match pack classes {sorted(boundary_names)} "
+            "(from the pack's .mix.json)"
+        )
+    target_fractions = {name: float(frac) for name, frac in target.items()}
+    total = sum(target_fractions.values())
+    if abs(total - 1.0) > 1e-6:
+        raise ValueError(
+            f"[mix-target] {sidecar_path} 'target_mass' fractions sum to "
+            f"{total!r}, expected 1.0 +/- 1e-6"
+        )
+    return target_fractions
+
+
+def rescale_to_target_mass(motion_weights, class_boundaries, target_fractions):
+    """Rescale a global weight tensor so each class's global mass fraction
+    equals its target fraction, via a pure per-class scalar multiplier.
+
+    Pure function (no I/O, no torch.distributed) so it is unit-testable and
+    safe to call before any per-rank sharding.
+
+    Derivation: let ``total`` be the pre-rescale sum of all weights, and
+    ``mass_i`` the pre-rescale sum of class i's weights. Scaling class i's
+    weights by ``multiplier_i = target_i * total / mass_i`` makes its
+    post-rescale mass exactly ``target_i * total``. Summing over classes,
+    the post-rescale total is ``total * sum(target_i) == total`` (since
+    target fractions sum to 1.0), so the post-rescale total is UNCHANGED and
+    each class's post-rescale global fraction is exactly ``target_i``.
+
+    Args:
+        motion_weights: Global weight tensor [N] (any float dtype/device).
+        class_boundaries: List of (name, start, end) from
+            load_shard_class_boundaries.
+        target_fractions: Dict name -> target global mass fraction (from
+            load_mix_target); must cover every class in class_boundaries.
+
+    Returns:
+        Rescaled weight tensor, same shape and dtype as ``motion_weights``.
+    """
+    orig_dtype = motion_weights.dtype
+    w = motion_weights.detach().to(dtype=torch.float64, device="cpu")
+    total = float(w.sum())
+    assert total > 0, "[mix-target] global sampling mass is zero, cannot rescale"
+    out = w.clone()
+    for name, start, end in class_boundaries:
+        assert name in target_fractions, (
+            f"[mix-target] class '{name}' has no target fraction (should have "
+            "been caught by load_mix_target validation)"
+        )
+        mass = float(w[start:end].sum())
+        assert mass > 0, (
+            f"[mix-target] class '{name}' has zero pre-rescale mass; cannot "
+            "rescale a zero-mass class to a nonzero target"
+        )
+        multiplier = target_fractions[name] * total / mass
+        out[start:end] = w[start:end] * multiplier
+    return out.to(dtype=orig_dtype, device=motion_weights.device)
+
+
 # Mapping from MotionLib (packaged motion) field names to RobotState (single motion/sim state) field names
 _motion_field_mapping = {
     "gts": "rigid_body_pos",
@@ -878,6 +985,35 @@ class MotionLib:
             file_path, map_location=self.device, weights_only=False
         )
 
+        # Runtime target-mass reweight (unsharded-load parity with
+        # load_from_file_sharded): if a "<pack>.mix_target.json" sidecar is
+        # present, rescale motion_weights so per-class global mass fractions
+        # match the target. Requires the pack's "<pack>.mix.json" class
+        # boundaries; if that sidecar is absent, log and skip (no mix.json
+        # means we cannot know which weight indices belong to which class).
+        mix_target_path = str(file_path) + _MIX_TARGET_SIDECAR_SUFFIX
+        if os.path.isfile(mix_target_path) and "motion_weights" in loaded_data:
+            mix_sidecar_path = str(file_path) + ".mix.json"
+            num_motions = int(loaded_data["motion_weights"].shape[0])
+            class_boundaries = load_shard_class_boundaries(
+                mix_sidecar_path, num_motions
+            )
+            if class_boundaries is None:
+                log.warning(
+                    f"[motion-mix-target] found {mix_target_path} but no "
+                    f"usable class boundaries (missing/invalid "
+                    f"{mix_sidecar_path}); skipping target-mass rescale"
+                )
+            else:
+                target_fractions = load_mix_target(mix_target_path, class_boundaries)
+                loaded_data["motion_weights"] = rescale_to_target_mass(
+                    loaded_data["motion_weights"], class_boundaries, target_fractions
+                ).to(self.device)
+                print(
+                    f"[motion-mix-target] applied target mass sidecar "
+                    f"{mix_target_path}: {target_fractions}"
+                )
+
         # Pre-initialize all fields to None so missing fields (e.g. contacts
         # discarded at save time) don't cause AttributeError below.
         for field in self._fields:
@@ -961,6 +1097,27 @@ class MotionLib:
                 "(global class sampling mass only approximately preserved)"
             )
 
+        # Runtime target-mass reweight, applied to the GLOBAL weight tensor
+        # BEFORE compute_rank_shard so the per-rank renorm (above) targets the
+        # already-rescaled class masses. Must happen here, not post-shard.
+        mix_target_path = str(file_path) + _MIX_TARGET_SIDECAR_SUFFIX
+        if os.path.isfile(mix_target_path):
+            if class_boundaries is None:
+                log.warning(
+                    f"[motion-mix-target][rank {rank}] found {mix_target_path} "
+                    f"but no usable class boundaries (missing/invalid "
+                    f"{sidecar_path}); skipping target-mass rescale"
+                )
+            else:
+                target_fractions = load_mix_target(mix_target_path, class_boundaries)
+                loaded_data["motion_weights"] = rescale_to_target_mass(
+                    loaded_data["motion_weights"], class_boundaries, target_fractions
+                )
+                print(
+                    f"[motion-mix-target][rank {rank}] applied target mass "
+                    f"sidecar {mix_target_path}: {target_fractions}"
+                )
+
         local_indices, local_weights, report = compute_rank_shard(
             num_motions_global,
             loaded_data["motion_weights"],
@@ -1039,7 +1196,13 @@ class MotionLib:
         B. every sidecar class present with >0 mass on this rank (checked in
            compute_rank_shard).
         C. per-class post-renorm mass fractions identical across ranks and equal
-           to the global fractions (all_gather, tol 1e-5).
+           to the global fractions (all_gather, tol 1e-5). "Global fractions"
+           here means whatever `report["classes"][i]["global_mass_fraction"]`
+           says — computed by compute_rank_shard from the weight tensor it was
+           given. When a mix_target sidecar is active, that tensor was already
+           rescaled to the target fractions before compute_rank_shard ran, so
+           this assert transparently checks against the TARGET fractions in
+           that case (no separate expected-value branch needed).
         D. local frame tensors consistent with motion_num_frames/length_starts.
         """
         rank, world_size = self.shard_rank, self.shard_world_size
