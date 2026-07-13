@@ -452,6 +452,25 @@ class BaseEnv:
                 self._action_delay[env_ids] = torch.where(
                     exposed, delays, torch.zeros_like(delays)
                 )
+            elif getattr(cfg, "action_delay_probs", None) is not None:
+                # Discrete weighted distribution (night13/T3 operator revision):
+                # P(delay=d) = probs[d]. The epoch ramp caps the SUPPORT at
+                # effective_max_action_delay(epoch): only delays <= hi are
+                # allowed and their probabilities are renormalized
+                # (truncate + renormalize). torch.multinomial normalizes
+                # weights internally, so truncation alone suffices.
+                probs = torch.tensor(
+                    cfg.action_delay_probs, dtype=torch.float, device=self.device
+                )
+                probs = probs[: int(hi) + 1]
+                if probs.sum() <= 0:
+                    # Ramp cap so tight that all allowed delays have zero
+                    # configured mass -> everyone runs clean (delay 0).
+                    self._action_delay[env_ids] = 0
+                else:
+                    self._action_delay[env_ids] = torch.multinomial(
+                        probs, n, replacement=True
+                    ).to(dtype=torch.long)
             else:
                 self._action_delay[env_ids] = torch.randint(
                     int(lo), int(hi) + 1, (n,), dtype=torch.long, device=self.device

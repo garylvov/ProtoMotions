@@ -223,3 +223,104 @@ def test_settings_env_parsing():
         for k in ("ACTION_DELAY_DR", "ACTION_DELAY_FRAC",
                   "ACTION_DELAY_STEPS_MAX"):
             os.environ.pop(k, None)
+
+
+# =============================================================================
+# Weighted discrete action-delay distribution (night13/T3 operator revision)
+# =============================================================================
+
+NIGHT13_PROBS = [0.2, 0.35, 0.3, 0.1, 0.05]
+
+
+def _sample_probs(n, probs, epoch=0, ramp_epochs=None, seed=0):
+    from protomotions.simulator.base_simulator.config import (
+        DelayDomainRandomizationConfig,
+    )
+
+    torch.manual_seed(seed)
+    cfg = DelayDomainRandomizationConfig(
+        action_delay_steps=(0, len(probs) - 1),
+        observation_delay_steps=(0, 2),
+        ramp_epochs=ramp_epochs,
+        action_delay_probs=probs,
+    )
+    env = SimpleNamespace(
+        _delay_cfg=cfg,
+        _has_action_delay=True,
+        _has_obs_delay=False,
+        _current_epoch=epoch,
+        device=DEVICE,
+        _action_delay=torch.zeros(n, dtype=torch.long),
+        _obs_delay=torch.zeros(n, dtype=torch.long),
+        _delay_partial=ActionDelaySettings(enabled=False),
+    )
+    BaseEnv._sample_delays(env, torch.arange(n))
+    return env._action_delay, cfg
+
+
+def test_delay_probs_distribution_counts_within_tolerance():
+    n = 100000
+    d, _ = _sample_probs(n, NIGHT13_PROBS, seed=11)
+    for v, p in enumerate(NIGHT13_PROBS):
+        frac = (d == v).float().mean().item()
+        assert abs(frac - p) < 0.01, (v, frac, p)
+    assert d.max().item() == 4 and d.min().item() == 0
+
+
+def test_delay_probs_buffer_capacity_and_max_delay():
+    from protomotions.simulator.base_simulator.config import (
+        DelayDomainRandomizationConfig,
+    )
+
+    cfg = DelayDomainRandomizationConfig(
+        action_delay_steps=(0, 4),
+        action_delay_probs=NIGHT13_PROBS,
+    )
+    # max_action_delay derives from the distribution -> ring buffer len 5.
+    assert cfg.max_action_delay() == 4
+    assert cfg.has_action_delay()
+
+
+def test_delay_probs_ramp_truncates_and_renormalizes_support():
+    # epoch 0 of a ramp -> effective max 0 -> everyone clean.
+    d0, cfg = _sample_probs(50000, NIGHT13_PROBS, epoch=0, ramp_epochs=100, seed=5)
+    assert cfg.effective_max_action_delay(0) == 0
+    assert int(d0.max().item()) == 0
+    # half-ramp -> effective max = round(4*0.5) = 2 -> support {0,1,2},
+    # renormalized to [.2,.35,.3]/0.85.
+    d50, cfg = _sample_probs(100000, NIGHT13_PROBS, epoch=50, ramp_epochs=100, seed=6)
+    assert cfg.effective_max_action_delay(50) == 2
+    assert int(d50.max().item()) == 2
+    scale = sum(NIGHT13_PROBS[:3])
+    for v in (0, 1, 2):
+        frac = (d50 == v).float().mean().item()
+        assert abs(frac - NIGHT13_PROBS[v] / scale) < 0.01, (v, frac)
+    # full ramp -> whole support back.
+    d100, cfg = _sample_probs(50000, NIGHT13_PROBS, epoch=100, ramp_epochs=100, seed=7)
+    assert cfg.effective_max_action_delay(100) == 4
+    assert int(d100.max().item()) == 4
+
+
+def test_delay_probs_validation():
+    import pytest
+    from protomotions.simulator.base_simulator.config import (
+        DelayDomainRandomizationConfig,
+    )
+
+    with pytest.raises(ValueError):
+        DelayDomainRandomizationConfig(action_delay_probs=[0.5, 0.4])  # sums to .9
+    with pytest.raises(ValueError):
+        DelayDomainRandomizationConfig(action_delay_probs=[1.5, -0.5])  # negative
+    with pytest.raises(ValueError):
+        DelayDomainRandomizationConfig(action_delay_probs=[])  # empty
+
+
+def test_delay_exactness_d4_ring_buffer():
+    # Ring buffer correctness at the new max delay 4 (buffer length 5).
+    env = _mock_env(2, delays=[4, 3], max_delay=4)
+    for t in range(12):
+        applied = _step(env, t)
+        exp0 = 1000.0 * 0 + max(0, t - 4)
+        exp1 = 1000.0 * 1 + max(0, t - 3)
+        assert applied[0, 0] == exp0, (t, applied[0, 0].item(), exp0)
+        assert applied[1, 0] == exp1, (t, applied[1, 0].item(), exp1)

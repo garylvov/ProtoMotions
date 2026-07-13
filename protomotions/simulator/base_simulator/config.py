@@ -852,7 +852,31 @@ class DelayDomainRandomizationConfig:
                 "protomotions/agents/base_agent/agent.py:845) — the ramp fraction is "
                 "therefore a pure function of a globally-lockstep counter, not any "
                 "per-rank random or wall-clock state, so all ranks compute identical "
-                "effective bounds and never diverge in the DR sampling collective."
+                "effective bounds and never diverge in the DR sampling collective. "
+                "With action_delay_probs, the ramp CAPS the distribution's support "
+                "instead (see that field's help)."
+            )
+        },
+    )
+    action_delay_probs: Optional[List[float]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional DISCRETE distribution over per-env action delays "
+                "(night13/T3, operator revision 2026-07-13): probs[d] = P(delay=d "
+                "control steps), d = 0..len(probs)-1. When set, per-env action "
+                "delays are sampled from this distribution at reset INSTEAD of "
+                "uniform over action_delay_steps (which is then ignored for "
+                "action-delay sampling; observation delay is unaffected). Must "
+                "be non-negative and sum to 1 +/- 1e-6. max_action_delay() "
+                "becomes len(probs)-1, so the action ring buffer automatically "
+                "sizes to hold the largest delay. RAMP semantics: ramp_epochs "
+                "caps the distribution's SUPPORT — at epoch E only delays "
+                "<= effective_max_action_delay(E) are allowed, and the "
+                "probabilities over the allowed delays are renormalized "
+                "(truncate + renormalize; the simplest correct adaptation of "
+                "the range-cap semantics). Read via getattr(cfg, "
+                "'action_delay_probs', None) for pre-field pickles."
             )
         },
     )
@@ -868,6 +892,17 @@ class DelayDomainRandomizationConfig:
                 raise ValueError(f"{name}[0] must be <= {name}[1].")
         if self.ramp_epochs is not None and self.ramp_epochs <= 0:
             raise ValueError("ramp_epochs must be a positive int (or None to disable).")
+        if self.action_delay_probs is not None:
+            probs = self.action_delay_probs
+            if len(probs) < 1:
+                raise ValueError("action_delay_probs must have at least one entry.")
+            if any(p < 0 for p in probs):
+                raise ValueError("action_delay_probs entries must be non-negative.")
+            total = float(sum(probs))
+            if abs(total - 1.0) > 1e-6:
+                raise ValueError(
+                    f"action_delay_probs must sum to 1.0 +/- 1e-6, got {total}."
+                )
 
     def effective_max_action_delay(self, current_epoch: int) -> int:
         return self._ramp(self.max_action_delay(), self.action_delay_steps[0], current_epoch)
@@ -885,6 +920,9 @@ class DelayDomainRandomizationConfig:
         return max(eff, configured_min)
 
     def max_action_delay(self) -> int:
+        probs = getattr(self, "action_delay_probs", None)
+        if probs is not None:
+            return len(probs) - 1
         return int(self.action_delay_steps[1])
 
     def max_observation_delay(self) -> int:
