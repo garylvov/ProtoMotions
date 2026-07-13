@@ -520,7 +520,14 @@ class BaseEnv:
         return delayed
 
     def _apply_observation_delay(self, obs: dict) -> dict:
-        """Return a per-env time-delayed version of the observation dict."""
+        """Return a per-env time-delayed version of the observation dict.
+
+        WARNING: obs-delay output currently feeds ONLY the critic's next_value
+        GAE bootstrap (ppo/agent.py), never the actor -- this injects noise into
+        the critic (which must see clean/privileged obs) and is a no-op for the
+        policy. DISABLED in the night13 recipe until re-wired to the actor's
+        input only. See PR discussion.
+        """
         if not self._has_obs_delay:
             return obs
         length = self._delay_cfg.max_observation_delay() + 1

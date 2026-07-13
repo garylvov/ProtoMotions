@@ -829,6 +829,11 @@ class DelayDomainRandomizationConfig:
             "help": "Range (min,max) of control-step delay on the PD target sent to the sim."
         },
     )
+    # WARNING: obs-delay output currently feeds ONLY the critic's next_value GAE
+    # bootstrap (ppo/agent.py), never the actor -- this injects noise into the
+    # critic (which must see clean/privileged obs) and is a no-op for the policy.
+    # DISABLED in the night13 recipe until re-wired to the actor's input only.
+    # See PR discussion.
     observation_delay_steps: Tuple[int, int] = field(
         default=(0, 0),
         metadata={
