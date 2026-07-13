@@ -90,6 +90,25 @@ _WBC_STABILITY_ENV_DEFAULTS = {
     "TORCH_NCCL_ENABLE_MONITORING": "1",
     "TORCH_NCCL_ASYNC_ERROR_HANDLING": "1",
     "TORCH_NCCL_TRACE_BUFFER_SIZE": "1048576",
+    # NCCL 2.26.2 DDP deadlock fix (2026-07-13). Root cause (native-stack forensics):
+    # actor and critic are SEPARATE DDP modules with separate reducer buckets. The
+    # critic bucket's FIRST all-reduce lazy-connects its NCCL channel ON THE HOT PATH
+    # (the actor bucket was warmed by the actor step; the critic's was not). That lazy
+    # connect spawns NCCL's nonblocking group-launch worker thread and joins it, hitting
+    # a join-on-recycled-thread hang: ncclCommGetAsyncError -> ncclGroupJobComplete ->
+    # ncclAsyncJobComplete -> std::thread::join on a dead pthread (state=ncclSuccess but
+    # the collective is never enqueued). Reproducibly wedged one rank at the first critic
+    # backward of epoch 0/1 on the 36864-env warm-start; NOT memory pressure, NOT a
+    # graph/size mismatch, NOT GPU hardware (ECC/Xid clean; actor all-reduce on the same
+    # comm already succeeded). RUNTIME_CONNECT=0 eager-connects ALL channels at
+    # ncclCommInitRank (init time, off the hot path) -> removes the trigger.
+    # USE_COMM_NONBLOCKING=0 forces BLOCKING comms so the nonblocking group-launch worker
+    # thread never exists -> removes the racy join. Verified: 36864/85GB trains cleanly
+    # past epoch 0/1 (was: hang there twice). A definitive underlying fix is NCCL >=2.27
+    # (fixes "a group launch of multiple communicators"); these env defaults are the
+    # zero-rebuild, spot-durable mitigation.
+    "NCCL_RUNTIME_CONNECT": "0",
+    "TORCH_NCCL_USE_COMM_NONBLOCKING": "0",
 }
 
 
