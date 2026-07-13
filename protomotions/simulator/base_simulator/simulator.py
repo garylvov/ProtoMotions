@@ -515,6 +515,7 @@ class Simulator(RecordingMixin, ABC):
                     self._sample_wrench_vectors(
                         len(persistent_ids), cfg.force_magnitude_range, self.device,
                         mode=getattr(cfg, "direction_mode", "uniform"),
+                        cone_deg=getattr(cfg, "downward_cone_deg", 30.0),
                     ) * scale
                 )
                 sched["torques"][persistent_ids, body_choice] = (
@@ -547,6 +548,7 @@ class Simulator(RecordingMixin, ABC):
         magnitude_range: Tuple[float, float],
         device: torch.device,
         mode: str = "uniform",
+        cone_deg: float = 30.0,
     ) -> torch.Tensor:
         """Sample [num, 3] vectors with mode-dependent direction and uniform magnitude.
 
@@ -572,6 +574,19 @@ class Simulator(RecordingMixin, ABC):
             xy = h_dir * h_frac * magnitudes
             z = -magnitudes
             return torch.cat([xy, z], dim=-1)
+        if mode == "downward_cone":
+            # Unit direction uniform over the spherical cap of half-angle
+            # ``cone_deg`` around -z (dominant downward payload + bounded sway),
+            # scaled by the sampled magnitude (so |force| == magnitude exactly).
+            cos_theta = math.cos(math.radians(cone_deg))
+            u = torch.rand(num, 1, device=device)
+            cos_a = cos_theta + u * (1.0 - cos_theta)  # in [cos_theta, 1]
+            sin_a = (1.0 - cos_a * cos_a).clamp_min(0.0).sqrt()
+            phi = (2.0 * math.pi) * torch.rand(num, 1, device=device)
+            dirs = torch.cat(
+                [sin_a * torch.cos(phi), sin_a * torch.sin(phi), -cos_a], dim=-1
+            )
+            return dirs * magnitudes
         directions = torch.randn(num, 3, device=device)
         if mode == "horizontal":
             directions[:, 2] *= 0.25
@@ -618,6 +633,7 @@ class Simulator(RecordingMixin, ABC):
                 forces = self._sample_wrench_vectors(
                     num_due, cfg.force_magnitude_range, self.device,
                     mode=getattr(cfg, "direction_mode", "uniform"),
+                    cone_deg=getattr(cfg, "downward_cone_deg", 30.0),
                 ) * scale
                 torques = self._sample_wrench_vectors(
                     num_due, cfg.torque_magnitude_range, self.device

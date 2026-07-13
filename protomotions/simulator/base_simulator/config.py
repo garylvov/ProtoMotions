@@ -762,6 +762,40 @@ class WrenchDomainRandomizationConfig:
             )
         },
     )
+    downward_cone_deg: float = field(
+        default=30.0,
+        metadata={
+            "help": (
+                "For direction_mode='downward_cone': half-angle (degrees) of the "
+                "cone around -z the force is sampled within (uniform over the cone "
+                "cap). Dominant downward (payload weight) with bounded random sway "
+                "up to this angle. Default 30 deg."
+            )
+        },
+    )
+    # ---- Epoch-keyed gentle magnitude ramp (night13 2026-07-13, mirror of the
+    # delay-DR ramp_epochs). Default (None/1.0/0) is an exact no-op. env.on_epoch_end
+    # sets magnitude_scale = start + (1-start)*min(1, (epoch - start_epoch)/ramp_epochs),
+    # read live by the simulator at each reset/burst -> persistent forces ramp up as
+    # episodes turn over, no restarts. ----
+    magnitude_ramp_epochs: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "If set, ramp magnitude_scale from magnitude_start_scale up to 1.0 "
+                "over this many epochs (starting at magnitude_ramp_start_epoch). "
+                "None (default) = no ramp (magnitude_scale used as-is)."
+            )
+        },
+    )
+    magnitude_start_scale: float = field(
+        default=1.0,
+        metadata={"help": "Starting magnitude_scale at the ramp start epoch (see magnitude_ramp_epochs)."},
+    )
+    magnitude_ramp_start_epoch: int = field(
+        default=0,
+        metadata={"help": "Absolute epoch at which the magnitude ramp begins (for resume reproducibility)."},
+    )
 
     def __post_init__(self):
         for name, rng in (
@@ -796,10 +830,21 @@ class WrenchDomainRandomizationConfig:
                 raise ValueError(f"{name}[0] must be <= {name}[1].")
         if not (0.0 <= self.all_bodies_prob <= 1.0):
             raise ValueError("all_bodies_prob must be in [0, 1].")
-        if self.direction_mode not in ("uniform", "horizontal", "downward"):
+        if self.direction_mode not in (
+            "uniform", "horizontal", "downward", "downward_cone"
+        ):
             raise ValueError(
-                "direction_mode must be one of 'uniform', 'horizontal', 'downward'."
+                "direction_mode must be one of 'uniform', 'horizontal', "
+                "'downward', 'downward_cone'."
             )
+        if not (0.0 < self.downward_cone_deg <= 90.0):
+            raise ValueError("downward_cone_deg must be in (0, 90].")
+        if self.magnitude_ramp_epochs is not None and self.magnitude_ramp_epochs <= 0:
+            raise ValueError("magnitude_ramp_epochs must be a positive int (or None).")
+        if self.magnitude_start_scale < 0.0:
+            raise ValueError("magnitude_start_scale must be non-negative.")
+        if self.magnitude_ramp_start_epoch < 0:
+            raise ValueError("magnitude_ramp_start_epoch must be >= 0.")
         if self.magnitude_scale < 0.0:
             raise ValueError("magnitude_scale must be non-negative.")
 

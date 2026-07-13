@@ -957,8 +957,32 @@ class BaseEnv:
         in the same training-loop iteration (no per-rank randomness or wall-clock input),
         so every rank computes the identical ramp fraction/effective max and the delay-DR
         RNG draws stay independent-but-parameterized-identically (no collective divergence).
+
+        Also drives the WRENCH magnitude epoch-ramp (mirror of the delay ramp): for any
+        wrench class with ``magnitude_ramp_epochs`` set, magnitude_scale is ramped from
+        ``magnitude_start_scale`` up to 1.0 over that many epochs (from
+        ``magnitude_ramp_start_epoch``). magnitude_scale is read live by the simulator at
+        each reset/burst, so persistent payload forces ramp up as episodes turn over.
+        current_epoch is the same rank-lockstep counter used above, so every rank sets an
+        identical magnitude_scale (no collective divergence). Default (no ramp fields) is a
+        no-op.
         """
         self._current_epoch = current_epoch
+
+        _sim = getattr(self, "simulator", None)
+        _scheds = getattr(_sim, "_wrench_scheds", None) or []
+        _seen = set()
+        for _sched in _scheds:
+            _cfg = _sched.get("cfg") if isinstance(_sched, dict) else None
+            if _cfg is None or id(_cfg) in _seen:
+                continue
+            _seen.add(id(_cfg))
+            _rk = getattr(_cfg, "magnitude_ramp_epochs", None)
+            if _rk:
+                _start = getattr(_cfg, "magnitude_start_scale", 1.0)
+                _e0 = getattr(_cfg, "magnitude_ramp_start_epoch", 0)
+                _frac = min(1.0, max(0.0, float(current_epoch - _e0)) / float(_rk))
+                _cfg.magnitude_scale = _start + (1.0 - _start) * _frac
 
     def post_physics_step(self):
         """Update environment state after physics simulation step.
