@@ -391,7 +391,10 @@ class MimicEvaluator(BaseEvaluator):
             for m in range(num_motions):
                 f = motion_num_frames[m].item()
                 f = min(f, data.shape[1])
-                per_motion.append(data[m, :f].detach().clone())
+                # Move each motion's slice to CPU before concatenation: with ~42k
+                # motions, concatenating rigid_body_pos on GPU OOMs. The final
+                # torch.save target is a disk-only artifact, so CPU is fine.
+                per_motion.append(data[m, :f].detach().cpu())
             return torch.cat(per_motion, dim=0)
 
         # Build packed tensors matching MotionLib field names
@@ -453,6 +456,9 @@ class MimicEvaluator(BaseEvaluator):
             # correction and scene xy.
             env_offsets[:, 2] -= float(self.env.config.ref_respawn_offset)
             per_motion_offset[unique_motion_ids] = env_offsets
+        # gts now lives on CPU (pack_metric concatenates there to avoid the
+        # GPU OOM); match devices before subtracting below.
+        per_motion_offset = per_motion_offset.to(gts.device)
         for m in range(num_motions):
             nframes = int(motion_num_frames[m].item())
             if nframes == 0:
@@ -469,8 +475,9 @@ class MimicEvaluator(BaseEvaluator):
             f = motion_num_frames[m].item()
             # Clamp to available frames
             f = min(f, contacts_data.shape[1])
-            # Convert float contacts to bool for consistency with MotionLib format
-            contacts_list.append(contacts_data[m, :f].bool().detach().clone())
+            # Convert float contacts to bool for consistency with MotionLib format;
+            # concat on CPU for the same OOM reason as pack_metric above.
+            contacts_list.append(contacts_data[m, :f].bool().detach().cpu())
         contacts = torch.cat(contacts_list, dim=0)
 
         # Copy ground-truth motion weights and files

@@ -90,6 +90,7 @@ class PPOActor(ProtoMotionsTensorDictModule):
         tensordict["action"] = action
         tensordict["mean_action"] = mu
         tensordict["neglogp"] = neglogp
+        tensordict["std"] = mu * 0 + std
 
         return tensordict
 

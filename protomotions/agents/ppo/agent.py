@@ -448,7 +448,7 @@ class PPO(BaseAgent):
         # Recompute neglogp for the actions that were actually taken (from experience buffer)
         # We need the current policy's evaluation, not the sampled action's neglogp
         mu = mean_action  # Already tanh-bounded
-        std = torch.exp(self.actor_module.logstd)
+        std = batch_td["std"]
         dist = torch.distributions.Normal(mu, mu * 0 + std)
         current_neglogp = -dist.log_prob(batch_dict["action"]).sum(dim=-1)
 
