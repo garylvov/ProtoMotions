@@ -59,10 +59,29 @@ def _default_ddp_strategy() -> fabric.strategies.DDPStrategy:
     # its graph across iterations (torch then errors loudly, not silently).
     find_unused = os.environ.get("DDP_FIND_UNUSED_PARAMETERS", "1") == "1"
     static_graph = os.environ.get("DDP_STATIC_GRAPH", "1") == "1"
+    # 2026-07-13 night13 Gate A attempt-3 Epoch-1 deadlock fix:
+    # broadcast_buffers defaults to True in torch DDP, which issues a
+    # per-forward _sync_module_buffers BROADCAST collective in DDP._pre_forward.
+    # py-spy (gateA_attempt3_deadlock_pyspy_20260713.txt) caught the 8-rank
+    # fleet drifted a full minibatch apart across the PPO num_mini_epochs loop:
+    # rank2 parked in that _distributed_broadcast_coalesced buffer-broadcast at
+    # the START of minibatch M's actor_step (ppo/agent.py:444), 5 ranks already
+    # PAST it (actor_step:473), and 2 ranks a step BEHIND still spinning on
+    # minibatch M-1's gradient-bucket all-reduce at handle_model_grad_clipping.
+    # The buffer-broadcast is a SECOND per-forward collective independent of the
+    # (already static_graph-stabilised) gradient reducer; under the mini-epoch
+    # loop its ordering desynced vs the grad all-reduce -> NCCL cross-collective
+    # mismatch -> hard deadlock, GPU 7x100%/1x0%. The broadcast buffers are the
+    # obs RunningMeanStd normaliser stats, which do NOT need re-broadcasting
+    # every optimize forward (they are updated during rollout, not optimize),
+    # so disabling it removes the offending collective with no behavioural cost.
+    # Env-overridable to re-enable if a future model needs buffer sync.
+    broadcast_buffers = os.environ.get("DDP_BROADCAST_BUFFERS", "0") == "1"
     return fabric.strategies.DDPStrategy(
         timeout=timedelta(seconds=timeout_sec),
         find_unused_parameters=find_unused,
         static_graph=static_graph,
+        broadcast_buffers=broadcast_buffers,
     )
 
 
