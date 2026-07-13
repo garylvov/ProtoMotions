@@ -1804,6 +1804,47 @@ def anchor_ori_error_term_factory(threshold: float = 0.8) -> MdpComponent:
     )
 
 
+def anchor_yaw_error_term_factory(
+    threshold: float = 1.0472, settle_steps: int = 0
+) -> MdpComponent:
+    """Factory for anchor yaw (heading) drift termination (night13/T3, NEW).
+
+    Distinct from ``anchor_ori_error_term_factory`` (tilt / projected-gravity
+    metric): this terminates on global HEADING drift specifically, via
+    ``compute_anchor_yaw_error_term``. ``settle_steps`` is the same generic
+    post-reset grace-window primitive used by ``tracking_error_term_factory``
+    (``combine_terminations`` in base_env/utils.py applies it uniformly to any
+    termination component that sets it — not specific to this factory); there
+    is no mid-episode consecutive-violation debounce primitive in this
+    codebase today, so ``settle_steps`` is the closest available "persistence"
+    lever (see night13 T3 OUT.md for the deviation note).
+
+    Args:
+        threshold: Maximum allowed yaw drift in radians (default 1.0472 rad
+            = 60 degrees).
+        settle_steps: Suppress this termination for this many env steps after
+            reset. 0 preserves immediate-termination behavior.
+
+    Returns:
+        MdpComponent configured for anchor yaw error termination.
+    """
+    from protomotions.envs.terminations import compute_anchor_yaw_error_term
+
+    static_params = {"threshold": threshold}
+    if settle_steps:
+        static_params["settle_steps"] = int(settle_steps)
+
+    return MdpComponent(
+        compute_func=compute_anchor_yaw_error_term,
+        dynamic_vars={
+            "current_anchor_rot": EnvContext.current.anchor_rot,
+            "ref_rigid_body_rot": EnvContext.mimic.ref_state.rigid_body_rot,
+            "anchor_idx": EnvContext.mimic.anchor_idx,
+        },
+        static_params=static_params,
+    )
+
+
 def relative_body_pos_error_term_factory(threshold: float = 0.25) -> MdpComponent:
     """Factory for relative body position error termination (BeyondMimic).
 
@@ -2167,6 +2208,7 @@ __all__ = [
     "tracking_error_term_factory",
     "anchor_pos_error_term_factory",
     "anchor_ori_error_term_factory",
+    "anchor_yaw_error_term_factory",
     "relative_body_pos_error_term_factory",
     "anchor_height_error_term_factory",
     "fall_termination_factory",
