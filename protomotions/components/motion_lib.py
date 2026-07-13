@@ -71,6 +71,78 @@ _SHARD_FRAME_FIELDS = (
 _SHARD_MOTION_FIELDS = ("motion_lengths", "motion_dt", "motion_num_frames")
 
 
+# --- Smoothed-contacts disk cache -------------------------------------------
+#
+# MotionLib.smooth_contacts() runs a per-motion conv1d over the (possibly
+# per-rank) contacts tensor on every env construction. For large packs this
+# costs several minutes at every startup. We cache the smoothed tensor to a
+# sidecar next to the pack -- keyed by (pack size+mtime, smoothing window, and
+# when sharded world_size+rank) -- and skip the recompute on a validated hit.
+# The cache is best-effort: any error falls back to the normal recompute path,
+# so it can never break loading. Disable with MOTION_LIB_SMOOTHED_CACHE_DISABLE=1.
+_SMOOTHED_CACHE_DISABLE_ENV = "MOTION_LIB_SMOOTHED_CACHE_DISABLE"
+
+
+def _smoothed_contacts_cache_disabled() -> bool:
+    return os.environ.get(_SMOOTHED_CACHE_DISABLE_ENV, "0") not in (
+        "0",
+        "",
+        "false",
+        "False",
+    )
+
+
+def _raw_pack_path(motion_file):
+    """Strip the '#shard{r}of{ws}' suffix a sharded load appends to motion_file."""
+    if not motion_file:
+        return None
+    return str(motion_file).split("#shard")[0]
+
+
+def _pack_signature(pack_path):
+    st = os.stat(pack_path)
+    return {"size": int(st.st_size), "mtime_ns": int(st.st_mtime_ns)}
+
+
+def _smoothed_contacts_sidecar_path(pack_path, window_size, world_size=None, rank=None):
+    if world_size is not None and rank is not None:
+        return (
+            f"{pack_path}.smoothed_contacts_w{window_size}"
+            f".ws{world_size}.rank{rank}.pt"
+        )
+    return f"{pack_path}.smoothed_contacts_w{window_size}.pt"
+
+
+def _smooth_contacts_core(
+    contacts, length_starts, motion_num_frames, num_motions, window_size, device
+):
+    """Per-motion moving-average smoothing that respects motion boundaries.
+
+    Pure re-expression of the original smooth_contacts convolution loop; returns
+    a new float32 tensor clamped to [0, 1] (does not mutate the input).
+    """
+    kernel = (
+        torch.ones(1, 1, window_size, device=device, dtype=torch.float32)
+        / window_size
+    )
+    padding = window_size // 2
+    smoothed = torch.zeros_like(contacts, dtype=torch.float32)
+    for motion_idx in range(num_motions):
+        start_idx = int(length_starts[motion_idx].item())
+        num_frames = int(motion_num_frames[motion_idx].item())
+        end_idx = start_idx + num_frames
+        motion_contacts = contacts[start_idx:end_idx].float()
+        contacts_for_conv = motion_contacts.t().unsqueeze(1)
+        padded_contacts = torch.nn.functional.pad(
+            contacts_for_conv, (padding, padding), mode="replicate"
+        )
+        smoothed_motion = torch.nn.functional.conv1d(
+            padded_contacts, kernel, padding=0
+        )
+        smoothed[start_idx:end_idx] = smoothed_motion.squeeze(1).t()
+    return torch.clamp(smoothed, 0.0, 1.0)
+
+
 def motion_lib_shard_enabled() -> bool:
     """True when per-rank motion-lib sharding is requested via env var."""
     return os.environ.get(_MOTION_SHARD_ENV, "0") == "1"
@@ -1286,6 +1358,12 @@ class MotionLib:
         IMPORTANT: Smoothing respects motion boundaries - each motion is smoothed
         independently to avoid artifacts from one motion bleeding into another.
 
+        A validated disk cache (a sidecar next to the motion pack, keyed by pack
+        size+mtime, window size, and -- when sharded -- world_size+rank) lets us
+        skip the O(num_motions) convolution loop on subsequent startups. The
+        cache is best-effort: any error falls back to recompute, so it can never
+        break loading. Disable via MOTION_LIB_SMOOTHED_CACHE_DISABLE=1.
+
         Args:
             window_size: Size of the moving average window (must be positive odd number)
 
@@ -1304,6 +1382,10 @@ class MotionLib:
             print(
                 "Warning: No contacts to smooth (contacts are None, likely all-zero at load time)"
             )
+            return
+
+        # Fast path: load pre-smoothed contacts from the disk cache if valid.
+        if self._try_load_smoothed_contacts_cache(window_size):
             return
 
         # Validate that contacts are binary (0/1 or boolean)
@@ -1329,56 +1411,112 @@ class MotionLib:
 
         print(f"Smoothing contact labels with window size {window_size}...")
 
-        # contacts shape: [total_frames, num_bodies]
-        total_frames, num_bodies = self.contacts.shape
         num_motions = self.num_motions()
 
-        # Create uniform kernel for moving average
-        kernel = (
-            torch.ones(1, 1, window_size, device=self.device, dtype=torch.float32)
-            / window_size
+        # Smooth each motion independently to respect motion boundaries.
+        self.contacts = _smooth_contacts_core(
+            self.contacts,
+            self.length_starts,
+            self.motion_num_frames,
+            num_motions,
+            window_size,
+            self.device,
         )
-        padding = window_size // 2
-
-        # Smooth each motion independently to respect motion boundaries
-        smoothed_contacts = torch.zeros_like(self.contacts, dtype=torch.float32)
-
-        for motion_idx in range(num_motions):
-            # Get the range for this motion
-            start_idx = self.length_starts[motion_idx].item()
-            num_frames = self.motion_num_frames[motion_idx].item()
-            end_idx = start_idx + num_frames
-
-            # Extract contacts for this motion: [num_frames, num_bodies]
-            motion_contacts = self.contacts[start_idx:end_idx].float()
-
-            # Reshape for conv1d: [num_bodies, 1, num_frames]
-            contacts_for_conv = motion_contacts.t().unsqueeze(1)
-
-            # Manually apply replicate padding (functional conv1d doesn't support padding_mode)
-            padded_contacts = torch.nn.functional.pad(
-                contacts_for_conv,
-                (padding, padding),  # pad left and right
-                mode="replicate",
-            )
-
-            # Apply 1D convolution (no padding needed since we already padded)
-            smoothed_motion = torch.nn.functional.conv1d(
-                padded_contacts, kernel, padding=0
-            )
-
-            # Reshape back to [num_frames, num_bodies] and store
-            smoothed_contacts[start_idx:end_idx] = smoothed_motion.squeeze(1).t()
-
-        # Replace contacts with smoothed version
-        self.contacts = smoothed_contacts
-
-        # Ensure values stay in [0, 1] (they should already, but clamp for numerical stability)
-        self.contacts = torch.clamp(self.contacts, 0.0, 1.0)
 
         print(
             f"Contact smoothing complete for {num_motions} motions. Contacts are now float values in [0, 1]."
         )
+
+        # Persist to the disk cache for future startups (best-effort).
+        self._save_smoothed_contacts_cache(window_size)
+
+    def _smoothed_contacts_cache_spec(self, window_size):
+        """Resolve (sidecar_path, signature, world_size, rank) or None if the
+        cache is unavailable/disabled for this instance."""
+        if _smoothed_contacts_cache_disabled():
+            return None
+        raw = _raw_pack_path(getattr(self, "motion_file", None))
+        if not raw or not os.path.isfile(raw):
+            return None
+        sharded = bool(getattr(self, "sharded_across_ranks", False))
+        ws = int(getattr(self, "shard_world_size")) if sharded else None
+        rank = int(getattr(self, "shard_rank")) if sharded else None
+        try:
+            sig = _pack_signature(raw)
+        except OSError:
+            return None
+        sidecar = _smoothed_contacts_sidecar_path(raw, window_size, ws, rank)
+        return sidecar, sig, ws, rank
+
+    def _try_load_smoothed_contacts_cache(self, window_size) -> bool:
+        """Return True (and set self.contacts) on a validated cache hit."""
+        try:
+            spec = self._smoothed_contacts_cache_spec(window_size)
+            if spec is None:
+                return False
+            sidecar, sig, _ws, _rank = spec
+            if not os.path.isfile(sidecar):
+                return False
+            cached = torch.load(sidecar, map_location="cpu", weights_only=False)
+            if (
+                not isinstance(cached, dict)
+                or cached.get("window") != window_size
+                or cached.get("signature") != sig
+                or "contacts" not in cached
+            ):
+                log.warning(
+                    f"[smoothed-cache] stale/invalid sidecar {sidecar}; recomputing"
+                )
+                return False
+            cc = cached["contacts"]
+            if tuple(cc.shape) != tuple(self.contacts.shape):
+                log.warning(
+                    f"[smoothed-cache] shape mismatch {tuple(cc.shape)} != "
+                    f"{tuple(self.contacts.shape)} in {sidecar}; recomputing"
+                )
+                return False
+            self.contacts = cc.to(device=self.device, dtype=torch.float32)
+            print(
+                f"[smoothed-cache] loaded pre-smoothed contacts from {sidecar} "
+                "(skipped recompute)"
+            )
+            return True
+        except Exception as e:  # never let the cache break loading
+            log.warning(f"[smoothed-cache] load failed ({e}); recomputing")
+            return False
+
+    def _save_smoothed_contacts_cache(self, window_size) -> None:
+        """Atomically write the smoothed contacts sidecar (best-effort)."""
+        tmp = None
+        try:
+            spec = self._smoothed_contacts_cache_spec(window_size)
+            if spec is None:
+                return
+            sidecar, sig, ws, rank = spec
+            if os.path.isfile(sidecar):
+                return
+            payload = {
+                "contacts": self.contacts.detach().to("cpu", torch.float32),
+                "signature": sig,
+                "window": window_size,
+                "world_size": ws,
+                "rank": rank,
+                "shape": tuple(self.contacts.shape),
+            }
+            tmp = f"{sidecar}.tmp.{os.getpid()}"
+            torch.save(payload, tmp)
+            os.replace(tmp, sidecar)
+            print(f"[smoothed-cache] wrote pre-smoothed contacts to {sidecar}")
+        except Exception as e:  # never let the cache break loading
+            log.warning(
+                f"[smoothed-cache] save failed ({e}); continuing without cache"
+            )
+            if tmp is not None:
+                try:
+                    if os.path.isfile(tmp):
+                        os.remove(tmp)
+                except OSError:
+                    pass
 
     def translate_all_motions_to_origin(self, target_xy: Optional[torch.Tensor] = None):
         """
