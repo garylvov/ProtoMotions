@@ -30,6 +30,36 @@ def heading_local_xy_delta(
     return rotations.quat_rotate(heading_inv, rel_pos, w_last)[..., :2]
 
 
+def heading_local_xyz_delta(
+    origin_pos: Tensor,
+    origin_rot: Tensor,
+    target_pos: Tensor,
+    w_last: bool = True,
+) -> Tensor:
+    """Return target XYZ displacement in the origin heading frame, Z preserved.
+
+    Like ``heading_local_xy_delta`` but keeps the raw (unrotated) vertical
+    delta instead of discarding it. Only the XY plane components of the
+    delta are rotated into the origin's heading-aligned frame (yaw-only
+    rotation about the world Z axis leaves Z untouched anyway), so this is
+    equivalent to rotating the full 3D delta by the heading-inverse quaternion
+    and is a pure delta: heading-invariant under a shared yaw rotation of the
+    origin and target, and translation-invariant (no world-frame absolutes).
+
+    Used for commands/rewards where vertical motion (e.g. deep-bend, pickup)
+    must be observable, unlike ``heading_local_xy_delta`` which is meant for
+    ground-plane-only offsets.
+    """
+    rel_pos = target_pos - origin_pos
+    rel_xy = rel_pos.clone()
+    rel_xy[..., 2] = 0.0
+    heading_inv = rotations.calc_heading_quat_inv(origin_rot, w_last)
+    rotated = rotations.quat_rotate(heading_inv, rel_xy, w_last)
+    rotated = rotated.clone()
+    rotated[..., 2] = rel_pos[..., 2]
+    return rotated
+
+
 def select_step_indices(
     tensor: Tensor,
     steps: Union[int, List[int]],

@@ -54,6 +54,8 @@ from protomotions.envs.rewards.tracking import (
     # Track D root displacement kernels (Option-B fallback, dormant)
     compute_root_xy_displacement_rew,
     compute_root_heading_rew,
+    # Heading-local anchor drift reward (twin of build_mimic_future_displacement_cmd)
+    compute_heading_local_anchor_drift_rew,
 )
 
 # Big-step reward kernels (Track D, OmniH2O-style, dormant; stateful callables)
@@ -124,6 +126,8 @@ __all__ = [
     # Track D root displacement kernels (Option-B fallback, dormant)
     "compute_root_xy_displacement_rew",
     "compute_root_heading_rew",
+    # Heading-local anchor drift reward (twin of build_mimic_future_displacement_cmd)
+    "compute_heading_local_anchor_drift_rew",
     # Big-step reward kernels (Track D, OmniH2O-style, dormant)
     "FeetApexHeightReward",
     "StepDisplacementReward",

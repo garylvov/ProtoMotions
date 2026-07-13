@@ -400,6 +400,57 @@ def mimic_target_poses_reduced_coords_factory(
     )
 
 
+def mimic_future_displacement_cmd_factory(
+    use_noisy: bool = False,
+    future_steps: Union[int, List[int]] = [8],
+    include_heading_delta: bool = True,
+) -> MdpComponent:
+    """Factory for heading-frame future-displacement command observation.
+
+    Per selected future step, the reference anchor's displacement from the
+    current anchor, heading-rotated (XYZ, Z preserved) plus an optional 2D
+    heading(yaw) delta. Pure delta (ref future - current); no world-frame
+    absolutes, no accumulated state. Dim per step: 3 (+2 if
+    include_heading_delta).
+
+    NOTE (anchor body): the anchor is ``robot_config.anchor_body_index``,
+    which defaults to the root/pelvis body (see ``robot_configs/base.py``)
+    unless ``anchor_body_name`` is set on the robot config. This factory
+    tracks the pelvis anchor, not the chest, following the existing
+    ``EnvContext.mimic`` anchor convention used by every other mimic
+    command/reward factory in this module.
+
+    Args:
+        use_noisy: If True, use noisy current anchor state (actor with DR).
+        future_steps: Steps to select from MimicControl's future buffer.
+            Int N = first N consecutive steps. List = specific 1-indexed
+            step numbers (e.g., [8] selects the 8th future step).
+        include_heading_delta: If True, append the 2D heading(yaw) delta
+            (cos, sin) per step.
+
+    Returns:
+        MdpComponent configured for the future-displacement command observation.
+    """
+    from protomotions.envs.obs import build_mimic_future_displacement_cmd
+
+    state = EnvContext.noisy if use_noisy else EnvContext.current
+
+    return MdpComponent(
+        compute_func=build_mimic_future_displacement_cmd,
+        dynamic_vars={
+            "current_state_anchor_pos": state.anchor_pos,
+            "current_state_anchor_rot": state.anchor_rot,
+            "mimic_ref_anchor_pos": EnvContext.mimic.future_anchor_pos,
+            "mimic_ref_anchor_rot": EnvContext.mimic.future_anchor_rot,
+        },
+        static_params={
+            "future_steps": future_steps,
+            "include_heading_delta": include_heading_delta,
+            "w_last": True,
+        },
+    )
+
+
 def mimic_deploy_target_poses_factory(
     use_noisy: bool = False,
     include_dof_vel: bool = True,
@@ -1499,20 +1550,102 @@ def global_anchor_ori_rew_factory(
     )
 
 
-def relative_body_pos_rew_factory(
-    weight: float = 1.0,
-    sigma: float = 0.3,
+def heading_local_anchor_drift_rew_factory(
+    weight: float = 0.5, sigma: float = 0.3
 ) -> MdpComponent:
-    """Factory for relative body position reward (BeyondMimic).
+    """Factory for heading-local anchor drift reward.
+
+    Reward twin of ``mimic_future_displacement_cmd_factory``'s observation
+    command: scores the CURRENT-time drift between the actual and reference
+    anchor position in the current anchor's heading-aligned frame (XYZ, Z
+    preserved) with a Gaussian kernel. exp(-||drift||^2 / sigma^2).
 
     Args:
         weight: Reward weight.
         sigma: Gaussian kernel width.
 
     Returns:
+        MdpComponent configured for heading-local anchor drift reward.
+    """
+    from protomotions.envs.rewards import compute_heading_local_anchor_drift_rew
+
+    return MdpComponent(
+        compute_func=compute_heading_local_anchor_drift_rew,
+        dynamic_vars={
+            "current_anchor_pos": EnvContext.current.anchor_pos,
+            "current_anchor_rot": EnvContext.current.anchor_rot,
+            "ref_anchor_pos": EnvContext.mimic.ref_anchor_pos,
+        },
+        static_params={"weight": weight, "sigma": sigma},
+    )
+
+
+def _resolve_body_indices_and_weights(
+    body_indices: Optional[List[int]],
+    body_weights: Optional[Dict[str, float]],
+    body_names: Optional[List[str]],
+) -> Dict[str, Any]:
+    """Resolve body_indices/body_weights static_params for weighted body rewards.
+
+    ``body_weights`` (body-name -> multiplier) requires ``body_names``, the
+    robot's ordered body name list (e.g. ``robot_config.kinematic_info.body_names``),
+    to resolve names to indices. This mirrors how ``gt_rel_rew_factory`` and
+    friends already accept caller-supplied raw ``body_indices``: factories in
+    this module are robot-agnostic and have no access to a robot config at
+    construction time, so the ordered name list must come from the caller.
+    """
+    static_params: Dict[str, Any] = {}
+    if body_weights is not None:
+        if body_indices is not None:
+            raise ValueError(
+                "Provide either body_indices or body_weights, not both."
+            )
+        if body_names is None:
+            raise ValueError(
+                "body_names (the robot's ordered body name list, e.g. "
+                "robot_config.kinematic_info.body_names) is required to resolve "
+                "body_weights (body-name -> multiplier) to indices."
+            )
+        resolved_indices = [body_names.index(name) for name in body_weights]
+        resolved_weights = [body_weights[name] for name in body_weights]
+        static_params["body_indices"] = resolved_indices
+        static_params["body_weights"] = resolved_weights
+    elif body_indices is not None:
+        static_params["body_indices"] = body_indices
+    return static_params
+
+
+def relative_body_pos_rew_factory(
+    weight: float = 1.0,
+    sigma: float = 0.3,
+    body_indices: Optional[List[int]] = None,
+    body_weights: Optional[Dict[str, float]] = None,
+    body_names: Optional[List[str]] = None,
+) -> MdpComponent:
+    """Factory for relative body position reward (BeyondMimic).
+
+    Args:
+        weight: Reward weight.
+        sigma: Gaussian kernel width.
+        body_indices: Optional body indices to restrict to a subset (uniform
+            mean over the subset). Mutually exclusive with ``body_weights``.
+        body_weights: Optional per-body weight multipliers, body-name ->
+            multiplier (e.g. ``{"left_wrist_link": 3.0}``). Default None =
+            uniform mean over all bodies (unchanged/backward-compatible
+            behavior). Requires ``body_names`` to resolve names to indices.
+        body_names: The robot's ordered body name list (e.g.
+            ``robot_config.kinematic_info.body_names``), required when
+            ``body_weights`` is provided.
+
+    Returns:
         MdpComponent configured for relative body position reward.
     """
     from protomotions.envs.rewards import compute_relative_body_pos_rew
+
+    static_params: Dict[str, Any] = {"weight": weight, "sigma": sigma}
+    static_params.update(
+        _resolve_body_indices_and_weights(body_indices, body_weights, body_names)
+    )
 
     return MdpComponent(
         compute_func=compute_relative_body_pos_rew,
@@ -1524,24 +1657,41 @@ def relative_body_pos_rew_factory(
             "current_anchor_pos": EnvContext.current.anchor_pos,
             "anchor_idx": EnvContext.mimic.anchor_idx,
         },
-        static_params={"weight": weight, "sigma": sigma},
+        static_params=static_params,
     )
 
 
 def relative_body_ori_rew_factory(
     weight: float = 1.0,
     sigma: float = 0.4,
+    body_indices: Optional[List[int]] = None,
+    body_weights: Optional[Dict[str, float]] = None,
+    body_names: Optional[List[str]] = None,
 ) -> MdpComponent:
     """Factory for relative body orientation reward (BeyondMimic).
 
     Args:
         weight: Reward weight.
         sigma: Gaussian kernel width.
+        body_indices: Optional body indices to restrict to a subset (uniform
+            mean over the subset). Mutually exclusive with ``body_weights``.
+        body_weights: Optional per-body weight multipliers, body-name ->
+            multiplier (e.g. ``{"left_wrist_link": 3.0}``). Default None =
+            uniform mean over all bodies (unchanged/backward-compatible
+            behavior). Requires ``body_names`` to resolve names to indices.
+        body_names: The robot's ordered body name list (e.g.
+            ``robot_config.kinematic_info.body_names``), required when
+            ``body_weights`` is provided.
 
     Returns:
         MdpComponent configured for relative body orientation reward.
     """
     from protomotions.envs.rewards import compute_relative_body_ori_rew
+
+    static_params: Dict[str, Any] = {"weight": weight, "sigma": sigma}
+    static_params.update(
+        _resolve_body_indices_and_weights(body_indices, body_weights, body_names)
+    )
 
     return MdpComponent(
         compute_func=compute_relative_body_ori_rew,
@@ -1551,7 +1701,7 @@ def relative_body_ori_rew_factory(
             "current_anchor_rot": EnvContext.current.anchor_rot,
             "anchor_idx": EnvContext.mimic.anchor_idx,
         },
-        static_params={"weight": weight, "sigma": sigma},
+        static_params=static_params,
     )
 
 
