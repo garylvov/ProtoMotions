@@ -405,6 +405,14 @@ class BaseAgent:
             self.just_loaded_checkpoint_should_evaluate = False
             self._skip_next_eval_after_resume = True
 
+            # night13: the CPU+subset eval fix (EVAL_METRICS_ON_CPU / EVAL_SUBSET_N)
+            # removes the metric-buffer OOM that this post-resume skip was guarding
+            # against. When EVAL_RUN_AFTER_RESUME=1, clear the skip so the first
+            # cadence eval after resume actually runs (our first gt_error datapoint)
+            # instead of being swallowed. Default off preserves the skip.
+            if os.environ.get("EVAL_RUN_AFTER_RESUME", "0") == "1":
+                self._skip_next_eval_after_resume = False
+
             if load_env:
                 # Load env state from the same directory as the checkpoint.
                 task_id = self.env.get_task_id()
