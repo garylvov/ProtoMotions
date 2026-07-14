@@ -7,7 +7,7 @@ This module defines configurations for the AMP algorithm which uses a discrimina
 to learn motion priors from reference motions.
 """
 
-from typing import List, Dict, Any, TYPE_CHECKING
+from typing import List, Dict, Any, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from protomotions.envs.mdp_component import MdpComponent
@@ -50,6 +50,19 @@ class AMPParametersConfig:
     discriminator_grad_penalty: float = field(
         default=5.0,
         metadata={"help": "Gradient penalty coefficient for discriminator stability.", "min": 0.0}
+    )
+    gp_on_agent_samples: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Apply the gradient penalty to the NEGATIVE (agent) samples "
+                "instead of the positive/expert samples. Paper-faithful for "
+                "ADD (arXiv 2505.04961 Eq. 8-9: GP on negatives because ADD "
+                "has a single positive sample; Fig. 9 ablation puts Pos-only "
+                "in the same failure tier as no-GP). Default False = stock "
+                "ProtoMotions expert-side placement."
+            )
+        },
     )
     discriminator_optimization_ratio: int = field(
         default=1,
@@ -133,4 +146,74 @@ class AMPAgentConfig(PPOAgentConfig):
     reference_obs_components: Dict[str, "MdpComponent"] = field(
         default_factory=dict,
         metadata={"help": "MdpComponent instances for computing reference motion features. Agent injects motion_lib params at runtime."}
+    )
+
+    add_root_displacement_features: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "MimicADD only (Track D, dormant by default; A/B option — the "
+                "2026-07-10 final design carries xy+heading pressure in the "
+                "task-reward channel instead): append the wrapped root heading "
+                "error (1D) to the mimic_target_poses_diff discriminator input "
+                "(plus heading-frame xy 2D when add_root_xy_features is set). "
+                "Expert positive samples get matching zero channels."
+            )
+        },
+    )
+    add_root_xy_features: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "MimicADD only (A/B sub-option of add_root_displacement_"
+                "features): additionally append the heading-frame root xy "
+                "error channels (legacy 3-channel form)."
+            )
+        },
+    )
+    global_diff_bodies: Optional[List[str]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "MimicADD only (dormant; A/B option, rejected as Track D "
+                "default 2026-07-10 — couples hand precision to deploy-time "
+                "odom quality): body-name regexes whose position diff keeps "
+                "the FULL world-frame error (root displacement included); "
+                "all other bodies get root-stripped (articulation-relative) "
+                "position diffs. None = stock diff computation."
+            )
+        },
+    )
+    root_relative_position_diff: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "MimicADD only (Track D frame fix 2026-07-10, dormant by "
+                "default): strip ROOT TRANSLATION from the body-position "
+                "channels of mimic_target_poses_diff (positions become "
+                "root-relative, matching the ADD paper's root-local joint "
+                "positions, arXiv 2505.04961 §5.1). The stock world-frame "
+                "path leaks root drift into EVERY body-pos channel (verified "
+                "numerically 2026-07-10). Rotation/velocity channels are "
+                "untouched (heading stays represented). Bodies listed in "
+                "global_diff_bodies keep world-frame diffs even when this "
+                "is set."
+            )
+        },
+    )
+    add_diff_feature_scales: Optional[Dict[str, float]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "MimicADD only (Track D per-body saliency bias, dormant by "
+                "default): map of body-name regex -> scale applied to that "
+                "body's channels in mimic_target_poses_diff (special key "
+                "'root_displacement' scales the appended root channels). "
+                "Unmatched bodies scale 1.0. A saliency bias on ADD's "
+                "auto-balancing, not a hard weight; with normalize_obs=True "
+                "on the discriminator the bias is strongest early in "
+                "training (running normalizer absorbs static scales "
+                "asymptotically)."
+            )
+        },
     )

@@ -25,6 +25,7 @@ Note:
 """
 
 import logging
+import os
 import numpy as np
 import torch
 from torch import Tensor
@@ -511,6 +512,13 @@ class BaseEvaluator:
             Dictionary of additional computed metrics
         """
         additional_metrics = {}
+        # EVAL-OOM FIX (night13): when metric buffers live on CPU, the jerk
+        # SmoothnessAggregateMetric mixes GPU intermediates with CPU data. These
+        # aggregate plugins are secondary (the tracking metrics gt_error/gr_error
+        # etc. come from the per-step component accumulators, not from here), so
+        # skip them in CPU-eval mode. Default off keeps the plugins.
+        if os.environ.get("EVAL_METRICS_ON_CPU", "0") == "1":
+            return additional_metrics
         for plugin in self.metric_plugins:
             try:
                 plugin_metrics = plugin.compute(metrics)

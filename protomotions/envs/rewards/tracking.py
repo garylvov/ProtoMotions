@@ -32,11 +32,13 @@ from typing import Optional
 
 from protomotions.utils.rotations import (
     quat_angle_diff_norm,
+    calc_heading,
     calc_heading_quat_inv,
     quat_rotate,
     quat_mul,
 )
 from protomotions.envs.rewards.base import mean_squared_error_exp, rotation_error_exp
+from protomotions.envs.obs.utils import heading_local_xyz_delta
 
 
 # =============================================================================
@@ -160,20 +162,36 @@ def compute_rh_rew(
 # BeyondMimic-style Reward Kernels
 # =============================================================================
 
+def _weighted_body_mean(error: Tensor, weights: Optional[Tensor]) -> Tensor:
+    """Reduce a [num_envs, num_bodies] per-body error to [num_envs].
+
+    Uniform mean when ``weights`` is None (unchanged behavior). Otherwise a
+    weighted mean normalized by the sum of weights: sum(w_i * err_i) / sum(w_i).
+    """
+    if weights is None:
+        return error.mean(dim=-1)
+    w = torch.as_tensor(weights, dtype=error.dtype, device=error.device)
+    return (error * w).sum(dim=-1) / w.sum()
+
+
 def compute_global_position_error_exp(
     x: Tensor,
     ref_x: Tensor,
     sigma: float,
     indices: Optional[Tensor] = None,
+    weights: Optional[Tensor] = None,
 ) -> Tensor:
     """Position error: exp(-||x - ref_x||^2 / sigma^2).
-    
+
     Args:
         x: Current positions [num_envs, num_bodies, 3] or [num_envs, 3].
         ref_x: Reference positions (same shape as x).
         sigma: Gaussian kernel width.
         indices: Optional body indices to select [num_bodies_subset].
-    
+        weights: Optional per-body weight multipliers [num_bodies_subset],
+            aligned with ``indices`` (or with the body dim if ``indices`` is
+            None). None = uniform mean (default, backward compatible).
+
     Returns:
         Reward tensor [num_envs].
     """
@@ -183,7 +201,7 @@ def compute_global_position_error_exp(
 
     error = (x - ref_x).pow(2).sum(dim=-1)
     if error.dim() == 2:
-        error = error.mean(dim=-1)
+        error = _weighted_body_mean(error, weights)
     return torch.exp(-error / (sigma ** 2))
 
 
@@ -213,15 +231,19 @@ def compute_global_orientation_error_exp(
     ref_q: Tensor,
     sigma: float,
     indices: Optional[Tensor] = None,
+    weights: Optional[Tensor] = None,
 ) -> Tensor:
     """Orientation error: exp(-angle_diff^2 / sigma^2).
-    
+
     Args:
         q: Current orientations [num_envs, num_bodies, 4] or [num_envs, 4] (w-last).
         ref_q: Reference orientations (same shape as q).
         sigma: Gaussian kernel width.
         indices: Optional body indices to select [num_bodies_subset].
-    
+        weights: Optional per-body weight multipliers [num_bodies_subset],
+            aligned with ``indices`` (or with the body dim if ``indices`` is
+            None). None = uniform mean (default, backward compatible).
+
     Returns:
         Reward tensor [num_envs].
     """
@@ -231,7 +253,7 @@ def compute_global_orientation_error_exp(
 
     error = quat_angle_diff_norm(q, ref_q, w_last=True)
     if error.dim() == 2:
-        error = error.mean(dim=-1)
+        error = _weighted_body_mean(error, weights)
     return torch.exp(-error / (sigma ** 2))
 
 
@@ -265,11 +287,12 @@ def compute_relative_body_pos_rew(
     anchor_idx: int,
     sigma: float = 0.3,
     body_indices: Optional[Tensor] = None,
+    body_weights: Optional[Tensor] = None,
 ) -> Tensor:
     """Relative body position reward (BeyondMimic style).
-    
+
     Computes reward based on body positions relative to anchor in anchor's local frame.
-    
+
     Args:
         current_rigid_body_pos: Current body positions [num_envs, num_bodies, 3].
         ref_rigid_body_pos: Reference body positions [num_envs, num_bodies, 3].
@@ -279,7 +302,10 @@ def compute_relative_body_pos_rew(
         anchor_idx: Index of anchor body.
         sigma: Gaussian kernel width.
         body_indices: Optional body indices to select [num_bodies_subset].
-    
+        body_weights: Optional per-body weight multipliers [num_bodies_subset],
+            aligned with ``body_indices``. None = uniform mean over the
+            selected bodies (default, backward compatible).
+
     Returns:
         Reward: exp(-||rel_pos - ref_rel_pos||^2 / sigma^2).
     """
@@ -313,7 +339,7 @@ def compute_relative_body_pos_rew(
     ).reshape(ref_rigid_body_pos.shape)
     
     return compute_global_position_error_exp(
-        current_rel_pos_local, ref_rel_pos_local, sigma, body_indices
+        current_rel_pos_local, ref_rel_pos_local, sigma, body_indices, body_weights
     )
 
 
@@ -324,11 +350,12 @@ def compute_relative_body_ori_rew(
     anchor_idx: int,
     sigma: float = 0.4,
     body_indices: Optional[Tensor] = None,
+    body_weights: Optional[Tensor] = None,
 ) -> Tensor:
     """Relative body orientation reward (BeyondMimic style).
-    
+
     Computes reward based on body orientations relative to anchor.
-    
+
     Args:
         current_rigid_body_rot: Current body rotations [num_envs, num_bodies, 4] (w-last).
         ref_rigid_body_rot: Reference body rotations [num_envs, num_bodies, 4] (w-last).
@@ -336,7 +363,10 @@ def compute_relative_body_ori_rew(
         anchor_idx: Index of anchor body.
         sigma: Gaussian kernel width.
         body_indices: Optional body indices to select [num_bodies_subset].
-    
+        body_weights: Optional per-body weight multipliers [num_bodies_subset],
+            aligned with ``body_indices``. None = uniform mean over the
+            selected bodies (default, backward compatible).
+
     Returns:
         Reward: exp(-angle_diff^2 / sigma^2).
     """
@@ -359,7 +389,7 @@ def compute_relative_body_ori_rew(
     ref_rel_rot = quat_mul(ref_heading_rot_inv_exp, ref_rigid_body_rot, w_last=True)
     
     return compute_global_orientation_error_exp(
-        current_rel_rot, ref_rel_rot, sigma, body_indices
+        current_rel_rot, ref_rel_rot, sigma, body_indices, body_weights
     )
 
 
@@ -479,6 +509,90 @@ def compute_anchor_xy_rew(
     return mean_squared_error_exp(current_xy, ref_anchor_xy, coefficient)
 
 
+def compute_root_xy_displacement_rew(
+    current_root_pos: Tensor,
+    ref_rigid_body_pos: Tensor,
+    coefficient: float = -20.0,
+) -> Tensor:
+    """Root XY displacement tracking reward (exponential MSE).
+
+    Track D Option-B fallback: exp-kernel on the root xy error relative to the
+    reference motion (objective 1 — minimize xy displacement).  The kernel is
+    invariant to the frame the error is expressed in (only the magnitude
+    matters), so no heading-frame rotation is needed here.
+
+    Args:
+        current_root_pos: Current root position [num_envs, 3].
+        ref_rigid_body_pos: Reference body positions [num_envs, num_bodies, 3]
+            (root is body 0).
+        coefficient: Exponential coefficient for error.
+
+    Returns:
+        Reward tensor [num_envs] in (0, 1].
+    """
+    ref_root_xy = ref_rigid_body_pos[:, 0, :2]
+    current_xy = current_root_pos[:, :2]
+    return mean_squared_error_exp(current_xy, ref_root_xy, coefficient)
+
+
+def compute_root_heading_rew(
+    current_root_rot: Tensor,
+    ref_rigid_body_rot: Tensor,
+    coefficient: float = -2.0,
+) -> Tensor:
+    """Root heading tracking reward (exponential squared wrapped-angle error).
+
+    Track D Option-B fallback: exp-kernel on the wrapped heading (yaw) error
+    relative to the reference motion (objective 1 — minimize heading
+    displacement).
+
+    Args:
+        current_root_rot: Current root rotation [num_envs, 4] (w-last).
+        ref_rigid_body_rot: Reference body rotations [num_envs, num_bodies, 4]
+            (w-last, root is body 0).
+        coefficient: Exponential coefficient for error.
+
+    Returns:
+        Reward tensor [num_envs] in (0, 1].
+    """
+    ref_heading = calc_heading(ref_rigid_body_rot[:, 0], w_last=True)
+    cur_heading = calc_heading(current_root_rot, w_last=True)
+    heading_err = ref_heading - cur_heading
+    heading_err = torch.remainder(heading_err + torch.pi, 2 * torch.pi) - torch.pi
+    return heading_err.pow(2).mul(coefficient).exp()
+
+
+def compute_heading_local_anchor_drift_rew(
+    current_anchor_pos: Tensor,
+    current_anchor_rot: Tensor,
+    ref_anchor_pos: Tensor,
+    sigma: float = 0.3,
+) -> Tensor:
+    """Heading-local anchor drift reward (the reward twin of the future-
+    displacement command observation, ``build_mimic_future_displacement_cmd``).
+
+    Computes the CURRENT-time drift between the actual and reference anchor
+    position in the current anchor's heading-aligned frame (XYZ, Z
+    preserved) and scores it with a Gaussian kernel: exp(-||drift||^2 / sigma^2).
+    Zero drift gives a reward of 1; the reward falls off as drift grows,
+    with ``sigma`` controlling how quickly.
+
+    Args:
+        current_anchor_pos: Current anchor position [num_envs, 3].
+        current_anchor_rot: Current anchor rotation [num_envs, 4] (w-last).
+        ref_anchor_pos: Reference (current-time) anchor position [num_envs, 3].
+        sigma: Gaussian kernel width.
+
+    Returns:
+        Reward tensor [num_envs].
+    """
+    drift = heading_local_xyz_delta(
+        current_anchor_pos, current_anchor_rot, ref_anchor_pos, w_last=True
+    )
+    error = drift.pow(2).sum(dim=-1)
+    return torch.exp(-error / (sigma ** 2))
+
+
 __all__ = [
     # Standard tracking rewards
     "compute_gt_rew",
@@ -489,6 +603,9 @@ __all__ = [
     # Heading-local relative tracking (realign=OFF compatible)
     "compute_gt_rel_rew",
     "compute_anchor_xy_rew",
+    # Track D root displacement rewards (Option-B fallback, dormant)
+    "compute_root_xy_displacement_rew",
+    "compute_root_heading_rew",
     # BeyondMimic-style rewards
     "compute_global_position_error_exp",
     "compute_global_anchor_pos_rew",
@@ -498,4 +615,6 @@ __all__ = [
     "compute_relative_body_ori_rew",
     "compute_global_body_lin_vel_rew",
     "compute_global_body_ang_vel_rew",
+    # Heading-local anchor drift reward (twin of build_mimic_future_displacement_cmd)
+    "compute_heading_local_anchor_drift_rew",
 ]

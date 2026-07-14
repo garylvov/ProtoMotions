@@ -19,6 +19,7 @@ Key Features:
     - Episode statistics tracking
 """
 
+import os
 import torch
 from torch import Tensor
 import torch.distributed as dist
@@ -29,6 +30,8 @@ import torch.nn as nn
 
 import time
 import math
+import shutil
+import tempfile
 from pathlib import Path
 from typing import Optional, Dict
 
@@ -44,6 +47,8 @@ from protomotions.agents.utils.normalization import (
     RewardRunningMeanStd,
     RunningMeanStd,
     materialize_lazy_running_stats_from_state_dict,
+    sync_running_mean_std_modules,
+    sync_record_moments_gates,
 )
 from rich.progress import track
 from protomotions.agents.evaluators.base_evaluator import BaseEvaluator
@@ -182,6 +187,7 @@ class BaseAgent:
         )
 
         self.just_loaded_checkpoint_should_evaluate = False
+        self._skip_next_eval_after_resume = False
 
     @property
     def should_stop(self):
@@ -243,7 +249,76 @@ class BaseAgent:
 
     def _materialize_lazy_modules(self, dummy_obs_td: TensorDict) -> None:
         """Materialize LazyLinear/RunningMeanStd modules with a dummy forward."""
-        self.model.materialize(dummy_obs_td)
+        # Setup-time materialization only needs lazy parameter/buffer shapes.
+        # Freeze only for this dummy pass, then restore the configured training
+        # gates for rollout updates.
+        freeze_states = []
+        for module in self.model.modules():
+            if hasattr(module, "_freeze_running"):
+                freeze_states.append((module, module._freeze_running))
+                module._freeze_running = True
+        try:
+            self.model.materialize(dummy_obs_td)
+        finally:
+            for module, freeze_running in freeze_states:
+                module._freeze_running = freeze_running
+
+    def _iter_running_mean_std_sync_targets(self):
+        """Yield normalizers in deterministic training-loop sync order."""
+        seen = set()
+
+        def yield_once(name: str, module):
+            if not isinstance(module, RunningMeanStd):
+                return
+            module_id = id(module)
+            if module_id in seen:
+                return
+            seen.add(module_id)
+            yield name, module
+
+        running_reward_norm = getattr(self, "running_reward_norm", None)
+        if running_reward_norm is not None:
+            yield from yield_once("agent.running_reward_norm", running_reward_norm)
+
+        amp_component = getattr(self, "amp_component", None)
+        amp_reward_norm = getattr(amp_component, "running_reward_norm", None)
+        if amp_reward_norm is not None:
+            yield from yield_once(
+                "agent.amp_component.running_reward_norm",
+                amp_reward_norm,
+            )
+
+        model = getattr(self, "model", None)
+        if model is not None:
+            for name, module in model.named_modules():
+                if isinstance(module, RunningMeanStd):
+                    yield from yield_once(f"model.{name}" if name else "model", module)
+
+    def _sync_running_mean_std(self) -> None:
+        sync_running_mean_std_modules(
+            list(self._iter_running_mean_std_sync_targets()),
+            self.fabric,
+        )
+
+    def _evaluation_due_this_epoch(self) -> bool:
+        cadence_due = (
+            self.evaluator is not None
+            and self.evaluator.config.eval_metrics_every is not None
+            and self.current_epoch > 0
+            and self.current_epoch % self.evaluator.config.eval_metrics_every == 0
+        )
+        return cadence_due or self.just_loaded_checkpoint_should_evaluate
+
+    def _should_evaluate_this_epoch(self) -> bool:
+        if not self._evaluation_due_this_epoch():
+            return False
+
+        if getattr(self, "_skip_next_eval_after_resume", False):
+            self._skip_next_eval_after_resume = False
+            self.just_loaded_checkpoint_should_evaluate = False
+            return False
+
+        return True
 
     def _after_create_optimizers(self) -> None:
         """Hook after optimizers/DDP wrappers are created."""
@@ -294,19 +369,88 @@ class BaseAgent:
                 load_training_state=load_training_state,
             )
 
-            self.just_loaded_checkpoint_should_evaluate = True
+            # Rank-agree normalizer record/freeze gates: the resume path can
+            # desynchronize per-rank `_freeze_running`, and that flag gates
+            # record_moments' DDP collectives (divergence deadlocks the PG).
+            # Symmetric point: every rank runs load(). No-op for world_size==1.
+            if hasattr(self, "model"):
+                sync_record_moments_gates(self.model, self.fabric)
+
+            # 2026-07-05 hang kill-switch (scratchseed_v2, 3rd recurrence of the
+            # record_moments collective-mismatch deadlock in one night despite
+            # the NCCL-broadcast + gate-sync fixes above — see
+            # wbc_push/hang_evidence_v2_20260705): FREEZE_OBS_NORM_ON_RESUME=1
+            # hard-freezes every normalizer at checkpoint load. Rank-symmetric
+            # (env var set uniformly by the launch wrapper), zero collectives,
+            # and removes record_moments' all_gather/broadcast from the hot
+            # path entirely. Numerically benign for late resumes (stats long
+            # converged); default off so fresh runs still record moments.
+            if os.environ.get("FREEZE_OBS_NORM_ON_RESUME", "0") == "1":
+                _frozen = 0
+                for _name, _mod in self.model.named_modules():
+                    if hasattr(_mod, "_freeze_running") and not _mod._freeze_running:
+                        _mod._freeze_running = True
+                        _frozen += 1
+                if _frozen:
+                    print(
+                        f"[freeze_obs_norm_on_resume] froze {_frozen} "
+                        "normalizer(s) (FREEZE_OBS_NORM_ON_RESUME=1)"
+                    )
+
+            # 24-GiB-node memory guard: evaluating immediately after resume
+            # allocates per-rank metrics sized by (num_motions / world_size),
+            # which can OOM on small GPU pools with few ranks. Always skip
+            # exactly the next eval, including cadence-triggered eval at the
+            # loaded epoch; scheduled eval resumes on the next cadence.
+            self.just_loaded_checkpoint_should_evaluate = False
+            self._skip_next_eval_after_resume = True
+
+            # night13: the CPU+subset eval fix (EVAL_METRICS_ON_CPU / EVAL_SUBSET_N)
+            # removes the metric-buffer OOM that this post-resume skip was guarding
+            # against. When EVAL_RUN_AFTER_RESUME=1, clear the skip so the first
+            # cadence eval after resume actually runs (our first gt_error datapoint)
+            # instead of being swallowed. Default off preserves the skip.
+            if os.environ.get("EVAL_RUN_AFTER_RESUME", "0") == "1":
+                self._skip_next_eval_after_resume = False
 
             if load_env:
                 # Load env state from the same directory as the checkpoint.
                 task_id = self.env.get_task_id()
                 env_checkpoint = self.root_dir / f"env_{task_id}.ckpt"
-                if env_checkpoint.exists():
-                    print(f"Loading env checkpoint: {env_checkpoint}")
+                load_path = env_checkpoint
+                if self.fabric.world_size > 1 and dist.is_available() and dist.is_initialized():
+                    # fix: stage env_*.ckpt through node-local storage instead
+                    # of every rank re-reading the same NFS file concurrently
+                    # at resume. Mirrors the motion-pack-master staging
+                    # pattern already used by the launcher scripts (copy once
+                    # to /tmp, every rank reads the local copy). Concurrent
+                    # 8-way NFS reads of this file are dc7e0be's documented
+                    # straggler source behind BaseAgent.__init__'s world-size
+                    # all_gather timeout (crash_rootcause_20260704.md);
+                    # PG_TIMEOUT_SEC=3600 raises the ceiling but does not
+                    # remove the cause. Only local-rank-0 per node stages (so
+                    # this is correct for multi-node too); fabric.barrier()
+                    # is a native process-group barrier (no object pickling,
+                    # unlike fabric.broadcast) so it carries none of the
+                    # cross-backend hazard fixed elsewhere in this file.
+                    staged_dir = Path(tempfile.gettempdir()) / "protomotions_env_ckpt_stage"
+                    staged_path = staged_dir / f"{self.root_dir.name}_env_{task_id}.ckpt"
+                    if self.fabric.local_rank == 0 and env_checkpoint.exists():
+                        staged_dir.mkdir(parents=True, exist_ok=True)
+                        tmp_path = staged_path.with_suffix(".ckpt.part")
+                        shutil.copyfile(env_checkpoint, tmp_path)
+                        tmp_path.rename(staged_path)
+                    self.fabric.barrier()
+                    if staged_path.exists():
+                        load_path = staged_path
+                if load_path.exists():
+                    print(f"Loading env checkpoint: {load_path}")
                     env_state_dict = torch.load(
-                        env_checkpoint, map_location=self.device, weights_only=False
+                        load_path, map_location=self.device, weights_only=False
                     )
                     self.env.load_state_dict(env_state_dict)
 
+            self._sync_running_mean_std()
             self.fabric.call("on_load_checkpoint_end")
 
     def load_parameters(self, state_dict, load_training_state: bool = True):
@@ -724,6 +868,7 @@ class BaseAgent:
 
                     self.step_count += self.get_step_count_increment()
 
+                self._sync_running_mean_std()
                 self.normalize_rewards_in_buffer()
 
             # Skip policy update right after eval to avoid training spikes (hacky fix)
@@ -736,6 +881,7 @@ class BaseAgent:
                 _ = self.experience_buffer.make_dict()
             else:
                 training_log_dict = self.optimize_model()
+                self._sync_running_mean_std()
 
             training_log_dict["epoch"] = self.current_epoch
             self.current_epoch += 1
@@ -753,16 +899,7 @@ class BaseAgent:
             if self.current_epoch % self.config.save_last_checkpoint_every == 0:
                 self.save(checkpoint_name="last.ckpt")
 
-            if (
-                self.evaluator is not None
-                and self.evaluator.config.eval_metrics_every is not None
-                and (
-                    self.current_epoch > 0
-                    and self.current_epoch % self.evaluator.config.eval_metrics_every
-                    == 0
-                )
-                or self.just_loaded_checkpoint_should_evaluate
-            ):
+            if self._should_evaluate_this_epoch():
                 self.fabric.call("on_eval_start", self)
 
                 eval_log_dict, evaluated_score, num_eval_items = (

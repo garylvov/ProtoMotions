@@ -142,6 +142,14 @@ class NormObsBase(nn.Module):
         """
         if self.config.normalize_obs:
             norm_obs = self.running_obs_norm.normalize(obs)
+            # NOTE: this gate guards record_moments' distributed collectives.
+            # `self.training` is rank-uniform (Lightning propagates it), and
+            # `_freeze_running` is rank-agreed once at every checkpoint load via
+            # sync_record_moments_gates() (see normalization.py) — the resume
+            # path was the only place it desynchronized, deadlocking DDP. Do
+            # NOT add per-forward collectives here: an in-forward all_reduce
+            # was tried and wedged NCCL/gloo ordering during lazy-module
+            # materialization (see wbc_push/hang_evidence_run2seed_futex/round2).
             if self.training and not self._freeze_running:
                 self.running_obs_norm.record_moments(obs)
         else:

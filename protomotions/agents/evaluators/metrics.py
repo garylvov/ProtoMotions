@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 import torch
 from typing import Optional, Callable
 
@@ -34,11 +35,23 @@ class MotionMetrics:
             device: Device to store the tensors on
             dtype: Data type for the tensors
         """
+        # EVAL-OOM FIX (night13, EVAL_METRICS_ON_CPU): the in-training eval sizes
+        # these trajectory buffers to the whole per-rank motion shard, which can be
+        # GB-scale (e.g. 8.3 GiB for rigid_body_pos) and OOM the GPU on top of the
+        # training env state. When the env gate is set, hold the buffers on CPU so
+        # the eval never allocates on the GPU. Default off = original GPU behavior.
+        if os.environ.get("EVAL_METRICS_ON_CPU", "0") == "1":
+            device = torch.device("cpu")
+
         self.num_motions = num_motions
         self.num_sub_features = num_sub_features
         self.device = device
         self.dtype = dtype
-        self.motion_lens = motion_lens
+        # Keep motion_lens on the same device as the buffers so update()'s
+        # per-motion length checks never hit a cpu/cuda mismatch.
+        self.motion_lens = (
+            motion_lens.to(device) if isinstance(motion_lens, torch.Tensor) else motion_lens
+        )
         self.max_motion_len = max_motion_len
 
         # Raw data storage
@@ -66,6 +79,17 @@ class MotionMetrics:
             frame_indices: Optional tensor of frame indices [batch_size]
                            If None, will use the current count for each motion
         """
+        # EVAL-OOM FIX (night13): buffers may live on CPU while the eval rollout
+        # runs on GPU; move the per-step inputs to the buffer device before the
+        # indexed writes below so cpu/cuda never collide.
+        _dev = self.data.device
+        if motion_ids.device != _dev:
+            motion_ids = motion_ids.to(_dev)
+        if values.device != _dev:
+            values = values.to(_dev)
+        if frame_indices is not None and frame_indices.device != _dev:
+            frame_indices = frame_indices.to(_dev)
+
         if values.ndim == 1:
             values = values.unsqueeze(1)
         assert motion_ids.shape[0] == values.shape[0]

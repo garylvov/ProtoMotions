@@ -31,7 +31,7 @@ Includes:
 import torch
 from torch import Tensor
 
-from protomotions.utils.rotations import calc_heading_quat_inv, quat_diff_norm, quat_rotate, quat_rotate_inverse
+from protomotions.utils.rotations import calc_heading, calc_heading_quat_inv, quat_diff_norm, quat_rotate, quat_rotate_inverse
 
 
 # =============================================================================
@@ -131,6 +131,34 @@ def anchor_ori_error_value(
     ref_proj_grav = quat_rotate_inverse(ref_anchor_rot, gravity_vec, w_last=True)
 
     return torch.abs(proj_grav[:, 2] - ref_proj_grav[:, 2])
+
+
+def anchor_yaw_error_value(
+    current_anchor_rot: Tensor,
+    ref_rigid_body_rot: Tensor,
+    anchor_idx: int,
+) -> Tensor:
+    """Anchor yaw (heading) drift, absolute angle difference in radians.
+
+    Distinct from ``anchor_ori_error_value`` (projected-gravity-z / tilt
+    metric): this measures global HEADING drift specifically, via
+    ``calc_heading`` (yaw angle from the quaternion's local +X axis
+    projected to the world XY plane), wrapped to [-pi, pi] before taking the
+    absolute value.
+
+    Args:
+        current_anchor_rot: Current anchor rotation quaternion [num_envs, 4] (w-last).
+        ref_rigid_body_rot: Reference body rotations [num_envs, num_bodies, 4] (w-last).
+        anchor_idx: Index of anchor body.
+
+    Returns:
+        Absolute yaw error per env [num_envs] in radians.
+    """
+    ref_anchor_rot = ref_rigid_body_rot[:, anchor_idx, :]
+    cur_yaw = calc_heading(current_anchor_rot, w_last=True)
+    ref_yaw = calc_heading(ref_anchor_rot, w_last=True)
+    wrapped = torch.atan2(torch.sin(cur_yaw - ref_yaw), torch.cos(cur_yaw - ref_yaw))
+    return torch.abs(wrapped)
 
 
 def relative_body_pos_max_error(
@@ -290,6 +318,30 @@ def compute_anchor_ori_error_term(
     # Compare z-components (how "upright" each is)
     z_diff = torch.abs(proj_grav[:, 2] - ref_proj_grav[:, 2])
     return z_diff > threshold
+
+
+def compute_anchor_yaw_error_term(
+    current_anchor_rot: Tensor,
+    ref_rigid_body_rot: Tensor,
+    anchor_idx: int,
+    threshold: float = 1.0472,
+) -> Tensor:
+    """Anchor yaw (heading) drift termination.
+
+    NEW (night13/T3): a genuine global-yaw-drift termination, added because
+    the existing ``compute_anchor_ori_error_term`` measures TILT (projected
+    gravity z-component difference), not yaw. See ``anchor_yaw_error_value``.
+
+    Args:
+        current_anchor_rot: Current anchor rotation quaternion [num_envs, 4] (w-last).
+        ref_rigid_body_rot: Reference body rotations [num_envs, num_bodies, 4] (w-last).
+        anchor_idx: Index of anchor body.
+        threshold: Maximum allowed yaw drift in radians (default ~60 deg).
+
+    Returns:
+        Boolean tensor [num_envs] indicating which envs should terminate.
+    """
+    return anchor_yaw_error_value(current_anchor_rot, ref_rigid_body_rot, anchor_idx) > threshold
 
 
 def compute_relative_body_pos_error_term(

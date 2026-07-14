@@ -448,7 +448,7 @@ class PPO(BaseAgent):
         # Recompute neglogp for the actions that were actually taken (from experience buffer)
         # We need the current policy's evaluation, not the sampled action's neglogp
         mu = mean_action  # Already tanh-bounded
-        std = torch.exp(self.actor_module.logstd)
+        std = batch_td["std"]
         dist = torch.distributions.Normal(mu, mu * 0 + std)
         current_neglogp = -dist.log_prob(batch_dict["action"]).sum(dim=-1)
 
@@ -573,7 +573,14 @@ class PPO(BaseAgent):
             mu_clean = clean_td["mean_action"]
 
             output_dist = (mu_noisy - mu_clean).pow(2).mean()
-            l2c2_loss = output_dist / (input_dist + 1e-8)
+            # Stability guards ported from the supervised-path 2026-07-08
+            # divergence RCA (protomotions/agents/supervised/agent.py): the
+            # raw Lipschitz ratio explodes when the noisy-clean input gap is
+            # near zero (post-reset noisy-cache fallback steps) — (a) floor
+            # the input distance at 1e-4, (b) clamp the ratio at 10 so one
+            # bad batch cannot dominate the gradient. Neither guard binds in
+            # the healthy regime (ratio O(0.1-1)).
+            l2c2_loss = (output_dist / input_dist.clamp_min(1e-4)).clamp_max(10.0)
             l2c2_weighted = self.config.l2c2.lambda_l2c2 * l2c2_loss
 
             extra_loss = extra_loss + l2c2_weighted
@@ -843,9 +850,21 @@ class PPO(BaseAgent):
                             all_means, all_vars, all_counts
                         )
 
-                # Fabric broadcast returns a tensor on the source rank, so we need to move it to the device of the current rank.
-                updated_mean = self.fabric.broadcast(mean, src=0).to(self.device)
-                updated_var = self.fabric.broadcast(var, src=0).to(self.device)
+                # fix: use torch.distributed.broadcast (raw NCCL tensor
+                # broadcast) instead of fabric.broadcast, which routes
+                # through broadcast_object_list (a pickle/object collective).
+                # Interleaving that cross-backend call with the preceding
+                # NCCL all_gather calls above reproduces the exact hazard
+                # already root-caused and fixed once in
+                # RunningMeanStd.update() (a688e8e) but never ported to this
+                # sibling non-EMA advantage-normalization path.
+                mean = mean.to(self.device)
+                var = var.to(self.device)
+                if self.fabric.world_size > 1 and torch.distributed.is_initialized():
+                    torch.distributed.broadcast(mean, src=0)
+                    torch.distributed.broadcast(var, src=0)
+                updated_mean = mean
+                updated_var = var
 
                 if self.config.advantage_normalization.shift_mean:
                     advantages = (advantages - updated_mean) / (

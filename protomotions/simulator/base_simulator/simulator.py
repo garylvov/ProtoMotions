@@ -272,6 +272,9 @@ class Simulator(RecordingMixin, ABC):
         # Initialize push randomization state
         self._init_push_randomization()
 
+        # Initialize external wrench randomization state
+        self._init_wrench_randomization()
+
         # Initialize projectile system
         self._init_projectiles()
 
@@ -299,6 +302,21 @@ class Simulator(RecordingMixin, ABC):
             )
             self._schedule_push(torch.arange(self.num_envs, device=self.device))
 
+        # Post-push action-rate grace (Track D 2026-07-10): per-env countdown
+        # of control steps during which the action-rate penalty is suspended
+        # (getattr: pickles predating the field must keep loading).
+        grace_sec = (
+            float(getattr(push_cfg, "action_rate_grace_sec", 0.0) or 0.0)
+            if push_cfg is not None
+            else 0.0
+        )
+        self._push_grace_steps = (
+            max(1, int(round(grace_sec / self.dt))) if grace_sec > 0.0 else 0
+        )
+        self._push_grace_left = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
+
     def _schedule_push(self, env_ids: torch.Tensor) -> None:
         """Schedule next push time for specified environments."""
         if not self._push_enabled or len(env_ids) == 0:
@@ -325,15 +343,492 @@ class Simulator(RecordingMixin, ABC):
         due_env_ids = torch.where(due_mask)[0]
         num_due = len(due_env_ids)
 
+        # Curriculum ramp: live multiplier on the impulse magnitude (env.on_epoch_end
+        # ramps push.magnitude_scale). Default 1.0 = unchanged.
+        _pscale = getattr(
+            self.config.domain_randomization.push, "magnitude_scale", 1.0
+        )
         lin_vel = (
             torch.rand(num_due, 3, device=self.device) * 2 - 1
-        ) * self._push_max_lin_vel
+        ) * self._push_max_lin_vel * _pscale
         ang_vel = (
             torch.rand(num_due, 3, device=self.device) * 2 - 1
-        ) * self._push_max_ang_vel
+        ) * self._push_max_ang_vel * _pscale
 
         self._apply_root_velocity_impulse(lin_vel, ang_vel, due_env_ids)
+        if getattr(self, "_push_grace_steps", 0) > 0:
+            # Arm the post-push action-rate grace window for the pushed envs.
+            self._push_grace_left[due_env_ids] = self._push_grace_steps
         self._schedule_push(due_env_ids)
+
+    # -------------------------
+    # External wrench randomization (random force/torque bursts)
+    # -------------------------
+    def _init_wrench_randomization(self) -> None:
+        """Initialize external wrench randomization state buffers.
+
+        Supports up to two independent wrench classes, each with its own
+        scheduler state: ``domain_randomization.wrench`` (short hard bursts)
+        and ``domain_randomization.sustained_wrench`` (long, low-magnitude
+        quasi-static loads — leaning/tether/payload). Their force/torque
+        buffers are SUMMED before the single ``_apply_external_wrenches``
+        call because backend application overwrites rather than accumulates
+        (IsaacLab ``set_external_force_and_torque`` sets the persistent
+        buffers; MuJoCo assigns ``xfrc_applied``).
+
+        ``getattr`` is used for ``sustained_wrench`` so configs pickled
+        before this field existed (old resolved_configs.pt) keep loading.
+        """
+        dr = self.config.domain_randomization
+        cfgs = []
+        if dr is not None:
+            for attr in ("wrench", "sustained_wrench"):
+                cfg = getattr(dr, attr, None)
+                if cfg is not None and cfg.has_wrench():
+                    cfgs.append(cfg)
+            # Extra classes (Track D: e.g. wrist drag); getattr keeps
+            # pre-field pickles loading.
+            for cfg in getattr(dr, "additional_wrenches", None) or []:
+                if cfg is not None and cfg.has_wrench():
+                    cfgs.append(cfg)
+
+        self._wrench_enabled = len(cfgs) > 0
+        if not self._wrench_enabled:
+            return
+
+        # Scheduler entries: normally one per class, but a class with
+        # ``independent_bodies=True`` (Track D ramped payload forces) expands
+        # into one entry PER BODY so each body cycles independently —
+        # sometimes one wrist loaded, sometimes both (asymmetric/full
+        # carries). ``getattr`` keeps pre-field pickles loading.
+        entries: List[tuple] = []
+        for cfg in cfgs:
+            if getattr(cfg, "independent_bodies", False):
+                entries.extend((cfg, [name]) for name in cfg.body_names)
+            else:
+                entries.append((cfg, list(cfg.body_names)))
+
+        # Resolve the UNION of candidate bodies once (single backend body-id
+        # list => single application call covers all classes).
+        union_names: List[str] = []
+        for cfg in cfgs:
+            for name in cfg.body_names:
+                if name not in union_names:
+                    union_names.append(name)
+        num_union = self._resolve_wrench_bodies(union_names)
+
+        # Per-entry scheduler state; force/torque buffers are laid out over
+        # the union body list, with each entry restricted to its own columns.
+        self._wrench_scheds = []
+        for cfg, entry_names in entries:
+            cols = torch.tensor(
+                [union_names.index(n) for n in entry_names],
+                dtype=torch.long,
+                device=self.device,
+            )
+            ramp_in_range = getattr(cfg, "ramp_in_range", (0.0, 0.0))
+            ramp_out_range = getattr(cfg, "ramp_out_range", (0.0, 0.0))
+            self._wrench_scheds.append(
+                {
+                    "cfg": cfg,
+                    "entry_names": list(entry_names),
+                    "cols": cols,
+                    "time": torch.zeros(self.num_envs, device=self.device),
+                    "next_start": torch.zeros(self.num_envs, device=self.device),
+                    "end_time": torch.zeros(self.num_envs, device=self.device),
+                    "active": torch.zeros(
+                        self.num_envs, dtype=torch.bool, device=self.device
+                    ),
+                    "forces": torch.zeros(
+                        self.num_envs, num_union, 3, device=self.device
+                    ),
+                    "torques": torch.zeros(
+                        self.num_envs, num_union, 3, device=self.device
+                    ),
+                    # Ramped-profile state (Track D): targets are the sampled
+                    # hold-phase wrench; forces/torques hold target * s(t)
+                    # with a cosine ease-in/out envelope.
+                    "ramped": (
+                        ramp_in_range[1] > 0.0
+                        or ramp_out_range[1] > 0.0
+                        or float(getattr(cfg, "persistent_ramp_in_sec", 0.0) or 0.0) > 0.0
+                    ),
+                    "target_forces": torch.zeros(
+                        self.num_envs, num_union, 3, device=self.device
+                    ),
+                    "target_torques": torch.zeros(
+                        self.num_envs, num_union, 3, device=self.device
+                    ),
+                    "start_time": torch.zeros(self.num_envs, device=self.device),
+                    "ramp_in": torch.zeros(self.num_envs, device=self.device),
+                    "ramp_out": torch.zeros(self.num_envs, device=self.device),
+                    # Set when wrench values are written outside the update
+                    # loop (init/reset persistent cohort) so the next update
+                    # pushes them through the single apply call.
+                    "dirty": False,
+                }
+            )
+        all_envs = torch.arange(self.num_envs, device=self.device)
+        for sched in self._wrench_scheds:
+            if self._reset_wrench_class(sched, all_envs):
+                sched["dirty"] = True
+
+    def _schedule_wrench(self, sched: dict, env_ids: torch.Tensor) -> None:
+        """Schedule the next wrench start time for the given envs of one class."""
+        if len(env_ids) == 0:
+            return
+        interval_min, interval_max = sched["cfg"].interval_range
+        random_intervals = (
+            torch.rand(len(env_ids), device=self.device)
+            * (interval_max - interval_min)
+            + interval_min
+        )
+        sched["next_start"][env_ids] = sched["time"][env_ids] + random_intervals
+
+    def _reset_wrench_class(self, sched: dict, env_ids: torch.Tensor) -> bool:
+        """Clear one class's state for env_ids and re-draw its persistent cohort.
+
+        A ``persistent_fraction`` (per-env Bernoulli at every reset, so cohort
+        membership churns) of envs gets a wrench sampled ONCE and held for the
+        whole episode (``end_time = +inf``, no interval/duration cycling);
+        the rest are rescheduled to cycle normally. Returns True if wrench
+        values were written (caller must ensure they reach the backend).
+        """
+        cfg = sched["cfg"]
+        sched["forces"][env_ids] = 0.0
+        sched["torques"][env_ids] = 0.0
+        sched["active"][env_ids] = False
+        sched["time"][env_ids] = 0.0
+        sched["end_time"][env_ids] = 0.0  # clear stale +inf persistent markers
+        sched["target_forces"][env_ids] = 0.0
+        sched["target_torques"][env_ids] = 0.0
+        sched["start_time"][env_ids] = 0.0
+        sched["ramp_in"][env_ids] = 0.0
+        sched["ramp_out"][env_ids] = 0.0
+        wrote = False
+        # getattr: configs pickled before this field existed must keep loading.
+        p = getattr(cfg, "persistent_fraction", 0.0) or 0.0
+        scale = getattr(cfg, "magnitude_scale", 1.0)
+        all_bodies = getattr(cfg, "persistent_all_bodies", False)
+        p_ramp_in = float(getattr(cfg, "persistent_ramp_in_sec", 0.0) or 0.0)
+        clean_rem = getattr(cfg, "clean_remainder", False)
+        mode = getattr(cfg, "direction_mode", "uniform")
+        cone = getattr(cfg, "downward_cone_deg", 30.0)
+        cycling_ids = env_ids
+        if p > 0.0:
+            mask = torch.rand(len(env_ids), device=self.device) < p
+            persistent_ids = env_ids[mask]
+            cycling_ids = env_ids[~mask]
+            n = len(persistent_ids)
+            if n > 0:
+                # Sampled ONCE per episode per (env, body) and held constant
+                # (magnitude AND direction fixed for the whole episode).
+                if all_bodies:
+                    cols = [int(c) for c in sched["cols"].tolist()]  # e.g. BOTH wrists
+                else:
+                    cols = [int(sched["cols"][torch.randint(len(sched["cols"]), (1,), device=self.device)].item())]
+                for col in cols:
+                    sched["target_forces"][persistent_ids, col] = (
+                        self._sample_wrench_vectors(
+                            n, cfg.force_magnitude_range, self.device, mode=mode, cone_deg=cone
+                        ) * scale
+                    )
+                    sched["target_torques"][persistent_ids, col] = (
+                        self._sample_wrench_vectors(n, cfg.torque_magnitude_range, self.device) * scale
+                    )
+                sched["active"][persistent_ids] = True
+                sched["end_time"][persistent_ids] = float("inf")
+                if p_ramp_in > 0.0:
+                    # Smooth onset: start at 0, cosine-ease target*s(t) in over
+                    # p_ramp_in sec (envelope pass), then hold constant.
+                    sched["forces"][persistent_ids] = 0.0
+                    sched["torques"][persistent_ids] = 0.0
+                    sched["start_time"][persistent_ids] = sched["time"][persistent_ids]
+                    sched["ramp_in"][persistent_ids] = p_ramp_in
+                else:
+                    sched["forces"][persistent_ids] = sched["target_forces"][persistent_ids]
+                    sched["torques"][persistent_ids] = sched["target_torques"][persistent_ids]
+                wrote = True
+        if clean_rem:
+            # Remainder gets NO wrench (clean tracking): never schedule a burst.
+            sched["next_start"][cycling_ids] = float("inf")
+        else:
+            self._schedule_wrench(sched, cycling_ids)
+        return wrote
+
+    def _summed_wrench_buffers(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Sum force/torque buffers across wrench classes (superposition)."""
+        total_f = self._wrench_scheds[0]["forces"].clone()
+        total_t = self._wrench_scheds[0]["torques"].clone()
+        for sched in self._wrench_scheds[1:]:
+            total_f += sched["forces"]
+            total_t += sched["torques"]
+        return total_f, total_t
+
+    @staticmethod
+    def _sample_wrench_vectors(
+        num: int,
+        magnitude_range: Tuple[float, float],
+        device: torch.device,
+        mode: str = "uniform",
+        cone_deg: float = 30.0,
+    ) -> torch.Tensor:
+        """Sample [num, 3] vectors with mode-dependent direction and uniform magnitude.
+
+        Modes (Track D ramped persistent forces, 2026-07-10):
+          - ``uniform``: uniform on the sphere (previous behavior; torques
+            always use this mode).
+          - ``horizontal``: mostly horizontal — z shrunk 4x pre-normalization
+            (chest persistent forces / pushes).
+          - ``downward``: PAYLOAD simulation — the FULL sampled magnitude is
+            locked to constant -z (the payload weight), plus a small
+            horizontal component of 10-18% of the magnitude in a random
+            per-event direction (constant within the event = temporally
+            correlated bag-swing/inertia, re-drawn per event).
+        """
+        mag_min, mag_max = magnitude_range
+        magnitudes = (
+            torch.rand(num, 1, device=device) * (mag_max - mag_min) + mag_min
+        )
+        if mode == "downward":
+            h_dir = torch.randn(num, 2, device=device)
+            h_dir = h_dir / h_dir.norm(dim=-1, keepdim=True).clamp_min(1e-9)
+            h_frac = 0.10 + 0.08 * torch.rand(num, 1, device=device)
+            xy = h_dir * h_frac * magnitudes
+            z = -magnitudes
+            return torch.cat([xy, z], dim=-1)
+        if mode == "downward_cone":
+            # Unit direction uniform over the spherical cap of half-angle
+            # ``cone_deg`` around -z (dominant downward payload + bounded sway),
+            # scaled by the sampled magnitude (so |force| == magnitude exactly).
+            cos_theta = math.cos(math.radians(cone_deg))
+            u = torch.rand(num, 1, device=device)
+            cos_a = cos_theta + u * (1.0 - cos_theta)  # in [cos_theta, 1]
+            sin_a = (1.0 - cos_a * cos_a).clamp_min(0.0).sqrt()
+            phi = (2.0 * math.pi) * torch.rand(num, 1, device=device)
+            dirs = torch.cat(
+                [sin_a * torch.cos(phi), sin_a * torch.sin(phi), -cos_a], dim=-1
+            )
+            return dirs * magnitudes
+        directions = torch.randn(num, 3, device=device)
+        if mode == "horizontal":
+            directions[:, 2] *= 0.25
+        directions = directions / directions.norm(dim=-1, keepdim=True).clamp_min(1e-9)
+        return directions * magnitudes
+
+    def _update_wrench_randomization(self) -> None:
+        """Advance all wrench-class timers; start due wrenches, expire finished ones."""
+        if not self._wrench_enabled:
+            return
+        changed = False
+        for sched in self._wrench_scheds:
+            cfg = sched["cfg"]
+            sched["time"] += self.dt
+
+            # Values written at init/reset (persistent cohort) not yet applied.
+            if sched["dirty"]:
+                sched["dirty"] = False
+                changed = True
+
+            # Expire finished wrenches -> zero their rows.
+            expired = sched["active"] & (sched["time"] >= sched["end_time"])
+            if expired.any():
+                expired_ids = torch.where(expired)[0]
+                sched["forces"][expired_ids] = 0.0
+                sched["torques"][expired_ids] = 0.0
+                sched["active"][expired_ids] = False
+                self._schedule_wrench(sched, expired_ids)
+                changed = True
+
+            # Start wrenches that are due.
+            due = (~sched["active"]) & (sched["time"] >= sched["next_start"])
+            if due.any():
+                due_ids = torch.where(due)[0]
+                num_due = len(due_ids)
+                # Choose one candidate body of THIS entry per env (entries
+                # from independent_bodies classes have exactly one body).
+                body_choice = sched["cols"][
+                    torch.randint(len(sched["cols"]), (num_due,), device=self.device)
+                ]
+                # Stage-scale knob (DR ladder patches this one scalar in
+                # resolved_configs.pt to ramp a family across stages).
+                scale = getattr(cfg, "magnitude_scale", 1.0)
+                forces = self._sample_wrench_vectors(
+                    num_due, cfg.force_magnitude_range, self.device,
+                    mode=getattr(cfg, "direction_mode", "uniform"),
+                    cone_deg=getattr(cfg, "downward_cone_deg", 30.0),
+                ) * scale
+                torques = self._sample_wrench_vectors(
+                    num_due, cfg.torque_magnitude_range, self.device
+                ) * scale
+                # Only the chosen body gets the wrench; other rows stay 0.
+                sched["target_forces"][due_ids] = 0.0
+                sched["target_torques"][due_ids] = 0.0
+                sched["target_forces"][due_ids, body_choice] = forces
+                sched["target_torques"][due_ids, body_choice] = torques
+                # Two-hand posture (Track D drag): with all_bodies_prob, some
+                # events load ALL candidate bodies together, the sampled
+                # magnitude split equally across them.
+                all_p = getattr(cfg, "all_bodies_prob", 0.0) or 0.0
+                if all_p > 0.0 and len(sched["cols"]) > 1:
+                    all_mask = (
+                        torch.rand(num_due, device=self.device) < all_p
+                    )
+                    if all_mask.any():
+                        ids = due_ids[all_mask]
+                        per_f = forces[all_mask] / len(sched["cols"])
+                        per_t = torques[all_mask] / len(sched["cols"])
+                        sched["target_forces"][ids] = 0.0
+                        sched["target_torques"][ids] = 0.0
+                        for col in sched["cols"]:
+                            sched["target_forces"][ids, col] = per_f
+                            sched["target_torques"][ids, col] = per_t
+                dur_min, dur_max = cfg.duration_range
+                durations = (
+                    torch.rand(num_due, device=self.device) * (dur_max - dur_min)
+                    + dur_min
+                )
+                if sched["ramped"]:
+                    # Ramped profile: ease-in U(ramp_in_range) -> hold at the
+                    # sampled magnitude for U(duration_range) -> ease-out
+                    # U(ramp_out_range). Applied force starts at 0 here; the
+                    # envelope pass below writes target * s(t) every step.
+                    ri_min, ri_max = getattr(cfg, "ramp_in_range", (0.0, 0.0))
+                    ro_min, ro_max = getattr(cfg, "ramp_out_range", (0.0, 0.0))
+                    ramp_in = (
+                        torch.rand(num_due, device=self.device) * (ri_max - ri_min)
+                        + ri_min
+                    )
+                    ramp_out = (
+                        torch.rand(num_due, device=self.device) * (ro_max - ro_min)
+                        + ro_min
+                    )
+                    sched["ramp_in"][due_ids] = ramp_in
+                    sched["ramp_out"][due_ids] = ramp_out
+                    sched["start_time"][due_ids] = sched["time"][due_ids]
+                    sched["end_time"][due_ids] = (
+                        sched["time"][due_ids] + ramp_in + durations + ramp_out
+                    )
+                    sched["forces"][due_ids] = 0.0
+                    sched["torques"][due_ids] = 0.0
+                else:
+                    # Step profile (previous behavior): full magnitude now.
+                    sched["forces"][due_ids] = sched["target_forces"][due_ids]
+                    sched["torques"][due_ids] = sched["target_torques"][due_ids]
+                    sched["end_time"][due_ids] = sched["time"][due_ids] + durations
+                sched["active"][due_ids] = True
+                changed = True
+
+            # Ramp envelope: write target * s(t) for active ramped envs
+            # (persistent cohort has end_time=+inf and ramp_in=0 -> s=1).
+            if sched["ramped"]:
+                # Include persistent-cohort envs (end_time=+inf) that are easing in
+                # (ramp_in>0): they ramp force in then hold (t_left=inf => s_out=1).
+                act = sched["active"] & (
+                    torch.isfinite(sched["end_time"]) | (sched["ramp_in"] > 0)
+                )
+                if act.any():
+                    t_rel = sched["time"] - sched["start_time"]
+                    s_in = torch.ones_like(t_rel)
+                    ri = sched["ramp_in"]
+                    m_in = act & (ri > 0) & (t_rel < ri)
+                    if m_in.any():
+                        x = (t_rel[m_in] / ri[m_in]).clamp(0.0, 1.0)
+                        s_in[m_in] = 0.5 * (1.0 - torch.cos(torch.pi * x))
+                    t_left = sched["end_time"] - sched["time"]
+                    s_out = torch.ones_like(t_rel)
+                    ro = sched["ramp_out"]
+                    m_out = act & (ro > 0) & (t_left < ro)
+                    if m_out.any():
+                        x = (t_left[m_out] / ro[m_out]).clamp(0.0, 1.0)
+                        s_out[m_out] = 0.5 * (1.0 - torch.cos(torch.pi * x))
+                    s = torch.minimum(s_in, s_out)
+                    rows = torch.where(act)[0]
+                    sched["forces"][rows] = (
+                        sched["target_forces"][rows] * s[rows, None, None]
+                    )
+                    sched["torques"][rows] = (
+                        sched["target_torques"][rows] * s[rows, None, None]
+                    )
+                    changed = True
+
+        if changed:
+            self._apply_external_wrenches(*self._summed_wrench_buffers())
+
+    def get_action_rate_grace_mask(self):
+        """Per-env mask suspending the action-rate penalty (Track D grace).
+
+        True while (a) the post-push grace countdown is running
+        (``PushDomainRandomizationConfig.action_rate_grace_sec``) or (b) any
+        persistent-force event of a class flagged
+        ``action_rate_grace=True`` is in its ramp-in or PLATEAU phase (the
+        ease-out is taxed again — the robot should settle smoothly).
+        Returns None when no grace source is configured (component treats
+        None as no grace).
+        """
+        pieces = []
+        if getattr(self, "_push_grace_steps", 0) > 0:
+            pieces.append(self._push_grace_left > 0)
+        if getattr(self, "_wrench_enabled", False):
+            for sched in self._wrench_scheds:
+                cfg = sched["cfg"]
+                ramp_in_only = getattr(cfg, "action_rate_grace_ramp_in_only", False)
+                if not (getattr(cfg, "action_rate_grace", False) or ramp_in_only):
+                    continue
+                in_event = sched["active"] & torch.isfinite(sched["end_time"])
+                if ramp_in_only:
+                    # Load onset / load-shift only: grace during the ramp-in;
+                    # steady carrying/pulling stays taxed.
+                    t_rel = sched["time"] - sched["start_time"]
+                    pieces.append(in_event & (t_rel < sched["ramp_in"]))
+                else:
+                    # ramp-in + plateau: before end_time - ramp_out.
+                    pre_ease_out = sched["time"] < (
+                        sched["end_time"] - sched["ramp_out"]
+                    )
+                    pieces.append(in_event & pre_ease_out)
+        if not pieces:
+            return None
+        mask = pieces[0]
+        for p in pieces[1:]:
+            mask = mask | p
+        return mask
+
+    def _reset_wrench_randomization(self, env_ids: torch.Tensor) -> None:
+        """Clear active wrenches (all classes) and reschedule for reset envs."""
+        if getattr(self, "_push_grace_steps", 0) > 0 and len(env_ids) > 0:
+            self._push_grace_left[env_ids] = 0
+        if not self._wrench_enabled or len(env_ids) == 0:
+            return
+        need_apply = False
+        for sched in self._wrench_scheds:
+            was_active = bool(sched["active"][env_ids].any())
+            wrote = self._reset_wrench_class(sched, env_ids)
+            need_apply = need_apply or was_active or wrote
+        if need_apply:
+            self._apply_external_wrenches(*self._summed_wrench_buffers())
+
+    def _resolve_wrench_bodies(self, body_names: List[str]) -> int:
+        """Resolve configured wrench body names to backend body indices.
+
+        Returns the number of candidate bodies. Backends that support wrench
+        DR must override this (and _apply_external_wrenches).
+        """
+        raise NotImplementedError(
+            "Wrench domain randomization is not implemented for this simulator backend."
+        )
+
+    def _apply_external_wrenches(
+        self, forces: torch.Tensor, torques: torch.Tensor
+    ) -> None:
+        """Write [num_envs, num_wrench_bodies, 3] force/torque buffers to the sim.
+
+        World-frame wrenches, persistently applied every physics step until
+        changed. Backends that support wrench DR must override this.
+        """
+        raise NotImplementedError(
+            "Wrench domain randomization is not implemented for this simulator backend."
+        )
 
     @abstractmethod
     def _apply_root_velocity_impulse(
@@ -703,6 +1198,11 @@ class Simulator(RecordingMixin, ABC):
         if self._push_enabled:
             self._simulation_time += self.dt
             self._apply_push_if_due()
+        if getattr(self, "_push_grace_steps", 0) > 0:
+            self._push_grace_left.clamp_(min=0).sub_(1).clamp_(min=0)
+
+        # Update external wrench randomization (random force/torque bursts)
+        self._update_wrench_randomization()
 
         # Update projectile timers (hide expired cubes)
         self._update_projectiles()
@@ -749,6 +1249,9 @@ class Simulator(RecordingMixin, ABC):
         if self._push_enabled:
             self._simulation_time[env_ids] = 0.0
             self._schedule_push(env_ids)
+
+        # Reset external wrench randomization state for reset environments
+        self._reset_wrench_randomization(env_ids)
 
         # Reset projectiles for reset environments
         self._reset_projectiles(env_ids)
@@ -1418,6 +1921,20 @@ class Simulator(RecordingMixin, ABC):
                     self.config.domain_randomization.object_assets
                 )
             )
+        # getattr: resolved-config pickles persisted before this field exist.
+        if getattr(self.config.domain_randomization, "mass_scale", None) is not None:
+            domain_randomization_dict["mass_scale"] = (
+                self._process_mass_scale_domain_randomization(
+                    self.config.domain_randomization.mass_scale
+                )
+            )
+        # getattr: resolved-config pickles persisted before this field exist.
+        if getattr(self.config.domain_randomization, "actuator_gain", None) is not None:
+            domain_randomization_dict["actuator_gain"] = (
+                self._process_actuator_gain_domain_randomization(
+                    self.config.domain_randomization.actuator_gain
+                )
+            )
 
         return domain_randomization_dict
 
@@ -1530,6 +2047,121 @@ class Simulator(RecordingMixin, ABC):
 
         com_dict = {"body_indices": body_indices, "com": com}
         return com_dict
+
+    def _process_mass_scale_domain_randomization(
+        self, domain_randomization: "MassScaleDomainRandomizationConfig"
+    ) -> Dict[str, Any]:
+        """Sample per-env body-mass scale multipliers (MASS-DR).
+
+        Samples [num_envs, num_matching_bodies] main-body multipliers from
+        ``mass_scale_range`` and, when ``all_links_scale_range`` is set,
+        [num_envs, num_bodies] all-links multipliers. Backend apply paths
+        compose them multiplicatively on the default masses. Logs
+        ``[mass-dr]`` sample statistics for dump-verify.
+        """
+        body_indices = get_matching_indices(
+            self.robot_config.kinematic_info.body_names,
+            domain_randomization.body_names,
+            domain_randomization.body_indices,
+        )
+        num_matching_bodies = len(body_indices)
+        lo, hi = domain_randomization.mass_scale_range
+        scales = (
+            torch.rand(self.num_envs, num_matching_bodies) * (hi - lo) + lo
+        )
+
+        all_links_scales = None
+        if domain_randomization.all_links_scale_range is not None:
+            alo, ahi = domain_randomization.all_links_scale_range
+            num_bodies = len(self.robot_config.kinematic_info.body_names)
+            all_links_scales = (
+                torch.rand(self.num_envs, num_bodies) * (ahi - alo) + alo
+            )
+
+        body_names = [
+            self.robot_config.kinematic_info.body_names[i] for i in body_indices
+        ]
+        print(
+            f"[mass-dr] enabled: main_bodies={body_names} range=({lo}, {hi}) "
+            f"sampled mean/min/max="
+            f"{scales.mean().item():.4f}/{scales.min().item():.4f}/"
+            f"{scales.max().item():.4f} over {self.num_envs} envs; "
+            f"all_links_range={domain_randomization.all_links_scale_range}"
+            + (
+                f" all_links mean/min/max={all_links_scales.mean().item():.4f}/"
+                f"{all_links_scales.min().item():.4f}/{all_links_scales.max().item():.4f}"
+                if all_links_scales is not None
+                else ""
+            )
+        )
+
+        return {
+            "body_indices": body_indices,
+            "scales": scales,
+            "all_links_scales": all_links_scales,
+        }
+
+    def _process_actuator_gain_domain_randomization(
+        self, domain_randomization: "ActuatorGainDomainRandomizationConfig"
+    ) -> Dict[str, Any]:
+        """Sample per-env, per-DOF actuator PD-gain scale multipliers (GAIN-DR).
+
+        Samples [num_envs, num_matching_dofs] multiplicative scales for
+        stiffness and damping from their respective ranges and, when
+        ``effort_limit_scale_range`` is set, an additional independent
+        [num_envs, num_matching_dofs] effort-limit scale. Backend apply paths
+        compose these multiplicatively on the nominal (config) gains. Logs
+        ``[gain-dr]`` sample statistics for dump-verify.
+        """
+        dof_indices = get_matching_indices(
+            self.robot_config.kinematic_info.dof_names,
+            domain_randomization.dof_names,
+            domain_randomization.dof_indices,
+        )
+        num_matching_dofs = len(dof_indices)
+
+        s_lo, s_hi = domain_randomization.stiffness_scale_range
+        stiffness_scales = (
+            torch.rand(self.num_envs, num_matching_dofs) * (s_hi - s_lo) + s_lo
+        )
+        d_lo, d_hi = domain_randomization.damping_scale_range
+        damping_scales = (
+            torch.rand(self.num_envs, num_matching_dofs) * (d_hi - d_lo) + d_lo
+        )
+
+        effort_limit_scales = None
+        if domain_randomization.effort_limit_scale_range is not None:
+            e_lo, e_hi = domain_randomization.effort_limit_scale_range
+            effort_limit_scales = (
+                torch.rand(self.num_envs, num_matching_dofs) * (e_hi - e_lo) + e_lo
+            )
+
+        dof_names = [
+            self.robot_config.kinematic_info.dof_names[i] for i in dof_indices
+        ]
+        print(
+            f"[gain-dr] enabled: dofs={dof_names} "
+            f"stiffness_range=({s_lo}, {s_hi}) sampled mean/min/max="
+            f"{stiffness_scales.mean().item():.4f}/{stiffness_scales.min().item():.4f}/"
+            f"{stiffness_scales.max().item():.4f} "
+            f"damping_range=({d_lo}, {d_hi}) sampled mean/min/max="
+            f"{damping_scales.mean().item():.4f}/{damping_scales.min().item():.4f}/"
+            f"{damping_scales.max().item():.4f} over {self.num_envs} envs; "
+            f"effort_limit_range={domain_randomization.effort_limit_scale_range}"
+            + (
+                f" effort_limit mean/min/max={effort_limit_scales.mean().item():.4f}/"
+                f"{effort_limit_scales.min().item():.4f}/{effort_limit_scales.max().item():.4f}"
+                if effort_limit_scales is not None
+                else ""
+            )
+        )
+
+        return {
+            "dof_indices": dof_indices,
+            "stiffness_scales": stiffness_scales,
+            "damping_scales": damping_scales,
+            "effort_limit_scales": effort_limit_scales,
+        }
 
     def _process_object_asset_domain_randomization(
         self, domain_randomization: ObjectAssetDomainRandomizationConfig

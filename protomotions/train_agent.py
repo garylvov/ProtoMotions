@@ -76,12 +76,86 @@ Example
 """
 
 import os
+import time
 import sys
 import json
 
 os.environ["WANDB_DISABLE_SENTRY"] = "true"  # Must be first environment variable
 os.environ["WANDB_SILENT"] = "true"
 os.environ["WANDB_DISABLE_CODE"] = "true"
+
+_WBC_STABILITY_ENV_DEFAULTS = {
+    "PG_TIMEOUT_SEC": "3600",
+    "TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC": "1200",
+    "TORCH_NCCL_ENABLE_MONITORING": "1",
+    "TORCH_NCCL_ASYNC_ERROR_HANDLING": "1",
+    "TORCH_NCCL_TRACE_BUFFER_SIZE": "1048576",
+    # NCCL 2.26.2 DDP deadlock fix (2026-07-13). Root cause (native-stack forensics):
+    # actor and critic are SEPARATE DDP modules with separate reducer buckets. The
+    # critic bucket's FIRST all-reduce lazy-connects its NCCL channel ON THE HOT PATH
+    # (the actor bucket was warmed by the actor step; the critic's was not). That lazy
+    # connect spawns NCCL's nonblocking group-launch worker thread and joins it, hitting
+    # a join-on-recycled-thread hang: ncclCommGetAsyncError -> ncclGroupJobComplete ->
+    # ncclAsyncJobComplete -> std::thread::join on a dead pthread (state=ncclSuccess but
+    # the collective is never enqueued). Reproducibly wedged one rank at the first critic
+    # backward of epoch 0/1 on the 36864-env warm-start; NOT memory pressure, NOT a
+    # graph/size mismatch, NOT GPU hardware (ECC/Xid clean; actor all-reduce on the same
+    # comm already succeeded). RUNTIME_CONNECT=0 eager-connects ALL channels at
+    # ncclCommInitRank (init time, off the hot path) -> removes the trigger.
+    # USE_COMM_NONBLOCKING=0 forces BLOCKING comms so the nonblocking group-launch worker
+    # thread never exists -> removes the racy join. Verified: 36864/85GB trains cleanly
+    # past epoch 0/1 (was: hang there twice). A definitive underlying fix is NCCL >=2.27
+    # (fixes "a group launch of multiple communicators"); these env defaults are the
+    # zero-rebuild, spot-durable mitigation.
+    "NCCL_RUNTIME_CONNECT": "0",
+    "TORCH_NCCL_USE_COMM_NONBLOCKING": "0",
+}
+
+
+def _set_wbc_stability_env_defaults() -> None:
+    """Seed process-group/NCCL stability defaults before Fabric initializes."""
+
+    for name, value in _WBC_STABILITY_ENV_DEFAULTS.items():
+        os.environ.setdefault(name, value)
+
+
+def _raise_nproc_soft_limit() -> None:
+    """Raise RLIMIT_NPROC soft limit to min(desired, hard) at startup.
+
+    fix: RLIMIT_NPROC starvation wedges multi-rank Isaac+NCCL training.
+    Ranks that inherit the bare SLURM step default (soft=4096) exhaust the
+    per-UID thread budget during startup/epoch0 burst thread creation --
+    pthread_create returns EAGAIN inside NCCL, the failing rank SIGABRTs
+    holding process-group state, and every peer wedges in its next
+    collective (the ncclSystemError / "pthread_join failed" /
+    futex_wait_queue family; see wbc_push/briefs/rank_stall_rca.*.md
+    round-2). Launcher-side `ulimit -u` is fragile: it silently no-ops when
+    the request exceeds the hard cap and does not reliably survive
+    setsid/spawn boundaries (both observed live). Setting it here, in the
+    training process itself before simulator/Fabric setup, is immune to
+    launch plumbing. Never request above the hard cap -- clamp to it.
+    Override the target via NPROC_SOFT_LIMIT; opt out with
+    NPROC_SOFT_LIMIT=0.
+    """
+
+    import resource
+
+    try:
+        desired = int(os.environ.get("NPROC_SOFT_LIMIT", "16384"))
+    except ValueError:
+        desired = 16384
+    if desired <= 0:
+        return
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NPROC)
+        target = desired if hard == resource.RLIM_INFINITY else min(desired, hard)
+        if soft != resource.RLIM_INFINITY and target > soft:
+            resource.setrlimit(resource.RLIMIT_NPROC, (target, hard))
+            print(
+                f"[train_agent] raised RLIMIT_NPROC soft {soft} -> {target} (hard={hard})"
+            )
+    except (ValueError, OSError) as exc:
+        print(f"[train_agent] WARN could not raise RLIMIT_NPROC: {exc}")
 
 """
 ## Quick Start
@@ -270,6 +344,8 @@ from protomotions.utils.cli_utils import parse_bool  # noqa: E402
 
 parser = create_parser()
 args, unknown_args = parser.parse_known_args()
+_set_wbc_stability_env_defaults()
+_raise_nproc_soft_limit()
 
 # Import simulator before torch - isaacgym/isaaclab must be imported before torch
 # This also returns AppLauncher if using isaaclab, None otherwise
@@ -318,9 +394,16 @@ def detect_checkpoint_mode(args, save_dir):
             with open(checkpoint_config_path, "r") as file:
                 checkpoint_config = json.load(file)
 
-            # Update args with checkpoint config
+            # Update args with checkpoint config.
+            # Skip transient CLI-only flags that must NOT be restored from a
+            # saved run: `create_config_only` (a saved config minted via
+            # --create-config-only bakes this True; restoring it re-triggers the
+            # create-config-only branch on every resume -> save_configs ->
+            # json.dump(args) crashes on the resume checkpoint PosixPath) and
+            # `checkpoint` (resume sets its own checkpoint path below).
+            _SKIP_RESTORE = {"wandb_id", "create_config_only", "checkpoint"}
             for key, value in checkpoint_config.items():
-                if key != "wandb_id":
+                if key not in _SKIP_RESTORE:
                     setattr(args, key, value)
             wandb_id = checkpoint_config.get("wandb_id", None)
         else:
@@ -717,6 +800,15 @@ def main():
             app_launcher_flags["distributed"] = True
             os.environ["LOCAL_RANK"] = str(fabric.local_rank)
             os.environ["RANK"] = str(fabric.global_rank)
+            # 2026-07-04 crash-rootcause mitigation (patch-3): de-collide the
+            # 8-way concurrent NFS reads (motion-lib pickle, env_*.pt.ckpt on
+            # resume) that all ranks on a node issue at ~the same instant,
+            # which is the documented straggler source behind the
+            # BaseAgent.__init__ all_gather timeout. Opt-in (default 0 = off)
+            # so behavior is unchanged unless a wrapper sets NFS_STAGGER_SEC.
+            _stagger = float(os.environ.get("NFS_STAGGER_SEC", "0") or "0")
+            if _stagger > 0:
+                time.sleep(fabric.local_rank * _stagger)
         app_launcher = AppLauncher(app_launcher_flags)
         simulator_extra_params["simulation_app"] = app_launcher.app
 

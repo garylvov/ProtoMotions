@@ -146,7 +146,7 @@ def test_running_mean_std_ema_updates_without_accumulating_count():
     assert rms.count == 1
 
 
-def test_running_mean_std_records_distributed_moments_and_broadcasts():
+def test_record_moments_records_local_only_with_distributed_fabric():
     fabric = _DistributedFabric()
     rms = RunningMeanStd(
         fabric,
@@ -157,11 +157,47 @@ def test_running_mean_std_records_distributed_moments_and_broadcasts():
 
     rms.record_moments(torch.tensor([[1.0], [3.0]]))
 
-    all_values = torch.tensor([1.0, 3.0, 3.0, 5.0])
-    assert torch.allclose(rms.mean, all_values.mean().view(1).double())
-    assert torch.allclose(rms.var, all_values.var(unbiased=False).view(1).double())
-    assert rms.count == 4
-    assert len(fabric.broadcasts) == 3
+    assert fabric.gather_calls == 0
+    assert fabric.broadcasts == []
+    assert torch.allclose(rms.mean, torch.tensor([2.0], dtype=torch.float64))
+    assert torch.allclose(rms.var, torch.tensor([1.0], dtype=torch.float64))
+    assert rms.count == 2
+
+
+def test_record_moments_uses_no_hot_path_collectives(monkeypatch):
+    """record_moments stays local; explicit training-loop sync owns collectives."""
+    import protomotions.agents.utils.normalization as norm_mod
+
+    fabric = _DistributedFabric()
+    rms = RunningMeanStd(fabric, shape=(1,), device="cpu")
+    rms.count.zero_()
+
+    broadcast_tensor_calls = []
+    object_broadcast_calls = []
+
+    def fake_broadcast(tensor, src=0, group=None):
+        # Emulate rank-0 as source: leave the (already rank-0-correct) tensor.
+        broadcast_tensor_calls.append((tensor, src))
+        return None
+
+    def fake_broadcast_object_list(obj_list, src=0, group=None):
+        object_broadcast_calls.append((list(obj_list), src))
+        return None
+
+    monkeypatch.setattr(norm_mod.dist, "is_available", lambda: True)
+    monkeypatch.setattr(norm_mod.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(norm_mod.dist, "broadcast", fake_broadcast)
+    monkeypatch.setattr(
+        norm_mod.dist, "broadcast_object_list", fake_broadcast_object_list
+    )
+
+    rms.record_moments(torch.tensor([[1.0], [3.0]]))
+
+    assert broadcast_tensor_calls == []
+    assert object_broadcast_calls == []
+    assert fabric.broadcasts == []
+    assert torch.allclose(rms.mean, torch.tensor([2.0], dtype=torch.float64))
+    assert rms.count == 2
 
 
 def test_materialize_lazy_running_stats_from_state_dict_creates_missing_buffers():

@@ -115,12 +115,51 @@ class _PPOLogstdLoadModel(nn.Module):
         self._actor.logstd.data.copy_(state_dict["_actor.logstd"])
 
 
+class _FreezeGateModule(nn.Module):
+    def __init__(self, freeze_running: bool):
+        super().__init__()
+        self._freeze_running = freeze_running
+        self.states_seen = []
+
+    def forward(self, obs_td):
+        self.states_seen.append(self._freeze_running)
+        return obs_td
+
+
+class _MaterializeRecorder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.open_norm = _FreezeGateModule(False)
+        self.frozen_norm = _FreezeGateModule(True)
+        self.materialized = False
+
+    def materialize(self, obs_td):
+        self.materialized = True
+        self.open_norm(obs_td)
+        self.frozen_norm(obs_td)
+        return obs_td
+
+
 def test_base_agent_has_critic_is_false_for_agents_without_critic_contract():
     agent = object.__new__(BaseAgent)
     assert BaseAgent.has_critic.fget(agent) is False
 
     agent.critic = object()
     assert BaseAgent.has_critic.fget(agent) is False
+
+
+def test_materialize_lazy_modules_freezes_and_restores_gates():
+    model = _MaterializeRecorder()
+    agent = object.__new__(BaseAgent)
+    agent.model = model
+
+    BaseAgent._materialize_lazy_modules(agent, TensorDict({}, batch_size=[]))
+
+    assert model.materialized is True
+    assert model.open_norm.states_seen == [True]
+    assert model.frozen_norm.states_seen == [True]
+    assert model.open_norm._freeze_running is False
+    assert model.frozen_norm._freeze_running is True
 
 
 class _ConcreteBaseModel(BaseModel):
@@ -607,11 +646,34 @@ def test_base_agent_load_uses_explicit_training_state_and_loads_matching_env_sta
     assert loaded["agent"][1] is False
     assert torch.equal(loaded["agent"][0]["model"]["w"], torch.tensor([1.0]))
     assert torch.equal(loaded["env"]["env"], torch.tensor([2.0]))
-    assert agent.just_loaded_checkpoint_should_evaluate is True
+    assert agent.just_loaded_checkpoint_should_evaluate is False
+    assert agent._skip_next_eval_after_resume is True
     assert fabric.calls == [
         ("on_load_checkpoint_start", ()),
         ("on_load_checkpoint_end", ()),
     ]
+
+
+def test_base_agent_load_defers_next_eval(tmp_path):
+    checkpoint = tmp_path / "inference.ckpt"
+    torch.save({"model": {"w": torch.tensor([1.0])}}, checkpoint)
+
+    fabric = _FabricRecorder()
+    loaded = {}
+    agent = object.__new__(BaseAgent)
+    agent.fabric = fabric
+    agent.device = torch.device("cpu")
+    agent.root_dir = tmp_path
+    agent.load_parameters = lambda state, load_training_state: loaded.setdefault(
+        "agent",
+        (state, load_training_state),
+    )
+
+    BaseAgent.load(agent, checkpoint, load_env=False, load_training_state=False)
+
+    assert loaded["agent"][1] is False
+    assert agent.just_loaded_checkpoint_should_evaluate is False
+    assert agent._skip_next_eval_after_resume is True
 
 
 def test_agent_training_state_hooks_do_not_thread_load_flag():

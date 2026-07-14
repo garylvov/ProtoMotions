@@ -505,6 +505,119 @@ class IsaacLabSimulator(Simulator):
             # Set the new COMs.
             self._robot.root_physx_view.set_coms(coms, all_env_ids)
 
+        if (
+            self._domain_randomization is not None
+            and "mass_scale" in self._domain_randomization
+        ):
+            # MASS-DR (Gary 2026-07-10): per-env multiplicative body-mass
+            # scales, applied once after robot creation via the PhysX
+            # articulation-view mass API. get_masses returns [num_envs,
+            # num_links] in the PhysX link order; robot-config body indices
+            # are remapped through find_bodies (the friction path's safe
+            # pattern — the two orderings are NOT guaranteed identical).
+            mass_dr = self._domain_randomization["mass_scale"]
+            masses = self._robot.root_physx_view.get_masses().clone()
+            default_masses = masses.clone()
+
+            if mass_dr.get("all_links_scales") is not None:
+                # All-links multiplier, sampled in robot-config body order ->
+                # remap to PhysX link order.
+                cfg_body_names = self.robot_config.kinematic_info.body_names
+                lab_ids, _ = self._robot.find_bodies(
+                    cfg_body_names, preserve_order=True
+                )
+                masses[:, lab_ids] *= mass_dr["all_links_scales"].to(masses.device)
+
+            main_body_names = [
+                self.robot_config.kinematic_info.body_names[i]
+                for i in mass_dr["body_indices"]
+            ]
+            main_lab_ids, _ = self._robot.find_bodies(
+                main_body_names, preserve_order=True
+            )
+            masses[:, main_lab_ids] *= mass_dr["scales"].to(masses.device)
+
+            self._robot.root_physx_view.set_masses(masses, all_env_ids)
+
+            before = default_masses[:, main_lab_ids].mean().item()
+            after_t = masses[:, main_lab_ids]
+            total_before = default_masses.sum(dim=-1)
+            total_after = masses.sum(dim=-1)
+            print(
+                f"[mass-dr] applied: main_bodies={main_body_names} "
+                f"default_mass={before:.3f} kg -> scaled mean/min/max="
+                f"{after_t.mean().item():.3f}/{after_t.min().item():.3f}/"
+                f"{after_t.max().item():.3f} kg; total robot mass "
+                f"mean/min/max={total_after.mean().item():.3f}/"
+                f"{total_after.min().item():.3f}/{total_after.max().item():.3f} kg "
+                f"(default {total_before.mean().item():.3f} kg)"
+            )
+
+        if (
+            self._domain_randomization is not None
+            and "actuator_gain" in self._domain_randomization
+        ):
+            # GAIN-DR (T7 2026-07-13): per-env, per-DOF multiplicative
+            # stiffness/damping (and optional effort-limit) scales, applied
+            # once after robot creation via the IsaacLab Articulation gain
+            # API. For BUILT_IN_PD (ImplicitActuatorCfg) robots this pushes
+            # straight into the PhysX implicit PD solver
+            # (root_physx_view.set_dof_stiffnesses/set_dof_dampings/
+            # set_dof_max_forces) via write_joint_stiffness_to_sim /
+            # write_joint_damping_to_sim / write_joint_effort_limit_to_sim —
+            # same idiom as MASS-DR's mass API. DOF ordering: robot-config
+            # dof indices are remapped through find_joints (the friction/mass
+            # paths' safe pattern — orderings are NOT guaranteed identical).
+            gain_dr = self._domain_randomization["actuator_gain"]
+            dof_names = [
+                self.robot_config.kinematic_info.dof_names[i]
+                for i in gain_dr["dof_indices"]
+            ]
+            lab_dof_ids, _ = self._robot.find_joints(dof_names, preserve_order=True)
+
+            default_stiffness = self._robot.root_physx_view.get_dof_stiffnesses().clone()
+            default_damping = self._robot.root_physx_view.get_dof_dampings().clone()
+
+            new_stiffness = default_stiffness.clone()
+            new_damping = default_damping.clone()
+            stiffness_scales = gain_dr["stiffness_scales"].to(new_stiffness.device)
+            damping_scales = gain_dr["damping_scales"].to(new_damping.device)
+            new_stiffness[:, lab_dof_ids] *= stiffness_scales
+            new_damping[:, lab_dof_ids] *= damping_scales
+
+            self._robot.write_joint_stiffness_to_sim(new_stiffness)
+            self._robot.write_joint_damping_to_sim(new_damping)
+
+            log_msg = (
+                f"[gain-dr] applied: dofs={dof_names} "
+                f"default_stiffness_mean={default_stiffness[:, lab_dof_ids].mean().item():.3f} "
+                f"-> scaled mean/min/max="
+                f"{new_stiffness[:, lab_dof_ids].mean().item():.3f}/"
+                f"{new_stiffness[:, lab_dof_ids].min().item():.3f}/"
+                f"{new_stiffness[:, lab_dof_ids].max().item():.3f}; "
+                f"default_damping_mean={default_damping[:, lab_dof_ids].mean().item():.3f} "
+                f"-> scaled mean/min/max="
+                f"{new_damping[:, lab_dof_ids].mean().item():.3f}/"
+                f"{new_damping[:, lab_dof_ids].min().item():.3f}/"
+                f"{new_damping[:, lab_dof_ids].max().item():.3f}"
+            )
+
+            if gain_dr.get("effort_limit_scales") is not None:
+                default_effort = self._robot.root_physx_view.get_dof_max_forces().clone()
+                new_effort = default_effort.clone()
+                effort_scales = gain_dr["effort_limit_scales"].to(new_effort.device)
+                new_effort[:, lab_dof_ids] *= effort_scales
+                self._robot.write_joint_effort_limit_to_sim(new_effort)
+                log_msg += (
+                    f"; default_effort_limit_mean="
+                    f"{default_effort[:, lab_dof_ids].mean().item():.3f} -> scaled "
+                    f"mean/min/max={new_effort[:, lab_dof_ids].mean().item():.3f}/"
+                    f"{new_effort[:, lab_dof_ids].min().item():.3f}/"
+                    f"{new_effort[:, lab_dof_ids].max().item():.3f}"
+                )
+
+            print(log_msg)
+
         self._apply_scene_object_properties_after_spawn(all_env_ids)
 
     def _apply_scene_object_properties_after_spawn(
@@ -929,6 +1042,52 @@ class IsaacLabSimulator(Simulator):
         new_vel[:, :3] += linear_velocity
         new_vel[:, 3:6] += angular_velocity
         self._robot.write_root_velocity_to_sim(new_vel, env_ids=env_ids)
+
+    def _resolve_wrench_bodies(self, body_names) -> int:
+        """Resolve wrench DR body names to IsaacLab body indices (cached)."""
+        body_ids, resolved_names = self._robot.find_bodies(
+            body_names, preserve_order=True
+        )
+        if len(body_ids) == 0:
+            raise ValueError(
+                f"Wrench DR body_names {body_names} matched no bodies; "
+                f"available: {self._robot.data.body_names}"
+            )
+        self._wrench_body_ids = body_ids
+        print(
+            f"[INFO] Wrench DR enabled on bodies {resolved_names} (ids {body_ids})"
+        )
+        return len(body_ids)
+
+    def _apply_external_wrenches(
+        self, forces: torch.Tensor, torques: torch.Tensor
+    ) -> None:
+        """Write wrench buffers into IsaacLab's persistent external wrench buffers.
+
+        Applied at every physics sub-step by _scene.write_data_to_sim() until
+        the next call. World-frame (is_global=True).
+        """
+        self._robot.set_external_force_and_torque(
+            forces,
+            torques,
+            body_ids=self._wrench_body_ids,
+            env_ids=None,
+            is_global=True,
+        )
+        if os.environ.get("PM_WRENCH_DEBUG"):
+            self._wrench_debug_counter = getattr(self, "_wrench_debug_counter", 0) + 1
+            if self._wrench_debug_counter % 50 == 1:
+                buf_f = self._robot._external_force_b
+                buf_t = self._robot._external_torque_b
+                n_active = int((buf_f.norm(dim=-1) > 0).any(dim=-1).sum())
+                print(
+                    f"[WRENCH-DEBUG] call={self._wrench_debug_counter} "
+                    f"envs_with_force={n_active}/{buf_f.shape[0]} "
+                    f"|F|max={float(buf_f.norm(dim=-1).max()):.1f}N "
+                    f"|T|max={float(buf_t.norm(dim=-1).max()):.1f}Nm "
+                    f"has_external_wrench={self._robot.has_external_wrench}",
+                    flush=True,
+                )
 
     # =====================================================
     # Projectile Implementation

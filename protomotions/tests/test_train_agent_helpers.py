@@ -141,6 +141,22 @@ def test_train_agent_parser_and_bool_helpers(monkeypatch, tmp_path):
     assert parsed.create_config_only is True
 
 
+def test_wbc_stability_env_defaults_are_seeded(monkeypatch, tmp_path):
+    for name in (
+        "PG_TIMEOUT_SEC",
+        "TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC",
+        "TORCH_NCCL_ENABLE_MONITORING",
+        "TORCH_NCCL_ASYNC_ERROR_HANDLING",
+        "TORCH_NCCL_TRACE_BUFFER_SIZE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    module = _load_train_agent_globals(monkeypatch, tmp_path)
+
+    for name, value in module["_WBC_STABILITY_ENV_DEFAULTS"].items():
+        assert os.environ[name] == value
+
+
 def test_detect_checkpoint_mode_handles_fresh_warm_start_and_resume(
     monkeypatch,
     tmp_path,

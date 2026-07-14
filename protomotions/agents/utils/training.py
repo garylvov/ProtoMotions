@@ -14,6 +14,7 @@ Key Functions:
 """
 
 import torch
+import torch.distributed as dist
 from torch import Tensor
 import torch.nn as nn
 from torch.nn import functional as F
@@ -23,6 +24,70 @@ from protomotions.utils import torch_utils
 from lightning.fabric import Fabric
 
 from protomotions.agents.common.common import get_params
+
+
+def _numeric_metric_value(value):
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 1:
+            return value.float().item()
+        return value.mean().float().item()
+    return None
+
+
+def _distributed_metric_key_union(local_keys, fabric: Fabric):
+    payload = "\n".join(sorted(local_keys)).encode("utf-8")
+    length = torch.tensor([len(payload)], device=fabric.device, dtype=torch.int64)
+    gathered_lengths = [torch.empty_like(length) for _ in range(fabric.world_size)]
+    dist.all_gather(gathered_lengths, length)
+    lengths = [int(item.cpu().item()) for item in gathered_lengths]
+    max_length = max(lengths) if lengths else 0
+
+    local_bytes = torch.zeros(max_length, device=fabric.device, dtype=torch.uint8)
+    if payload:
+        local_bytes[: len(payload)] = torch.tensor(
+            list(payload), device=fabric.device, dtype=torch.uint8
+        )
+    gathered_bytes = [torch.empty_like(local_bytes) for _ in range(fabric.world_size)]
+    dist.all_gather(gathered_bytes, local_bytes)
+
+    union_keys = set()
+    for byte_tensor, payload_length in zip(gathered_bytes, lengths):
+        if payload_length == 0:
+            continue
+        encoded = bytes(byte_tensor[:payload_length].cpu().tolist())
+        union_keys.update(key for key in encoded.decode("utf-8").split("\n") if key)
+    return sorted(union_keys)
+
+
+def _aggregate_scalar_metrics_tensor_only(
+    log_dict: Dict, fabric: Fabric, weight: int = 1
+) -> Dict:
+    union_keys = _distributed_metric_key_union(log_dict.keys(), fabric)
+    aggregated_dict = {}
+
+    value_sums = torch.zeros(len(union_keys), device=fabric.device, dtype=torch.float32)
+    weight_sums = torch.zeros_like(value_sums)
+    for index, key in enumerate(union_keys):
+        if key not in log_dict:
+            continue
+        numeric_value = _numeric_metric_value(log_dict[key])
+        if numeric_value is None:
+            aggregated_dict[key] = log_dict[key]
+            continue
+        value_sums[index] = numeric_value * float(weight)
+        weight_sums[index] = float(weight)
+
+    if len(union_keys) > 0:
+        dist.all_reduce(value_sums, op=dist.ReduceOp.SUM)
+        dist.all_reduce(weight_sums, op=dist.ReduceOp.SUM)
+
+    for index, key in enumerate(union_keys):
+        if weight_sums[index].item() > 0:
+            aggregated_dict[key] = (value_sums[index] / weight_sums[index]).item()
+
+    return aggregated_dict
 
 
 def bounds_loss(mu: Tensor) -> Tensor:
@@ -82,6 +147,19 @@ def handle_model_grad_clipping(config, fabric, model, optimizer, model_name):
         bad_grads = torch.isnan(grad_norm_before_clip)
 
     bad_grads_count = 0
+    # fix: bad-grad agreement is LOCAL-ONLY. The explicit
+    # dist.all_reduce(MAX) that used to sit here (added 5433ca3, made
+    # unconditional 7a366a0) is redundant under DDP: gradients are already
+    # bucket-all-reduced to identical values on every rank by the time
+    # backward returns, so torch.isnan(grad_norm) is rank-uniform by
+    # construction. Worse, the collective sat in the most dangerous window
+    # (the first CPU-blocking sync after backward): py-spy captures
+    # (gpu2255_stall1_pyspy_20260707.txt, ddp7_stall_pyspy_20260707.txt)
+    # show every healthy rank spinning at exactly this point while a
+    # reducer-starved rank was parked in backward. Removing the collective
+    # removes a mid-step cross-rank dependency without changing behavior.
+    # (For fabric=None / per-group-DDP callers this was already local.)
+
     if bad_grads:
         if config.fail_on_bad_grads:
             all_params = torch.cat(
@@ -102,19 +180,11 @@ def handle_model_grad_clipping(config, fabric, model, optimizer, model_name):
                     p.grad.zero_()
 
     if config.gradient_clip_val > 0:
-        if fabric is not None:
-            fabric.clip_gradients(
-                model,
-                optimizer,
-                max_norm=config.gradient_clip_val,
-                error_if_nonfinite=True,
-            )
-        else:
-            torch.nn.utils.clip_grad_norm_(
-                params,
-                max_norm=config.gradient_clip_val,
-                error_if_nonfinite=True,
-            )
+        torch.nn.utils.clip_grad_norm_(
+            params,
+            max_norm=config.gradient_clip_val,
+            error_if_nonfinite=True,
+        )
     grad_norm_after_clip = torch_utils.grad_norm(params)
     clip_dict = {
         f"{model_name}/grad_norm_before_clip": grad_norm_before_clip.detach(),
@@ -137,39 +207,17 @@ def aggregate_scalar_metrics(log_dict: Dict, fabric: Fabric, weight: int = 1) ->
     """
     aggregated_dict = {}
 
-    if fabric.world_size > 1:
-        weight_tensor = torch.tensor(weight, device=fabric.device, dtype=torch.float32)
-        all_weights = fabric.all_gather(weight_tensor)
-        total_weight = all_weights.sum()
-    else:
-        all_weights = None
-        total_weight = None
-
-    for key, value in log_dict.items():
-        if isinstance(value, (int, float)):
-            value_tensor = torch.tensor(
-                value, device=fabric.device, dtype=torch.float32
-            )
-        elif isinstance(value, torch.Tensor):
-            if value.numel() == 1:
-                value_tensor = value.float().to(fabric.device)
+    if fabric.world_size == 1:
+        # Single-GPU: no collectives, behavior-preserving.
+        for key, value in log_dict.items():
+            numeric_value = _numeric_metric_value(value)
+            if numeric_value is not None:
+                aggregated_dict[key] = numeric_value
             else:
-                value_tensor = value.mean().float().to(fabric.device)
-        else:
-            aggregated_dict[key] = value
-            continue
+                aggregated_dict[key] = value
+        return aggregated_dict
 
-        if fabric.world_size > 1:
-            all_values = fabric.all_gather(value_tensor)
-            # Weighted mean: sum(value_i * weight_i) / sum(weight_i)
-            aggregated_value = (all_values * all_weights).sum() / total_weight
-            aggregated_value = aggregated_value.item()
-        else:
-            aggregated_value = value_tensor.item()
-
-        aggregated_dict[key] = aggregated_value
-
-    return aggregated_dict
+    return _aggregate_scalar_metrics_tensor_only(log_dict, fabric, weight=weight)
 
 
 def get_activation_func(activation_name, return_type="nn"):

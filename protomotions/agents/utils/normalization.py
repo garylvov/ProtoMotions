@@ -21,6 +21,7 @@ Key Features:
 from typing import Optional, Tuple, List
 
 import torch
+import torch.distributed as dist
 from torch import Tensor, nn
 from lightning.fabric import Fabric
 
@@ -200,28 +201,82 @@ class RunningMeanStd(nn.Module):
         batch_count = arr.shape[0]
 
         if self.fabric is not None and self.fabric.world_size > 1:
-            all_means = self.fabric.all_gather(batch_mean)
-            all_vars = self.fabric.all_gather(batch_var)
-            all_counts = self.fabric.all_gather(batch_count)
-
-            if self.fabric.global_rank == 0:
-                batch_mean, batch_var, batch_count = combine_moments(
-                    all_means, all_vars, all_counts
-                )
-
-            if self.fabric.global_rank == 0:
-                self.update_from_moments(batch_mean, batch_var, batch_count)
-
-            # Broadcast updated parameters to all ranks
-            updated_mean = self.fabric.broadcast(self.mean, src=0)
-            updated_var = self.fabric.broadcast(self.var, src=0)
-            updated_count = self.fabric.broadcast(self.count, src=0)
-
-            self.mean.copy_(updated_mean)
-            self.var.copy_(updated_var)
-            self.count.fill_(updated_count.item())
-        else:
             self.update_from_moments(batch_mean, batch_var, batch_count)
+            return
+
+        self.update_from_moments(batch_mean, batch_var, batch_count)
+
+
+@torch.no_grad()
+def sync_running_mean_std_modules(
+    named_modules: List[Tuple[str, RunningMeanStd]],
+    fabric,
+) -> None:
+    """Synchronize RunningMeanStd buffers at a rank-uniform boundary.
+
+    The caller owns ordering and must call this from the same training-loop
+    boundary on every rank. The implementation uses tensor collectives only:
+    no object collectives and no Fabric broadcast wrappers.
+    """
+    if fabric is None or getattr(fabric, "world_size", 1) <= 1:
+        return
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+
+    world_size = dist.get_world_size()
+    for name, module in named_modules:
+        initialized = torch.tensor(
+            int(module._initialized),
+            device=fabric.device,
+            dtype=torch.long,
+        )
+        initialized_count = initialized.clone()
+        dist.all_reduce(initialized_count, op=dist.ReduceOp.SUM)
+        initialized_total = int(initialized_count.item())
+        if initialized_total == 0:
+            continue
+        if initialized_total != world_size:
+            raise RuntimeError(
+                f"RunningMeanStd '{name}' initialized on {initialized_total}/"
+                f"{world_size} ranks; lazy normalizer materialization must be "
+                "rank-consistent before synchronization."
+            )
+
+        mean = module.mean.to(dtype=torch.float64)
+        var = module.var.to(dtype=torch.float64)
+        count = module.count.to(device=module.mean.device, dtype=torch.float64)
+
+        if module.ema_decay is not None:
+            synced_mean = mean.clone()
+            synced_var = var.clone()
+            dist.all_reduce(synced_mean, op=dist.ReduceOp.SUM)
+            dist.all_reduce(synced_var, op=dist.ReduceOp.SUM)
+            synced_mean /= world_size
+            synced_var /= world_size
+            synced_count = count.clone()
+            dist.all_reduce(synced_count, op=dist.ReduceOp.MAX)
+        else:
+            total_count = count.clone()
+            total_sum = mean * count
+            total_sumsq = (var + mean.square()) * count
+            dist.all_reduce(total_count, op=dist.ReduceOp.SUM)
+            dist.all_reduce(total_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(total_sumsq, op=dist.ReduceOp.SUM)
+
+            safe_count = torch.clamp(total_count, min=1.0)
+            synced_mean = total_sum / safe_count
+            synced_var = torch.clamp(
+                total_sumsq / safe_count - synced_mean.square(), min=0.0
+            )
+            synced_count = total_count
+
+        module.mean.copy_(
+            synced_mean.to(device=module.mean.device, dtype=module.mean.dtype)
+        )
+        module.var.copy_(synced_var.to(device=module.var.device, dtype=module.var.dtype))
+        module.count.copy_(
+            synced_count.to(device=module.count.device, dtype=module.count.dtype)
+        )
 
 
 def materialize_lazy_running_stats_from_state_dict(
@@ -240,6 +295,49 @@ def materialize_lazy_running_stats_from_state_dict(
         mean = state_dict[mean_key]
         module._create_buffers(tuple(mean.shape), mean.device)
         module._initialized = True
+
+
+def sync_record_moments_gates(model: nn.Module, fabric) -> None:
+    """Rank-agree the normalizer record/freeze gates after a checkpoint load.
+
+    ``NormObsBase.forward`` gates ``RunningMeanStd.record_moments`` — which
+    issues all_gather/broadcast collectives — on the per-rank local flag
+    ``_freeze_running``. If that flag diverges across DDP ranks (observed after
+    ladder/checkpoint resume), ranks execute different collective schedules and
+    the process group deadlocks. This one-shot sync runs at a symmetric point
+    (checkpoint load, outside any forward) and forces every rank to the same
+    decision: a module records unless EVERY rank wants it frozen (i.e. record
+    if any rank would record — matching what an all_reduce(max) of the record
+    flag would decide, but with zero collectives in the hot path).
+
+    No-op for single-process runs and when torch.distributed is not initialized,
+    so single-GPU behavior is unchanged. For fresh multi-rank runs the flags are
+    already uniform, so this is behavior-preserving there too.
+    """
+    if fabric is None or getattr(fabric, "world_size", 1) <= 1:
+        return
+    import torch.distributed as dist
+
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+
+    for name, module in model.named_modules():
+        if not hasattr(module, "_freeze_running"):
+            continue
+        should_record = torch.tensor(
+            int(not module._freeze_running),
+            device=fabric.device,
+            dtype=torch.long,
+        )
+        dist.all_reduce(should_record, op=dist.ReduceOp.MAX)
+        agreed_freeze = int(should_record.item()) == 0
+        if module._freeze_running != agreed_freeze:
+            print(
+                f"[sync_record_moments_gates] rank {fabric.global_rank}: "
+                f"module '{name}' _freeze_running {module._freeze_running} -> "
+                f"{agreed_freeze} (rank-agreed)"
+            )
+        module._freeze_running = agreed_freeze
 
 
 def combine_moments(means: List[Tensor], vars: List[Tensor], counts: List[Tensor]):

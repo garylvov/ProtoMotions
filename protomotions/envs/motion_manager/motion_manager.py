@@ -111,6 +111,16 @@ class MotionManager:
         """
         subset_method = self.config.subset_method
 
+        if (
+            getattr(self.motion_lib, "sharded_across_ranks", False)
+            and isinstance(subset_method, (list, ListConfig))
+        ):
+            raise RuntimeError(
+                "subset_method with explicit motion IDs is not supported when "
+                "MOTION_LIB_SHARD_PER_RANK=1: config IDs are global pack IDs "
+                "but the motion lib on this rank uses shard-local IDs."
+            )
+
         total_motions = self.motion_lib.num_motions()
         if subset_method is None or self.num_envs > total_motions:
             # Use all motions
@@ -172,8 +182,20 @@ class MotionManager:
         If both are provided, combines them (union).
         """
         excluded_set = set()
+        sharded = getattr(self.motion_lib, "sharded_across_ranks", False)
 
         if self.config.exclude_motions_file is not None:
+            if sharded:
+                # failed_motions files are written per rank; under sharding a
+                # rank-0 file contains rank-0 SHARD-LOCAL ids (meaningless on
+                # other ranks / other shard configs). Refuse instead of
+                # silently excluding the wrong motions.
+                raise RuntimeError(
+                    "exclude_motions_file is not supported when "
+                    "MOTION_LIB_SHARD_PER_RANK=1: file contains shard-local "
+                    "motion IDs from a specific rank. Use exclude_motion_ids "
+                    "with GLOBAL pack IDs instead."
+                )
             file_ids = self._load_exclusions_from_file(self.config.exclude_motions_file)
             if file_ids:
                 excluded_set.update(file_ids)
@@ -191,6 +213,25 @@ class MotionManager:
             return
 
         motion_ids = sorted(excluded_set)
+
+        if sharded:
+            # Config exclude_motion_ids are GLOBAL pack IDs; translate to this
+            # rank's shard-local IDs (IDs owned by other ranks are dropped —
+            # those ranks perform the same translation on their own shard).
+            global_ids = torch.tensor(motion_ids, dtype=torch.long)
+            shard_gids = self.motion_lib.global_motion_ids.to("cpu")
+            local_mask = torch.isin(shard_gids, global_ids)
+            local_ids = torch.nonzero(local_mask, as_tuple=False).flatten()
+            print(
+                f"Motion Manager: [motion-shard] translated {len(motion_ids)} "
+                f"global excluded IDs -> {local_ids.numel()} shard-local IDs "
+                f"on rank {self.motion_lib.shard_rank}"
+            )
+            if local_ids.numel() == 0:
+                self.excluded_motion_ids = None
+                return
+            motion_ids = local_ids.tolist()
+
         total_motions = self.motion_lib.num_motions()
         for motion_id in motion_ids:
             if motion_id < 0 or motion_id >= total_motions:
@@ -208,6 +249,16 @@ class MotionManager:
 
     def _setup_fixed_motion_ids(self, fixed_motion_ids_per_env: Optional[torch.Tensor]):
         """Setup fixed motion IDs. Use -1 for environments that should use random sampling."""
+        if (
+            getattr(self.motion_lib, "sharded_across_ranks", False)
+            and fixed_motion_ids_per_env is not None
+            and bool((fixed_motion_ids_per_env != -1).any())
+        ):
+            raise RuntimeError(
+                "fixed_motion_ids_per_env (scene-paired motions) is not "
+                "supported when MOTION_LIB_SHARD_PER_RANK=1: scene humanoid "
+                "motion IDs are global pack IDs, the sharded lib is shard-local."
+            )
         self._fixed_motion_ids_per_env = fixed_motion_ids_per_env
         self._env_has_fixed_motion = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.bool

@@ -57,11 +57,46 @@ class MimicMotionManager(MotionManager):
         """Advance motion playback time by one environment timestep.
 
         Called after each physics simulation step to update the current time
-        in each motion track.
+        in each motion track. With the reference-freeze augmentation enabled
+        (reference_freeze_prob_per_sec > 0), each env's reference clock
+        randomly holds for a sampled duration and then resumes; everything
+        downstream (mimic targets, masked-mimic conditioning, expert obs,
+        tracking rewards, termination) consistently sees the frozen
+        reference. Default (prob 0.0) is byte-identical stock behavior.
         """
-        self.motion_times += self.env_dt
+        freeze_prob = getattr(self.config, "reference_freeze_prob_per_sec", 0.0)
+        if freeze_prob <= 0.0:
+            self.motion_times += self.env_dt
+            return
+
+        if not hasattr(self, "_freeze_time_left"):
+            self._freeze_time_left = torch.zeros(self.num_envs, device=self.device)
+        frozen = self._freeze_time_left > 0.0
+        # start new freezes on currently-unfrozen envs
+        lo, hi = self.config.reference_freeze_duration_range
+        start = (~frozen) & (
+            torch.rand(self.num_envs, device=self.device)
+            < freeze_prob * self.env_dt
+        )
+        if start.any():
+            n = int(start.sum())
+            self._freeze_time_left[start] = lo + (hi - lo) * torch.rand(
+                n, device=self.device
+            )
+            frozen = frozen | start
+        # advance unfrozen reference clocks; tick down active freezes
+        self.motion_times += self.env_dt * (~frozen).float()
+        self._freeze_time_left.sub_(self.env_dt).clamp_(min=0.0)
 
     def sample_motions(
+        self, env_ids: torch.Tensor, new_motion_ids: Optional[torch.Tensor] = None
+    ):
+        """Clear any active reference freeze for envs being reset."""
+        if hasattr(self, "_freeze_time_left") and len(env_ids) > 0:
+            self._freeze_time_left[env_ids] = 0.0
+        return self._sample_motions_mimic(env_ids, new_motion_ids)
+
+    def _sample_motions_mimic(
         self, env_ids: torch.Tensor, new_motion_ids: Optional[torch.Tensor] = None
     ):
         """Sample new motions for environments.

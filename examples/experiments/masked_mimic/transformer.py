@@ -173,6 +173,7 @@ def env_config(robot_cfg: RobotConfig, args: argparse.Namespace) -> EnvConfig:
     expert_model_path = getattr(args, 'expert_model_path', None)
     if expert_model_path:
         from protomotions.agents.supervised.expert_utils import (
+            get_expert_action_config,
             get_expert_observation_components,
         )
         from protomotions.utils.config_utils import (
@@ -181,7 +182,13 @@ def env_config(robot_cfg: RobotConfig, args: argparse.Namespace) -> EnvConfig:
 
         expert_configs = load_resolved_configs_from_checkpoint(expert_model_path)
         expert_env_config = expert_configs["env"]
+        expert_robot_config = expert_configs.get("robot")
         expert_agent_config = expert_configs["agent"]
+        action_config = get_expert_action_config(
+            expert_env_config,
+            robot_cfg,
+            expert_robot_config,
+        )
         
         expert_history_steps = getattr(expert_env_config, 'num_state_history_steps', 0)
         assert TOTAL_STORED_HISTORICAL_STEPS >= expert_history_steps, (
@@ -189,11 +196,17 @@ def env_config(robot_cfg: RobotConfig, args: argparse.Namespace) -> EnvConfig:
         )
         
         if hasattr(expert_env_config, 'control_components') and expert_env_config.control_components:
+            # future_steps may be an int N (-> N frames) or an explicit List[int]
+            # of frame offsets (-> len frames). Compare/adopt by FRAME COUNT so the
+            # masked_mimic env feeds the expert exactly as many future reference
+            # frames as it was trained with (else mimic_target_poses is mis-shaped).
+            def _future_count(v):
+                return len(v) if isinstance(v, (list, tuple)) else v
             for ctrl_cfg in expert_env_config.control_components.values():
                 expert_num_future = getattr(ctrl_cfg, 'future_steps', None)
                 if expert_num_future is not None:
                     masked_mimic_cfg = control_components["masked_mimic"]
-                    if masked_mimic_cfg.future_steps < expert_num_future:
+                    if _future_count(masked_mimic_cfg.future_steps) < _future_count(expert_num_future):
                         masked_mimic_cfg.future_steps = expert_num_future
         
         expert_obs_components = get_expert_observation_components(
@@ -227,7 +240,7 @@ def env_config(robot_cfg: RobotConfig, args: argparse.Namespace) -> EnvConfig:
         observation_components=observation_components,
         termination_components=termination_components,
         reward_components=reward_components,
-        action_config=make_pd_action_config(robot_cfg),
+        action_config=action_config if expert_model_path else make_pd_action_config(robot_cfg),
         # Motion manager configuration
         motion_manager=MimicMotionManagerConfig(
             init_start_prob=0.2,

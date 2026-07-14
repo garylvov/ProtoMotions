@@ -52,6 +52,9 @@ from protomotions.envs.obs.target_poses import (
     build_corrupted_xy_offset,
 )
 
+# Heading-frame future-displacement command compute kernel
+from protomotions.envs.obs.mimic_command import build_mimic_future_displacement_cmd
+
 # Masked mimic observation compute kernels
 from protomotions.envs.obs.masked_mimic import (
     compute_target_poses_only,
@@ -112,6 +115,8 @@ __all__ = [
     "build_target_root_vel",
     "build_target_root_ang_vel",
     "build_corrupted_xy_offset",
+    # Heading-frame future-displacement command compute kernel
+    "build_mimic_future_displacement_cmd",
     # Masked mimic observation compute kernels
     "compute_target_poses_only",
     "compute_target_masks_only",

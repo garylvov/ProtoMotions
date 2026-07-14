@@ -3,11 +3,25 @@
 
 import logging
 import math
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
 import torch
 from torch import Tensor
+
+
+def _eval_subset_n() -> int:
+    """EVAL-OOM/SPEED FIX (night13): if EVAL_SUBSET_N>0, the in-training eval is
+    restricted to the first-N motions of each rank's shard instead of the whole
+    (~42k/rank) shard. This keeps both the metric buffers and the O(num_motions)
+    reduction/pack loops cheap so the periodic eval costs minutes, not hours.
+    The first-N ids map 1:1 onto buffer positions [0, N), so no id remap is
+    needed. Default 0 = off = evaluate the full shard (original behavior)."""
+    try:
+        return int(os.environ.get("EVAL_SUBSET_N", "0"))
+    except ValueError:
+        return 0
 
 from protomotions.agents.evaluators.base_evaluator import BaseEvaluator
 from protomotions.agents.evaluators.config import MimicEvaluatorConfig
@@ -70,9 +84,17 @@ class MimicEvaluator(BaseEvaluator):
     def initialize_eval(self) -> Dict:
         """Initialize evaluation tracking and cache env state for restoration."""
         num_motions = self.motion_lib.num_motions()
+        # EVAL-OOM/SPEED FIX (night13): cap buffers to the eval subset (see
+        # _eval_subset_n). Buffers, component accumulators and the eval batch
+        # (below, in _build_eval_batches) all use the same [0, num_motions) ids.
+        subset_n = _eval_subset_n()
+        if subset_n > 0:
+            num_motions = min(subset_n, num_motions)
         motion_lengths = self.motion_lib.get_motion_length(None)
         motion_num_frames = (motion_lengths / self.env.dt).floor().long()
         motion_num_frames = motion_num_frames.clamp(max=self.config.max_eval_steps)
+        if subset_n > 0:
+            motion_num_frames = motion_num_frames[:num_motions]
         self._init_eval_component_buffers(num_motions)
 
         # Cache env + motion manager state (restored in cleanup_after_evaluation)
@@ -91,7 +113,15 @@ class MimicEvaluator(BaseEvaluator):
         Args:
             failed_motions: List of motion IDs that failed tracking
             epoch: Current epoch number
+
+        Note:
+            When the motion lib is rank-sharded (MOTION_LIB_SHARD_PER_RANK=1),
+            IDs are translated from shard-local to GLOBAL pack IDs before
+            writing, so the files stay meaningful across ranks and runs.
         """
+        if getattr(self.motion_lib, "sharded_across_ranks", False):
+            gids = self.motion_lib.global_motion_ids
+            failed_motions = [int(gids[m].item()) for m in failed_motions]
         filename = f"failed_motions_epoch_{epoch}_rank_{self.fabric.global_rank}.txt"
         self._save_list_to_file(failed_motions, filename, subdirectory="failed_motions")
 
@@ -210,6 +240,16 @@ class MimicEvaluator(BaseEvaluator):
         Returns:
             List of (env_ids, motion_ids) tuples
         """
+        # EVAL-OOM/SPEED FIX (night13): evaluate only the first-N motions of this
+        # rank's shard when the subset gate is set. ids == buffer positions.
+        subset_n = _eval_subset_n()
+        if subset_n > 0:
+            n = min(subset_n, self.motion_lib.num_motions())
+            env_ids = torch.arange(n, device=self.device)
+            motion_ids = torch.arange(n, device=self.device)
+            print(f"[eval-subset] evaluating first {n} motions of the shard")
+            return [(env_ids, motion_ids)]
+
         fixed_motion_ids, first_env_indices = (
             self.motion_manager.get_unique_fixed_motions()
         )
@@ -284,8 +324,13 @@ class MimicEvaluator(BaseEvaluator):
         to_log.update(additional_metrics)
 
         if self.fabric.global_rank == 0:
+            # EVAL-OOM/SPEED FIX (night13): the predicted-lib save packs over the
+            # FULL num_motions and would both mismatch the subset-sized buffers
+            # and re-introduce the slow O(42k) per-motion loop -> skip it while the
+            # eval subset gate is active.
             if (
-                self.config.save_predicted_motion_lib_every is not None
+                _eval_subset_n() <= 0
+                and self.config.save_predicted_motion_lib_every is not None
                 and self.eval_count % self.config.save_predicted_motion_lib_every == 0
             ):
                 self._save_predicted_motion_lib(
@@ -383,7 +428,10 @@ class MimicEvaluator(BaseEvaluator):
             for m in range(num_motions):
                 f = motion_num_frames[m].item()
                 f = min(f, data.shape[1])
-                per_motion.append(data[m, :f].detach().clone())
+                # Move each motion's slice to CPU before concatenation: with ~42k
+                # motions, concatenating rigid_body_pos on GPU OOMs. The final
+                # torch.save target is a disk-only artifact, so CPU is fine.
+                per_motion.append(data[m, :f].detach().cpu())
             return torch.cat(per_motion, dim=0)
 
         # Build packed tensors matching MotionLib field names
@@ -445,6 +493,9 @@ class MimicEvaluator(BaseEvaluator):
             # correction and scene xy.
             env_offsets[:, 2] -= float(self.env.config.ref_respawn_offset)
             per_motion_offset[unique_motion_ids] = env_offsets
+        # gts now lives on CPU (pack_metric concatenates there to avoid the
+        # GPU OOM); match devices before subtracting below.
+        per_motion_offset = per_motion_offset.to(gts.device)
         for m in range(num_motions):
             nframes = int(motion_num_frames[m].item())
             if nframes == 0:
@@ -461,8 +512,9 @@ class MimicEvaluator(BaseEvaluator):
             f = motion_num_frames[m].item()
             # Clamp to available frames
             f = min(f, contacts_data.shape[1])
-            # Convert float contacts to bool for consistency with MotionLib format
-            contacts_list.append(contacts_data[m, :f].bool().detach().clone())
+            # Convert float contacts to bool for consistency with MotionLib format;
+            # concat on CPU for the same OOM reason as pack_metric above.
+            contacts_list.append(contacts_data[m, :f].bool().detach().cpu())
         contacts = torch.cat(contacts_list, dim=0)
 
         # Copy ground-truth motion weights and files

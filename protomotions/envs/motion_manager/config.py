@@ -68,3 +68,26 @@ class MimicMotionManagerConfig(MotionManagerConfig):
         default=True,
         metadata={"help": "Whether to resample motion on environment reset."}
     )
+
+    # Reference freeze/resume augmentation (Track C/D, 2026-07-09; default
+    # OFF = stock behavior). Teleop-shaped data aug: per env, the reference
+    # clock randomly holds (targets freeze) then resumes, exposing training
+    # to the deployment-time "hold last commanded pose" regime that the
+    # teacher audit found fully out-of-distribution (hold-stutter finding).
+    reference_freeze_prob_per_sec: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "Per-second probability that an unfrozen env starts a "
+                "reference freeze (motion time holds; targets/rewards/expert "
+                "obs all see the frozen reference). 0.0 disables."
+            ),
+            "min": 0.0,
+        },
+    )
+    reference_freeze_duration_range: tuple = field(
+        default=(0.5, 2.0),
+        metadata={
+            "help": "Uniform range (seconds) for each freeze duration."
+        },
+    )

@@ -51,6 +51,18 @@ from protomotions.envs.rewards.tracking import (
     compute_relative_body_ori_rew,
     compute_global_body_lin_vel_rew,
     compute_global_body_ang_vel_rew,
+    # Track D root displacement kernels (Option-B fallback, dormant)
+    compute_root_xy_displacement_rew,
+    compute_root_heading_rew,
+    # Heading-local anchor drift reward (twin of build_mimic_future_displacement_cmd)
+    compute_heading_local_anchor_drift_rew,
+)
+
+# Big-step reward kernels (Track D, OmniH2O-style, dormant; stateful callables)
+from protomotions.envs.rewards.big_step import (
+    FeetApexHeightReward,
+    StepDisplacementReward,
+    compute_in_the_air_penalty,
 )
 
 # Task reward kernels
@@ -63,11 +75,15 @@ from protomotions.envs.rewards.task import (
 # Regularization reward kernels
 from protomotions.envs.rewards.regularization import (
     compute_action_smoothness,
+    compute_action_smoothness_graced,
     compute_action_smoothness_logmeanexp,
     compute_pow_rew,
     compute_soft_pos_limit_rew,
     compute_contact_match_rew,
+    compute_reference_contact_liftoff_penalty,
     compute_contact_force_change_rew,
+    compute_foot_contact_force_penalty,
+    compute_fall_penalty,
     # Helper functions
     joint_limit_violation,
     contact_mismatch_sum,
@@ -107,17 +123,30 @@ __all__ = [
     "compute_relative_body_ori_rew",
     "compute_global_body_lin_vel_rew",
     "compute_global_body_ang_vel_rew",
+    # Track D root displacement kernels (Option-B fallback, dormant)
+    "compute_root_xy_displacement_rew",
+    "compute_root_heading_rew",
+    # Heading-local anchor drift reward (twin of build_mimic_future_displacement_cmd)
+    "compute_heading_local_anchor_drift_rew",
+    # Big-step reward kernels (Track D, OmniH2O-style, dormant)
+    "FeetApexHeightReward",
+    "StepDisplacementReward",
+    "compute_in_the_air_penalty",
     # Task reward kernels
     "compute_heading_velocity_rew",
     "compute_path_following_rew",
     "compute_target_rew",
     # Regularization reward kernels
     "compute_action_smoothness",
+    "compute_action_smoothness_graced",
     "compute_action_smoothness_logmeanexp",
     "compute_pow_rew",
     "compute_soft_pos_limit_rew",
     "compute_contact_match_rew",
+    "compute_reference_contact_liftoff_penalty",
     "compute_contact_force_change_rew",
+    "compute_foot_contact_force_penalty",
+    "compute_fall_penalty",
     # Regularization helper functions
     "joint_limit_violation",
     "contact_mismatch_sum",

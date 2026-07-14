@@ -103,7 +103,10 @@ class SupervisedAgent(BaseAgent):
                 dummy_expert_obs_td = self._build_expert_obs_td(
                     dummy_obs_td, expert_actor_in_keys
                 )
-                _ = expert_actor(dummy_expert_obs_td)
+                self._materialize_frozen_external_expert(
+                    expert_actor,
+                    dummy_expert_obs_td,
+                )
 
             # Load weights before any distributed wrapper changes module keys.
             pre_trained_expert = torch.load(
@@ -152,6 +155,19 @@ class SupervisedAgent(BaseAgent):
         if expert_actor is not None:
             return expert_actor
         return self._external_expert_module_from(self.expert_model)
+
+    def _materialize_frozen_external_expert(self, expert_actor, dummy_obs_td):
+        """Materialize a frozen expert without updating distributed normalizers."""
+        freeze_states = []
+        for module in expert_actor.modules():
+            if hasattr(module, "_freeze_running"):
+                freeze_states.append((module, module._freeze_running))
+                module._freeze_running = True
+        try:
+            _ = expert_actor(dummy_obs_td)
+        finally:
+            for module, freeze_running in freeze_states:
+                module._freeze_running = freeze_running
 
     def _load_external_expert_state(self, expert_model, model_state_dict):
         expert_actor = self._external_expert_module_from(expert_model)
@@ -215,6 +231,22 @@ class SupervisedAgent(BaseAgent):
                 "expert_actions",
                 shape=(self.env.robot_config.number_of_actions,),
             )
+            # Track C action-delta matching: store the expert's PREVIOUS
+            # action per step so the loss can supervise action deltas
+            # (velocity gain/direction). Only registered when the term is on
+            # so stock runs keep an identical buffer layout. The tracker
+            # tensor persists across epochs (epoch boundaries are not episode
+            # boundaries); fresh-episode samples are masked in the loss via
+            # the all-zero previous_actions heuristic.
+            if getattr(self.config, "expert_action_delta_weight", 0.0) > 0:
+                num_actions = self.env.robot_config.number_of_actions
+                self.experience_buffer.register_key(
+                    "expert_prev_actions",
+                    shape=(num_actions,),
+                )
+                self._expert_prev_actions = torch.zeros(
+                    self.num_envs, num_actions, device=self.device
+                )
 
     def register_algorithm_experience_buffer_keys_from_obs(self, obs_td: TensorDict):
         target_key = self.config.loss.target_key
@@ -320,6 +352,15 @@ class SupervisedAgent(BaseAgent):
                 "expert_actions", step, output_td["expert_actions"]
             )
 
+        # Action-delta matching: write e_{t-1} for this step, then roll the
+        # tracker forward to e_t for the next step.
+        expert_prev = getattr(self, "_expert_prev_actions", None)
+        if expert_prev is not None and "expert_actions" in output_td.keys():
+            self.experience_buffer.update_data(
+                "expert_prev_actions", step, expert_prev
+            )
+            self._expert_prev_actions = output_td["expert_actions"].detach().clone()
+
         output_td["action"] = action
         return output_td
 
@@ -347,9 +388,8 @@ class SupervisedAgent(BaseAgent):
         batch_td = TensorDict(batch_dict, batch_size=batch_dict["action"].shape[0])
         batch_td = self.training_model(batch_td)
 
-        supervised_loss, supervised_log_dict = compute_supervision_loss(
+        supervised_loss, supervised_log_dict = self._compute_supervision_loss(
             batch_td,
-            self.config.loss,
         )
         actions = (
             batch_td["privileged_action"]
@@ -380,8 +420,213 @@ class SupervisedAgent(BaseAgent):
 
         return loss, log_dict
 
+    def _compute_supervision_loss(self, batch_td: TensorDict) -> Tuple[Tensor, Dict]:
+        """Configured supervision loss, with optional per-dim MSE weighting.
+
+        Track C: ``action_dim_weights`` (getattr: old pickles predate the
+        field) re-weights the imitation MSE per action dim (robot dof order),
+        normalized by the mean weight so the total loss scale matches the
+        unweighted MSE. Uniform weights reproduce F.mse_loss exactly.
+        """
+        loss_config = self.config.loss
+        dim_weights = getattr(self.config, "action_dim_weights", None)
+        if dim_weights is None or not loss_config.enabled:
+            return compute_supervision_loss(batch_td, loss_config)
+
+        from protomotions.agents.common.supervision import SupervisionLossType
+
+        if SupervisionLossType(loss_config.loss_type) != SupervisionLossType.MSE:
+            raise ValueError(
+                "action_dim_weights is only supported for loss_type=mse, got "
+                f"{loss_config.loss_type}"
+            )
+
+        prediction = batch_td[loss_config.prediction_key]
+        target = batch_td[loss_config.target_key]
+        weights = torch.as_tensor(
+            dim_weights, dtype=prediction.dtype, device=prediction.device
+        )
+        if weights.shape != prediction.shape[-1:]:
+            raise ValueError(
+                f"action_dim_weights length {tuple(weights.shape)} does not "
+                f"match action dim {prediction.shape[-1]}"
+            )
+        weights = weights / weights.mean()
+        raw_loss = ((prediction - target).pow(2) * weights).mean()
+        weighted_loss = raw_loss * loss_config.weight
+        prefix = loss_config.log_prefix
+        return weighted_loss, {
+            f"{prefix}/mse": raw_loss.detach(),
+            f"{prefix}/loss": weighted_loss.detach(),
+        }
+
     def calculate_extra_loss(self, batch_dict, actions) -> Tuple[Tensor, Dict]:
-        return torch.tensor(0.0, device=self.device), {}
+        extra_loss = torch.tensor(0.0, device=self.device)
+        log_dict: Dict = {}
+
+        l2c2_weight = self.config.l2c2_weight
+        if l2c2_weight > 0:
+            l2c2_loss = self._calculate_l2c2_loss(batch_dict)
+            extra_loss = extra_loss + l2c2_weight * l2c2_loss
+            log_dict["supervised/l2c2_loss"] = l2c2_loss.detach()
+
+        # Track C: action-rate penalty (getattr: old resolved_configs pickles
+        # predate the field; treat missing as 0.0 / off).
+        action_rate_weight = getattr(self.config, "action_rate_weight", 0.0)
+        if action_rate_weight > 0:
+            action_rate_loss = self._calculate_action_rate_loss(batch_dict, actions)
+            extra_loss = extra_loss + action_rate_weight * action_rate_loss
+            log_dict["supervised/action_rate_loss"] = action_rate_loss.detach()
+
+        # Track C: action-delta matching against the expert (velocity gain).
+        delta_weight = getattr(self.config, "expert_action_delta_weight", 0.0)
+        if delta_weight > 0:
+            delta_loss = self._calculate_action_delta_loss(batch_dict, actions)
+            extra_loss = extra_loss + delta_weight * delta_loss
+            log_dict["supervised/action_delta_loss"] = delta_loss.detach()
+
+        return extra_loss, log_dict
+
+    def _previous_actions_from_batch(self, batch_td, actions: Tensor) -> Tensor:
+        if "previous_actions" not in batch_td.keys():
+            raise KeyError(
+                "This loss term requires a 'previous_actions' key in the "
+                f"training batch. Available keys: {list(batch_td.keys())}"
+            )
+        previous_actions = batch_td["previous_actions"]
+        if previous_actions.shape != actions.shape:
+            # flattened action history (history_steps > 1), most recent first
+            previous_actions = previous_actions.reshape(actions.shape[0], -1)[
+                :, : actions.shape[-1]
+            ]
+        return previous_actions
+
+    def _calculate_action_delta_loss(self, batch_td, actions: Tensor) -> Tensor:
+        """Match the student's per-step action delta to the expert's.
+
+        L = mean( dimw * ((a_t - a_{t-1}) - (e_t - e_{t-1}))^2 ) over samples
+        with a valid previous step. previous_actions is exactly all-zero right
+        after an episode reset (StateHistoryBuffer zeroes the action history),
+        which also covers the tracker's stale e_{t-1} on those samples — both
+        are masked out together.
+        """
+        for key in ("expert_actions", "expert_prev_actions"):
+            if key not in batch_td.keys():
+                raise KeyError(
+                    f"expert_action_delta_weight > 0 requires '{key}' in the "
+                    "training batch (registered by the supervised agent when "
+                    "the term is enabled). Available keys: "
+                    f"{list(batch_td.keys())}"
+                )
+        previous_actions = self._previous_actions_from_batch(batch_td, actions)
+        expert_actions = batch_td["expert_actions"]
+        expert_prev_actions = batch_td["expert_prev_actions"]
+
+        delta_err = (
+            (actions - previous_actions.detach())
+            - (expert_actions - expert_prev_actions).detach()
+        ).pow(2)
+
+        dim_weights = getattr(self.config, "action_dim_weights", None)
+        if dim_weights is not None:
+            weights = torch.as_tensor(
+                dim_weights, dtype=delta_err.dtype, device=delta_err.device
+            )
+            if weights.shape != delta_err.shape[-1:]:
+                raise ValueError(
+                    f"action_dim_weights length {tuple(weights.shape)} does "
+                    f"not match action dim {delta_err.shape[-1]}"
+                )
+            delta_err = delta_err * (weights / weights.mean())
+
+        valid = (previous_actions.abs().sum(dim=-1, keepdim=True) > 0).to(
+            delta_err.dtype
+        )
+        denom = (valid.sum() * delta_err.shape[-1]).clamp_min(1.0)
+        return (delta_err * valid).sum() / denom
+
+    def _calculate_action_rate_loss(self, batch_td, actions: Tensor) -> Tensor:
+        """Temporal smoothness: mean((prediction_t - action_{t-1})^2).
+
+        ``actions`` is the supervised prediction for step t (privileged_action
+        when present). ``previous_actions`` is the env obs component holding
+        the action applied at t-1 (previous_actions_factory(history_steps=1)),
+        so the difference is the per-step action rate of the student.
+        """
+        previous_actions = self._previous_actions_from_batch(batch_td, actions)
+        return (actions - previous_actions.detach()).pow(2).mean()
+
+    def _calculate_l2c2_loss(self, batch_td: TensorDict) -> Tensor:
+        """L2C2 Lipschitz-ratio regularizer ported from the PPO actor path."""
+        obs_pairs = self.config.l2c2_obs_pairs
+        if not obs_pairs:
+            raise ValueError(
+                "l2c2_weight > 0 requires at least one l2c2_obs_pairs entry."
+            )
+
+        prediction_key = self.config.loss.prediction_key
+        if prediction_key not in batch_td.keys():
+            raise KeyError(
+                f"L2C2 prediction key '{prediction_key}' is missing. "
+                f"Available keys: {list(batch_td.keys())}"
+            )
+
+        clean_td = batch_td.clone()
+        prediction = batch_td[prediction_key]
+        input_ss = prediction.new_zeros(())
+        input_n = 0
+
+        for noisy_key, clean_key in obs_pairs.items():
+            if noisy_key not in batch_td.keys():
+                raise KeyError(
+                    f"L2C2 noisy observation key '{noisy_key}' is missing. "
+                    f"Available keys: {list(batch_td.keys())}"
+                )
+            if clean_key not in batch_td.keys():
+                raise KeyError(
+                    f"L2C2 clean observation key '{clean_key}' is missing. "
+                    f"Available keys: {list(batch_td.keys())}"
+                )
+
+            noisy_obs = batch_td[noisy_key]
+            clean_obs = batch_td[clean_key]
+            if noisy_obs.shape != clean_obs.shape:
+                raise ValueError(
+                    f"L2C2 observation pair '{noisy_key}'/'{clean_key}' has "
+                    f"mismatched shapes: {tuple(noisy_obs.shape)} vs "
+                    f"{tuple(clean_obs.shape)}"
+                )
+
+            clean_td[noisy_key] = clean_obs
+            diff = noisy_obs - clean_obs
+            input_ss = input_ss + diff.pow(2).sum()
+            input_n += diff.numel()
+
+        if input_n == 0:
+            raise ValueError("l2c2_obs_pairs must reference non-empty tensors.")
+
+        input_dist = (input_ss / input_n).detach()
+        clean_td = self.training_model(clean_td)
+        if prediction_key not in clean_td.keys():
+            raise KeyError(
+                f"L2C2 clean forward did not produce prediction key '{prediction_key}'. "
+                f"Available keys: {list(clean_td.keys())}"
+            )
+
+        output_dist = (prediction - clean_td[prediction_key]).pow(2).mean()
+        # Track C optional MSE form: plain MSE(pred_noisy, pred_clean), no
+        # ratio, no clamp (getattr: old pickles predate the field).
+        if getattr(self.config, "l2c2_mse_form", False):
+            return output_dist
+        # Stability (2026-07-08 v2 divergence RCA): the raw Lipschitz ratio
+        # exploded to inf by ep10 (TB supervised/l2c2_loss 0.25 -> 3.5 -> inf)
+        # and poisoned the weights. Two guards: (a) floor the input distance
+        # at 1e-4 (near-zero noisy-clean gaps — e.g. post-reset noisy-cache
+        # fallback steps — must not turn the ratio into a 1e8-scale loss);
+        # (b) clamp the ratio itself so one bad batch cannot dominate the
+        # gradient. Neither guard binds in the healthy regime observed
+        # upstream (ratio O(0.1-1)).
+        return (output_dist / input_dist.clamp_min(1e-4)).clamp_max(10.0)
 
     # -----------------------------
     # State Saving and Restoration
