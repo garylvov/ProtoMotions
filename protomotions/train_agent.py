@@ -280,6 +280,18 @@ def create_parser():
         help="Path to checkpoint file to resume from",
     )
     parser.add_argument(
+        "--warmstart-training-state",
+        action="store_true",
+        default=False,
+        help=(
+            "On a WARM start (--checkpoint into a fresh logdir), also restore the "
+            "optimizer/Adam-moment + advantage-normalization state from the checkpoint "
+            "(load_training_state=True) instead of starting with fresh Adam. Requires the "
+            "checkpoint to contain actor_optimizer/critic_optimizer. Epoch stays 0 and the "
+            "evaluator is not restored unless present in the checkpoint. No effect on resume/fresh."
+        ),
+    )
+    parser.add_argument(
         "--use-wandb",
         action="store_true",
         default=False,
@@ -910,7 +922,13 @@ def main():
 
     agent.setup()
     agent.fabric.strategy.barrier()
-    agent.load(args.checkpoint, load_training_state=(mode == "resume"))
+    agent.load(
+        args.checkpoint,
+        load_training_state=(
+            mode == "resume"
+            or (mode == "warm_start" and args.warmstart_training_state)
+        ),
+    )
 
     # ===================================================================
     # 6. Save Configs (First Run Only - Warm Start or Fresh)
