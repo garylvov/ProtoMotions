@@ -665,6 +665,40 @@ class WrenchDomainRandomizationConfig:
             "help": "Range (min, max) in seconds between end of one burst and start of the next."
         },
     )
+    # ---- Persistent "hanging weight" controls (night13 2026-07-14 wrist-bag) ----
+    clean_remainder: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "When True, the (1 - persistent_fraction) envs NOT selected for the "
+                "persistent load receive NO wrench at all (never cycle) — clean. "
+                "Use with persistent_fraction<1 to apply the load to only a fraction "
+                "of envs (e.g. 0.30) and leave the rest clean. Default False = "
+                "remainder cycles normally."
+            )
+        },
+    )
+    persistent_all_bodies: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "When True, a persistent-cohort env loads ALL candidate bodies "
+                "(e.g. BOTH wrists) with the full sampled magnitude each — a bag on "
+                "each — instead of one randomly-chosen body. Sampled once per body "
+                "per episode and held. Default False = one body per env."
+            )
+        },
+    )
+    persistent_ramp_in_sec: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "Smooth onset for the persistent load: ease the held force in from 0 "
+                "to its sampled value over this many seconds at episode start (cosine), "
+                "then hold constant. 0.0 (default) = instant application."
+            )
+        },
+    )
     body_names: Optional[List[str]] = field(
         default=None,
         metadata={

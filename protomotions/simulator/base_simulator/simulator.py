@@ -448,7 +448,11 @@ class Simulator(RecordingMixin, ABC):
                     # Ramped-profile state (Track D): targets are the sampled
                     # hold-phase wrench; forces/torques hold target * s(t)
                     # with a cosine ease-in/out envelope.
-                    "ramped": (ramp_in_range[1] > 0.0 or ramp_out_range[1] > 0.0),
+                    "ramped": (
+                        ramp_in_range[1] > 0.0
+                        or ramp_out_range[1] > 0.0
+                        or float(getattr(cfg, "persistent_ramp_in_sec", 0.0) or 0.0) > 0.0
+                    ),
                     "target_forces": torch.zeros(
                         self.num_envs, num_union, 3, device=self.device
                     ),
@@ -505,37 +509,51 @@ class Simulator(RecordingMixin, ABC):
         # getattr: configs pickled before this field existed must keep loading.
         p = getattr(cfg, "persistent_fraction", 0.0) or 0.0
         scale = getattr(cfg, "magnitude_scale", 1.0)
+        all_bodies = getattr(cfg, "persistent_all_bodies", False)
+        p_ramp_in = float(getattr(cfg, "persistent_ramp_in_sec", 0.0) or 0.0)
+        clean_rem = getattr(cfg, "clean_remainder", False)
+        mode = getattr(cfg, "direction_mode", "uniform")
+        cone = getattr(cfg, "downward_cone_deg", 30.0)
         cycling_ids = env_ids
         if p > 0.0:
             mask = torch.rand(len(env_ids), device=self.device) < p
             persistent_ids = env_ids[mask]
             cycling_ids = env_ids[~mask]
-            if len(persistent_ids) > 0:
-                body_choice = sched["cols"][
-                    torch.randint(
-                        len(sched["cols"]), (len(persistent_ids),), device=self.device
+            n = len(persistent_ids)
+            if n > 0:
+                # Sampled ONCE per episode per (env, body) and held constant
+                # (magnitude AND direction fixed for the whole episode).
+                if all_bodies:
+                    cols = [int(c) for c in sched["cols"].tolist()]  # e.g. BOTH wrists
+                else:
+                    cols = [int(sched["cols"][torch.randint(len(sched["cols"]), (1,), device=self.device)].item())]
+                for col in cols:
+                    sched["target_forces"][persistent_ids, col] = (
+                        self._sample_wrench_vectors(
+                            n, cfg.force_magnitude_range, self.device, mode=mode, cone_deg=cone
+                        ) * scale
                     )
-                ]
-                sched["forces"][persistent_ids, body_choice] = (
-                    self._sample_wrench_vectors(
-                        len(persistent_ids), cfg.force_magnitude_range, self.device,
-                        mode=getattr(cfg, "direction_mode", "uniform"),
-                        cone_deg=getattr(cfg, "downward_cone_deg", 30.0),
-                    ) * scale
-                )
-                sched["torques"][persistent_ids, body_choice] = (
-                    self._sample_wrench_vectors(
-                        len(persistent_ids), cfg.torque_magnitude_range, self.device
-                    ) * scale
-                )
-                # Persistent cohort holds constant (no ramp): mirror into
-                # targets so the ramp pass leaves it untouched.
-                sched["target_forces"][persistent_ids] = sched["forces"][persistent_ids]
-                sched["target_torques"][persistent_ids] = sched["torques"][persistent_ids]
+                    sched["target_torques"][persistent_ids, col] = (
+                        self._sample_wrench_vectors(n, cfg.torque_magnitude_range, self.device) * scale
+                    )
                 sched["active"][persistent_ids] = True
                 sched["end_time"][persistent_ids] = float("inf")
+                if p_ramp_in > 0.0:
+                    # Smooth onset: start at 0, cosine-ease target*s(t) in over
+                    # p_ramp_in sec (envelope pass), then hold constant.
+                    sched["forces"][persistent_ids] = 0.0
+                    sched["torques"][persistent_ids] = 0.0
+                    sched["start_time"][persistent_ids] = sched["time"][persistent_ids]
+                    sched["ramp_in"][persistent_ids] = p_ramp_in
+                else:
+                    sched["forces"][persistent_ids] = sched["target_forces"][persistent_ids]
+                    sched["torques"][persistent_ids] = sched["target_torques"][persistent_ids]
                 wrote = True
-        self._schedule_wrench(sched, cycling_ids)
+        if clean_rem:
+            # Remainder gets NO wrench (clean tracking): never schedule a burst.
+            sched["next_start"][cycling_ids] = float("inf")
+        else:
+            self._schedule_wrench(sched, cycling_ids)
         return wrote
 
     def _summed_wrench_buffers(self) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -704,7 +722,11 @@ class Simulator(RecordingMixin, ABC):
             # Ramp envelope: write target * s(t) for active ramped envs
             # (persistent cohort has end_time=+inf and ramp_in=0 -> s=1).
             if sched["ramped"]:
-                act = sched["active"] & torch.isfinite(sched["end_time"])
+                # Include persistent-cohort envs (end_time=+inf) that are easing in
+                # (ramp_in>0): they ramp force in then hold (t_left=inf => s_out=1).
+                act = sched["active"] & (
+                    torch.isfinite(sched["end_time"]) | (sched["ramp_in"] > 0)
+                )
                 if act.any():
                     t_rel = sched["time"] - sched["start_time"]
                     s_in = torch.ones_like(t_rel)
