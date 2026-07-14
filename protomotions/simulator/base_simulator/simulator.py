@@ -343,12 +343,17 @@ class Simulator(RecordingMixin, ABC):
         due_env_ids = torch.where(due_mask)[0]
         num_due = len(due_env_ids)
 
+        # Curriculum ramp: live multiplier on the impulse magnitude (env.on_epoch_end
+        # ramps push.magnitude_scale). Default 1.0 = unchanged.
+        _pscale = getattr(
+            self.config.domain_randomization.push, "magnitude_scale", 1.0
+        )
         lin_vel = (
             torch.rand(num_due, 3, device=self.device) * 2 - 1
-        ) * self._push_max_lin_vel
+        ) * self._push_max_lin_vel * _pscale
         ang_vel = (
             torch.rand(num_due, 3, device=self.device) * 2 - 1
-        ) * self._push_max_ang_vel
+        ) * self._push_max_ang_vel * _pscale
 
         self._apply_root_velocity_impulse(lin_vel, ang_vel, due_env_ids)
         if getattr(self, "_push_grace_steps", 0) > 0:

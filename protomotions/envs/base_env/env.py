@@ -969,20 +969,31 @@ class BaseEnv:
         """
         self._current_epoch = current_epoch
 
-        _sim = getattr(self, "simulator", None)
-        _scheds = getattr(_sim, "_wrench_scheds", None) or []
-        _seen = set()
-        for _sched in _scheds:
-            _cfg = _sched.get("cfg") if isinstance(_sched, dict) else None
-            if _cfg is None or id(_cfg) in _seen:
-                continue
-            _seen.add(id(_cfg))
+        # DR-curriculum magnitude ramp (mirror of the delay ramp): for any DR
+        # sub-config with magnitude_ramp_epochs set (wrench classes + push),
+        # magnitude_scale = start + (1-start)*min(1,(epoch-start_epoch)/N). Read
+        # live by the simulator at each reset/burst/push, so the disturbance
+        # forces ramp as episodes turn over. Rank-lockstep counter -> identical
+        # across DDP ranks. Default (no ramp fields) is a no-op.
+        def _ramp_cfg(_cfg):
             _rk = getattr(_cfg, "magnitude_ramp_epochs", None)
             if _rk:
                 _start = getattr(_cfg, "magnitude_start_scale", 1.0)
                 _e0 = getattr(_cfg, "magnitude_ramp_start_epoch", 0)
                 _frac = min(1.0, max(0.0, float(current_epoch - _e0)) / float(_rk))
                 _cfg.magnitude_scale = _start + (1.0 - _start) * _frac
+
+        _sim = getattr(self, "simulator", None)
+        _seen = set()
+        for _sched in getattr(_sim, "_wrench_scheds", None) or []:
+            _cfg = _sched.get("cfg") if isinstance(_sched, dict) else None
+            if _cfg is not None and id(_cfg) not in _seen:
+                _seen.add(id(_cfg))
+                _ramp_cfg(_cfg)
+        _dr = getattr(getattr(_sim, "config", None), "domain_randomization", None)
+        _push = getattr(_dr, "push", None)
+        if _push is not None and id(_push) not in _seen:
+            _ramp_cfg(_push)
 
     def post_physics_step(self):
         """Update environment state after physics simulation step.

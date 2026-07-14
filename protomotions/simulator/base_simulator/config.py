@@ -598,6 +598,26 @@ class PushDomainRandomizationConfig:
             )
         },
     )
+    # ---- Epoch-keyed magnitude ramp (night13 2026-07-14 DR curriculum). Runtime
+    # multiplier on the sampled push linear+angular impulse (applied live in
+    # _apply_push_if_due). Defaults are exact no-ops. env.on_epoch_end ramps
+    # magnitude_scale = start + (1-start)*min(1,(epoch-start_epoch)/ramp_epochs). ----
+    magnitude_scale: float = field(
+        default=1.0,
+        metadata={"help": "Runtime multiplier on push impulse magnitude (curriculum ramp knob)."},
+    )
+    magnitude_start_scale: float = field(
+        default=1.0,
+        metadata={"help": "push magnitude_scale at the ramp start epoch."},
+    )
+    magnitude_ramp_epochs: Optional[int] = field(
+        default=None,
+        metadata={"help": "If set, ramp push magnitude_scale start->1.0 over N epochs. None=off."},
+    )
+    magnitude_ramp_start_epoch: int = field(
+        default=0,
+        metadata={"help": "Absolute epoch at which the push magnitude ramp begins."},
+    )
 
     def __post_init__(self):
         if self.push_interval_range[0] <= 0 or self.push_interval_range[1] <= 0:
