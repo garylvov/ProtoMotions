@@ -789,9 +789,24 @@ class WrenchDomainRandomizationConfig:
                 "For direction_mode='downward_cone': half-angle (degrees) of the "
                 "cone around -z the force is sampled within (uniform over the cone "
                 "cap). Dominant downward (payload weight) with bounded random sway "
-                "up to this angle. Default 30 deg."
+                "up to this angle. Default 30 deg. This is the LIVE value the "
+                "sampler reads; if downward_cone_deg_start/end are set it is ramped "
+                "in-process by env.on_epoch_end on the magnitude-ramp schedule."
             )
         },
+    )
+    # ---- Epoch-keyed cone-WIDENING ramp (night13 2026-07-14): the cone half-angle
+    # opens from _start (narrow, near-pure-down) to _end (wider, still primarily
+    # down) over the SAME schedule as the magnitude ramp (magnitude_ramp_start_epoch
+    # / magnitude_ramp_epochs). env.on_epoch_end writes downward_cone_deg =
+    # start + (end-start)*frac. Both None (default) = fixed downward_cone_deg. ----
+    downward_cone_deg_start: Optional[float] = field(
+        default=None,
+        metadata={"help": "Cone half-angle at ramp start (deg). None = no cone widening."},
+    )
+    downward_cone_deg_end: Optional[float] = field(
+        default=None,
+        metadata={"help": "Cone half-angle at ramp end / terminal (deg). None = no cone widening."},
     )
     # ---- Epoch-keyed gentle magnitude ramp (night13 2026-07-13, mirror of the
     # delay-DR ramp_epochs). Default (None/1.0/0) is an exact no-op. env.on_epoch_end
@@ -859,6 +874,15 @@ class WrenchDomainRandomizationConfig:
             )
         if not (0.0 < self.downward_cone_deg <= 90.0):
             raise ValueError("downward_cone_deg must be in (0, 90].")
+        for _n in ("downward_cone_deg_start", "downward_cone_deg_end"):
+            _v = getattr(self, _n)
+            if _v is not None and not (0.0 < _v <= 90.0):
+                raise ValueError(f"{_n} must be in (0, 90] (or None).")
+        if (self.downward_cone_deg_start is None) != (self.downward_cone_deg_end is None):
+            raise ValueError(
+                "downward_cone_deg_start and downward_cone_deg_end must both be set "
+                "(to enable cone widening) or both None."
+            )
         if self.magnitude_ramp_epochs is not None and self.magnitude_ramp_epochs <= 0:
             raise ValueError("magnitude_ramp_epochs must be a positive int (or None).")
         if self.magnitude_start_scale < 0.0:

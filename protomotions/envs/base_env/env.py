@@ -978,10 +978,16 @@ class BaseEnv:
         def _ramp_cfg(_cfg):
             _rk = getattr(_cfg, "magnitude_ramp_epochs", None)
             if _rk:
-                _start = getattr(_cfg, "magnitude_start_scale", 1.0)
                 _e0 = getattr(_cfg, "magnitude_ramp_start_epoch", 0)
                 _frac = min(1.0, max(0.0, float(current_epoch - _e0)) / float(_rk))
+                _start = getattr(_cfg, "magnitude_start_scale", 1.0)
                 _cfg.magnitude_scale = _start + (1.0 - _start) * _frac
+                # Cone-widening ramp on the SAME schedule (if configured): open the
+                # downward_cone half-angle from _start (narrow) to _end (wider).
+                _cs = getattr(_cfg, "downward_cone_deg_start", None)
+                _ce = getattr(_cfg, "downward_cone_deg_end", None)
+                if _cs is not None and _ce is not None:
+                    _cfg.downward_cone_deg = _cs + (_ce - _cs) * _frac
 
         _sim = getattr(self, "simulator", None)
         _seen = set()
