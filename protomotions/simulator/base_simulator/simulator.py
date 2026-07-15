@@ -56,6 +56,44 @@ from protomotions.simulator.base_simulator.record import RecordingMixin
 from protomotions.simulator.base_simulator.user_interface import UserInterface
 
 
+def reference_wrench_scale(
+    ref_wrist_pos: torch.Tensor,
+    ref_chest_pos: torch.Tensor,
+    near_m: float,
+    far_m: float,
+    far_scale: float,
+) -> torch.Tensor:
+    """Anti-cheat payload scale from the REFERENCE motion's wrist->chest distance.
+
+    This is the structural anti-cheat guarantee for reference-conditioned payload
+    modulation. Its ONLY inputs are REFERENCE (mocap target) positions — it takes
+    NO robot/live pose. Because the demonstration is exogenous to the policy, the
+    robot cannot change this scale by moving: the load is heavy when the reference
+    holds the arms near the chest (short lever arm) and light when the reference
+    is outstretched. The policy is rewarded for tracking the reference, so it goes
+    where the load is and must bear it; it cannot shed load by extending its arms.
+
+    Modulation is a clamped linear falloff of the reference distance ``d``:
+      - ``d <= near_m`` -> scale 1.0 (full load, arms near chest)
+      - ``d >= far_m``  -> scale ``far_scale`` (floor, arms outstretched)
+      - in between       -> linear interpolation.
+
+    Args:
+        ref_wrist_pos: [..., 3] REFERENCE wrist body position(s) (world frame).
+        ref_chest_pos: [..., 3] REFERENCE chest/anchor position(s), broadcastable
+            to ``ref_wrist_pos``.
+        near_m: distance at/below which the scale is 1.0.
+        far_m: distance at/above which the scale is ``far_scale`` (far_m > near_m).
+        far_scale: floor multiplier in [0, 1].
+
+    Returns:
+        Tensor of scales in [far_scale, 1.0], shape = ref_wrist_pos.shape[:-1].
+    """
+    d = torch.linalg.norm(ref_wrist_pos - ref_chest_pos, dim=-1)
+    s = ((far_m - d) / (far_m - near_m)).clamp(far_scale, 1.0)
+    return s
+
+
 class Simulator(RecordingMixin, ABC):
     """Base class for physics simulators.
 
@@ -417,6 +455,19 @@ class Simulator(RecordingMixin, ABC):
                     union_names.append(name)
         num_union = self._resolve_wrench_bodies(union_names)
 
+        # Union body name -> column index (over the shared union body layout);
+        # used by the env-side reference-conditioned scale setter to map its
+        # configured wrist body names onto the wrench force columns.
+        self._wrench_union_names = list(union_names)
+        # Reference-conditioned payload scale (anti-cheat), per [env, union body].
+        # ONES = no modulation (identical to previous behavior); the env pushes
+        # wrist-body rows down each step from reference_wrench_scale(...). Applied
+        # to the SUMMED per-body force in _summed_wrench_buffers (broadcast over
+        # xyz); bodies never modulated stay 1.0 -> unchanged.
+        self._wrench_ref_scale = torch.ones(
+            self.num_envs, num_union, device=self.device
+        )
+
         # Per-entry scheduler state; force/torque buffers are laid out over
         # the union body list, with each entry restricted to its own columns.
         self._wrench_scheds = []
@@ -557,13 +608,120 @@ class Simulator(RecordingMixin, ABC):
         return wrote
 
     def _summed_wrench_buffers(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Sum force/torque buffers across wrench classes (superposition)."""
+        """Sum force/torque buffers across wrench classes (superposition).
+
+        The summed per-body FORCE is then multiplied by the reference-conditioned
+        anti-cheat scale ``_wrench_ref_scale`` (broadcast over xyz). That buffer
+        is all-ones unless the env pushes wrist-body rows down from the REFERENCE
+        wrist->chest distance (see ``reference_wrench_scale`` /
+        ``set_wrench_reference_scale_from_reference``), so with the feature off the
+        forces are byte-for-byte identical to the previous behavior. Torques are
+        left unmodulated (the payload weight is a force).
+        """
         total_f = self._wrench_scheds[0]["forces"].clone()
         total_t = self._wrench_scheds[0]["torques"].clone()
         for sched in self._wrench_scheds[1:]:
             total_f += sched["forces"]
             total_t += sched["torques"]
+        ref_scale = getattr(self, "_wrench_ref_scale", None)
+        if ref_scale is not None:
+            total_f = total_f * ref_scale[..., None]
         return total_f, total_t
+
+    def set_wrench_reference_scale_from_reference(
+        self,
+        ref_body_pos: torch.Tensor,
+        ref_body_names: List[str],
+        actual_body_pos: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Push the anti-cheat payload scale into ``_wrench_ref_scale`` each step.
+
+        The env calls this once per control step with the REFERENCE motion's body
+        positions (and their body-name ordering). For every wrench class with
+        ``reference_distance_modulation=True`` it computes, per configured wrist
+        body, the reference-conditioned scale via the pure ``reference_wrench_scale``
+        (REFERENCE wrist->chest distance ONLY) and writes it onto that body's
+        column in the shared ``_wrench_ref_scale`` buffer. Bodies never modulated
+        stay 1.0. This is the sole source that can lower the load, and it depends
+        only on the exogenous demonstration => the policy cannot game it by moving.
+
+        ``actual_body_pos`` is consumed ONLY by the opt-in secondary hardening
+        ``posture_gate`` (which, unlike the primary path, reads the live robot pose
+        — see the config docstring); leave it None to keep the pure reference path.
+
+        Args:
+            ref_body_pos: [num_envs, num_bodies, 3] REFERENCE body positions
+                (world frame), ordered as ``ref_body_names``.
+            ref_body_names: body-name list indexing ``ref_body_pos`` (and
+                ``actual_body_pos``).
+            actual_body_pos: optional [num_envs, num_bodies, 3] LIVE body positions
+                (only for ``posture_gate``).
+        """
+        if not getattr(self, "_wrench_enabled", False):
+            return
+        ref_scale = getattr(self, "_wrench_ref_scale", None)
+        if ref_scale is None:
+            return
+        union_names = getattr(self, "_wrench_union_names", None)
+        if not union_names:
+            return
+
+        name_to_idx = None
+        seen_cfgs = set()
+        for sched in self._wrench_scheds:
+            cfg = sched["cfg"]
+            # Independent-body classes expand into one sched per body but share
+            # one cfg; process each unique cfg once.
+            if id(cfg) in seen_cfgs:
+                continue
+            seen_cfgs.add(id(cfg))
+            if not getattr(cfg, "reference_distance_modulation", False):
+                continue
+
+            if name_to_idx is None:
+                name_to_idx = {n: i for i, n in enumerate(ref_body_names)}
+
+            chest_name = cfg.distance_ref_body
+            if chest_name not in name_to_idx:
+                raise ValueError(
+                    f"distance_ref_body '{chest_name}' not found in reference "
+                    f"body names for reference-conditioned wrench modulation."
+                )
+            ref_chest = ref_body_pos[:, name_to_idx[chest_name], :]
+
+            wrist_names = cfg.distance_wrist_bodies or cfg.body_names
+            for wname in wrist_names:
+                if wname not in union_names:
+                    # Not a wrench body -> no force column to scale; skip.
+                    continue
+                if wname not in name_to_idx:
+                    raise ValueError(
+                        f"distance_wrist_bodies entry '{wname}' not found in "
+                        f"reference body names for wrench modulation."
+                    )
+                body_idx = name_to_idx[wname]
+                ref_wrist = ref_body_pos[:, body_idx, :]
+                s = reference_wrench_scale(
+                    ref_wrist,
+                    ref_chest,
+                    cfg.distance_near_m,
+                    cfg.distance_far_m,
+                    cfg.distance_far_scale,
+                )
+                # --- Secondary hardening (opt-in; USES ACTUAL POSE) -----------
+                # Not part of the structural anti-cheat guarantee: attenuate the
+                # load when the ACTUAL wrist braces far (> tol) from the REFERENCE
+                # wrist, decaying linearly to 0 at twice the tolerance. Off by
+                # default; the reference path above is the primary guarantee.
+                if getattr(cfg, "posture_gate", False) and actual_body_pos is not None:
+                    tol = cfg.posture_gate_tol_m
+                    err = torch.linalg.norm(
+                        actual_body_pos[:, body_idx, :] - ref_wrist, dim=-1
+                    )
+                    gate = (((tol - err) / tol) + 1.0).clamp(0.0, 1.0)
+                    s = s * gate
+                col = union_names.index(wname)
+                ref_scale[:, col] = s
 
     @staticmethod
     def _sample_wrench_vectors(

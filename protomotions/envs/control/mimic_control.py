@@ -113,7 +113,28 @@ class MimicControl(ControlComponent):
             ref_gt
         )
         ref_state.rigid_body_pos = ref_gt
-        
+
+        # --- Reference-conditioned payload modulation (anti-cheat) -------------
+        # Push the per-wrist force scale into the simulator from the REFERENCE
+        # motion's (terrain-corrected, world-frame) wrist->chest distance. This
+        # is a NO-OP unless a wrench class sets reference_distance_modulation=True
+        # (the simulator setter early-returns). The scale depends ONLY on the
+        # exogenous demonstration (see simulator.reference_wrench_scale), so the
+        # policy cannot shed load by moving; it takes effect on the next physics
+        # step (the payload is quasi-static, so the one-step lag is negligible).
+        # The optional secondary hardening (posture_gate) additionally consumes
+        # the live robot pose passed as actual_body_pos.
+        _set_ref_scale = getattr(
+            self.env.simulator, "set_wrench_reference_scale_from_reference", None
+        )
+        if _set_ref_scale is not None:
+            _body_names = self.env.robot_config.kinematic_info.body_names
+            _actual_body_pos = (
+                ctx.current.rigid_body_pos if getattr(ctx, "current", None) is not None
+                else None
+            )
+            _set_ref_scale(ref_state.rigid_body_pos, _body_names, _actual_body_pos)
+
         # Build multi-step reference for observations
         dt = self.env.dt
         if isinstance(self.config.future_steps, int):
