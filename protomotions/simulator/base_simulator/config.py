@@ -865,6 +865,107 @@ class WrenchDomainRandomizationConfig:
         default=0,
         metadata={"help": "Absolute epoch at which the magnitude ramp begins (for resume reproducibility)."},
     )
+    # ---- Reference-conditioned payload modulation (night13 t8, 2026-07-15). ----
+    # ANTI-CHEAT payload scaling: the bag is HEAVY when the arms are near the
+    # chest (short lever arm, mechanically sane) and LIGHT when outstretched. The
+    # scale is a function of the REFERENCE motion's wrist->chest distance (the
+    # mocap target), which is EXOGENOUS to the policy — the robot cannot change
+    # the demonstration by moving, so it cannot shed load by extending its arms.
+    # It is rewarded for tracking the reference, so it goes where the load is and
+    # must bear it. See simulator.reference_wrench_scale (a PURE function whose
+    # ONLY inputs are reference positions — that is what makes the guarantee
+    # structural). Defaults are the OFF/no-op path: buffer stays all-ones,
+    # forces identical to the pre-feature behavior.
+    reference_distance_modulation: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Enable reference-conditioned payload modulation: scale each "
+                "wrist body's force by a function of the REFERENCE motion's "
+                "wrist->chest distance (exogenous to the policy => anti-cheat). "
+                "False (default) = no modulation (buffer all ones, forces "
+                "identical to previous behavior)."
+            )
+        },
+    )
+    distance_ref_body: str = field(
+        default="torso_link",
+        metadata={
+            "help": (
+                "Chest/anchor body whose REFERENCE position is the near end of "
+                "the wrist->chest distance used for modulation."
+            )
+        },
+    )
+    distance_wrist_bodies: Optional[List[str]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Bodies whose force is modulated by their reference distance to "
+                "distance_ref_body. None (default) = use body_names (all "
+                "candidate wrench bodies)."
+            )
+        },
+    )
+    distance_near_m: float = field(
+        default=0.25,
+        metadata={
+            "help": (
+                "Reference wrist->chest distance (m) at or below which the load "
+                "is at FULL scale (1.0) — arms near the chest, heavy bag."
+            )
+        },
+    )
+    distance_far_m: float = field(
+        default=0.55,
+        metadata={
+            "help": (
+                "Reference wrist->chest distance (m) at or above which the load "
+                "is at the floor scale (distance_far_scale) — arms outstretched, "
+                "light bag. Must be > distance_near_m."
+            )
+        },
+    )
+    distance_far_scale: float = field(
+        default=0.20,
+        metadata={
+            "help": (
+                "Floor multiplier applied to the force when the reference is "
+                "fully outstretched (distance >= distance_far_m). In [0, 1]."
+            )
+        },
+    )
+    # ---- Secondary hardening (default OFF). posture_gate ALSO uses the ACTUAL
+    # wrist pose (not reference-only), so it is NOT part of the structural
+    # anti-cheat guarantee — it is an opt-in belt-and-suspenders term that
+    # additionally attenuates the load when the robot braces its wrist far from
+    # the reference wrist (a would-be cheat pose). The reference-conditioning
+    # above is the primary, provable guarantee; this is secondary. ----
+    posture_gate: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "SECONDARY HARDENING (opt-in, uses ACTUAL pose): additionally "
+                "scale down the load when the actual wrist is farther than "
+                "posture_gate_tol_m from the REFERENCE wrist, so the policy "
+                "cannot brace in a cheat pose to relieve load. Default False. "
+                "NOTE: unlike reference_distance_modulation this reads the live "
+                "robot pose, so it is not part of the structural anti-cheat "
+                "guarantee; it is belt-and-suspenders only."
+            )
+        },
+    )
+    posture_gate_tol_m: float = field(
+        default=0.15,
+        metadata={
+            "help": (
+                "Tolerance (m) for posture_gate: the load stays at full "
+                "reference scale while the actual wrist is within this distance "
+                "of the reference wrist, then decays linearly to zero at twice "
+                "the tolerance. Only used when posture_gate=True."
+            )
+        },
+    )
 
     def __post_init__(self):
         for name, rng in (
@@ -925,6 +1026,17 @@ class WrenchDomainRandomizationConfig:
             raise ValueError("magnitude_ramp_start_epoch must be >= 0.")
         if self.magnitude_scale < 0.0:
             raise ValueError("magnitude_scale must be non-negative.")
+        # Reference-conditioned modulation validation (mirrors the style above).
+        if self.distance_near_m < 0.0:
+            raise ValueError("distance_near_m must be non-negative.")
+        if self.distance_far_m <= 0.0:
+            raise ValueError("distance_far_m must be positive.")
+        if not (self.distance_near_m < self.distance_far_m):
+            raise ValueError("distance_near_m must be < distance_far_m.")
+        if not (0.0 <= self.distance_far_scale <= 1.0):
+            raise ValueError("distance_far_scale must be in [0, 1].")
+        if self.posture_gate_tol_m <= 0.0:
+            raise ValueError("posture_gate_tol_m must be positive.")
 
     def has_wrench(self) -> bool:
         """Check if any wrench magnitude is configured (non-zero)."""
