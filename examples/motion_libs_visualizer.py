@@ -1105,11 +1105,13 @@ class MotionVisualizerSmoothness:
         translations = torch.where(visible, translations, hidden)
 
         # arrow_x.usd points +X; rotate +X onto -Z with +90 deg about Y.
+        # MarkerState.orientation uses the COMMON convention (xyzw) for every
+        # backend: RecordingMixin._update_markers (record.py) converts
+        # xyzw -> wxyz at the simulator boundary when config.w_last is False
+        # (IsaacLab). Emitting wxyz here would get double-converted and flip
+        # the arrow to point +Z (up) instead of -Z.
         half = math.pi / 4.0
-        if self.simulator_type == "isaaclab":
-            quat = [math.cos(half), 0.0, math.sin(half), 0.0]  # wxyz
-        else:
-            quat = [0.0, math.sin(half), 0.0, math.cos(half)]  # xyzw
+        quat = [0.0, math.sin(half), 0.0, math.cos(half)]  # xyzw (common)
         orientations = torch.tensor(
             quat, device=self.device, dtype=wrist_pos.dtype
         ).view(1, 1, 4).expand(self.num_envs, len(idx_in_common), 4).contiguous()
