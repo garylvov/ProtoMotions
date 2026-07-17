@@ -1211,8 +1211,16 @@ class IsaacLabSimulator(Simulator):
                 marker_name in self._visualization_markers
             ), f"Marker {marker_name} passed to update_markers but not defined at instantiation"
             marker_dict = self._visualization_markers[marker_name]
+            # A per-frame scale is optional: groups that don't set one (every
+            # existing sphere group) keep the static scale built at
+            # instantiation from MarkerConfig.size.
+            scales = marker_dict.scale
+            if markers_state_item.scale is not None:
+                scales = markers_state_item.scale.view(-1, 3).to(
+                    device=marker_dict.scale.device, dtype=marker_dict.scale.dtype
+                )
             marker_dict.marker.visualize(
                 translations=markers_state_item.translation.view(-1, 3),
                 orientations=markers_state_item.orientation.view(-1, 4),
-                scales=marker_dict.scale,
+                scales=scales,
             )

@@ -89,6 +89,14 @@ class MarkerState:
     color: Optional[Tuple[float, float, float]] = field(
         default=None, metadata={"help": "Optional RGB color override."}
     )
+    scale: Optional[torch.Tensor] = field(
+        default=None,
+        metadata={
+            "help": "Optional per-marker scale, broadcastable to the marker "
+            "group's (num_envs * num_markers, 3). When None the static scale "
+            "built from MarkerConfig.size at instantiation is used."
+        },
+    )
 
 
 @dataclass
