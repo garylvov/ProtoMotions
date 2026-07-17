@@ -53,6 +53,16 @@ def env_config(robot_cfg: RobotConfig, args: argparse.Namespace) -> EnvConfig:
     control_components = {
         "mimic": MimicControlConfig(
             bootstrap_on_episode_end=True,
+            # Lookahead ladder. env dt = decimation/fps = 4/200 = 0.02 s for h1_2 on
+            # isaaclab (robot_configs/h1_2.py), so these are 0.02 .. 0.64 s.
+            # MimicControlConfig defaults to future_steps=1 -- a 20 ms horizon, which
+            # is not a lookahead at all: the policy sees the reference's next frame and
+            # can only react once a turn has already begun. Anticipating a footfall or a
+            # weight transfer needs to see the whole step (~0.5-0.6 s), so the tail
+            # reaches 0.64 s. Dense near-term for tracking accuracy, sparse far-term for
+            # intent. Compare mimic/fsq.py [1,2,5,7,12,18,25] (0.50 s) and
+            # mlp_bm_l2c2.py [1,2,4,8] (0.16 s).
+            future_steps=[1, 2, 4, 8, 16, 32],
         )
     }
 
