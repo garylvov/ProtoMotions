@@ -20,6 +20,10 @@ Usage (default — first num_envs motions/scenes from the file):
 Usage (random motions):
     python examples/env_kinematic_playback.py ... --motion-ids random --num-envs 80
 
+Usage (explicit range — half-open, must match --num-envs):
+    python examples/env_kinematic_playback.py ... --motion-ids 0:100 --num-envs 100
+    python examples/env_kinematic_playback.py ... --motion-ids 100:200 --num-envs 100
+
 Usage (specific motion IDs — sequential range starting at 5):
     python examples/env_kinematic_playback.py ... --motion-ids 5 --num-envs 80
 
@@ -99,10 +103,12 @@ def create_parser():
         type=str,
         default=None,
         help=(
-            "Which motions to visualize. Three formats: "
+            "Which motions to visualize. Four formats: "
             "(1) 'random' — pick num_envs scenes/motions at random from the file; "
-            "(2) a single start index, e.g. '5', expanding to [5, 5+num_envs); "
-            "(3) an explicit comma-separated list, e.g. '5,10,15,20', whose length "
+            "(2) an explicit half-open range, e.g. '0:100' or '100:200', whose length "
+            "must equal --num-envs; "
+            "(3) a single start index, e.g. '5', expanding to [5, 5+num_envs); "
+            "(4) an explicit comma-separated list, e.g. '5,10,15,20', whose length "
             "must equal --num-envs. "
             "When --scenes-file is provided the matching scenes are loaded automatically. "
             "Omit this flag to use the default (first num_envs scenes)."
@@ -157,6 +163,19 @@ def main():
         raw = args.motion_ids.strip()
         if raw.lower() == "random":
             random_motions = True
+        elif ":" in raw:
+            start_str, _, end_str = raw.partition(":")
+            start, end = int(start_str), int(end_str)
+            if end <= start:
+                raise ValueError(
+                    f"--motion-ids range '{raw}' is empty: end must be greater than start."
+                )
+            specific_motion_ids = list(range(start, end))
+            if len(specific_motion_ids) != args.num_envs:
+                raise ValueError(
+                    f"--motion-ids range '{raw}' selects {len(specific_motion_ids)} motions "
+                    f"but --num-envs is {args.num_envs}. They must match."
+                )
         elif "," in raw:
             specific_motion_ids = [int(x.strip()) for x in raw.split(",")]
             if len(specific_motion_ids) != args.num_envs:

@@ -38,6 +38,17 @@ parser.add_argument(
     default="g1",
     help="Robot to load (g1, rigv1, h1_2, smpl, or soma23)",
 )
+parser.add_argument(
+    "--motion-ids",
+    type=str,
+    default=None,
+    help="Load only a subset of motions from the pack: a half-open range '0:1000', "
+    "'1000:2000', or an explicit list '5,10,15'. The slice happens on CPU, so only "
+    "the selected motions reach the GPU -- use this to review a large pack (e.g. the "
+    "68k-clip PHUMA train set) a slice at a time instead of exhausting VRAM. "
+    "Indices are into the ORIGINAL pack; the on-screen 'motion i/N' counter is "
+    "relative to the loaded slice.",
+)
 parser.add_argument("--headless", action="store_true", help="Run in headless mode")
 parser.add_argument(
     "--cpu-only",
@@ -337,7 +348,10 @@ class MotionVisualizerSmoothness:
 
         self.motion_libs = [
             MotionLib(
-                config=MotionLibConfig(motion_file=str(motion_file)), device=self.device
+                config=MotionLibConfig(
+                    motion_file=str(motion_file), motion_subset=args.motion_ids
+                ),
+                device=self.device,
             )
             for motion_file in self.motion_files
         ]
@@ -399,6 +413,7 @@ class MotionVisualizerSmoothness:
 
         # Create custom key handlers for speed and threshold control
         custom_key_handlers = {
+            "R": self._request_next_motion,  # Key R: Switch to next motion
             "1": self.increase_speed,  # Key 1: Increase playback speed
             "2": self.decrease_speed,  # Key 2: Decrease playback speed
             "3": self.increase_smoothness_threshold,  # Key 3: Increase smoothness threshold
@@ -513,6 +528,10 @@ class MotionVisualizerSmoothness:
             color=(0.8, 0.0, 0.8),  # purple
             markers=contact_marker_configs,
         )
+
+    def _request_next_motion(self):
+        """Ask the run loop to advance to the next motion."""
+        self.simulator.user_requested_reset = True
 
     def _switch_to_next_motion(self):
         """Switch to the next motion in the dataset"""
