@@ -146,6 +146,43 @@ parser.add_argument(
     help="Sliding window length in seconds for computing smoothness metrics",
 )
 parser.add_argument(
+    "--disable-self-collision",
+    action="store_true",
+    help="Turn OFF the orange robot-on-robot self-collision overlay (on by default). "
+    "The overlay is a purely geometric proximity check between body links -- it does "
+    "not require physx self-contacts and works on every simulator backend.",
+)
+parser.add_argument(
+    "--self-collision-radius",
+    type=float,
+    default=0.05,
+    help="Capsule radius (m) used to approximate each robot link for the self-collision "
+    "overlay. Two non-adjacent links are flagged when the distance between their bone "
+    "segments drops below 2*radius + --self-collision-margin, i.e. when their capsule "
+    "surfaces interpenetrate. This is a MODEST uniform-thickness approximation (links "
+    "are not really equal-radius capsules); adjust live with keys 7/8. Default 0.05 keeps "
+    "normal standing/walking frames clear.",
+)
+parser.add_argument(
+    "--self-collision-margin",
+    type=float,
+    default=0.0,
+    help="Extra surface clearance (m) added to the self-collision trigger distance, so a "
+    "pair is flagged at 2*radius + margin. Raise it to also surface near-misses (bodies "
+    "that come close without hard interpenetration).",
+)
+parser.add_argument(
+    "--self-collision-exclude-hops",
+    type=int,
+    default=2,
+    help="Exclude link pairs whose bones are within this many joints of each other in the "
+    "kinematic tree (default 2). Adjacent links share a joint and co-located multi-DOF "
+    "clusters (e.g. hip yaw/pitch/roll) sit on top of each other, so they must be "
+    "excluded or every frame lights up; 2 also drops sibling limbs branching off a shared "
+    "parent. Distinct limbs (chest vs thigh, arm vs opposite leg) are many hops apart and "
+    "stay checked.",
+)
+parser.add_argument(
     "--origin_xy",
     type=float,
     nargs=2,
@@ -443,6 +480,142 @@ def purposeful_jerk_from_vel(vel, dt, eps=1e-8):
     return pj, pj.mean()
 
 
+# ----- Self-collision (robot-on-robot) overlay -----
+# Orange spheres mark links that are geometrically interpenetrating OTHER,
+# non-adjacent links on the current frame. This is deliberately NOT a physx
+# self-contact read: the visualizer loads the robot with self_collisions=False
+# (asset.self_collisions is forced off below) and drives it kinematically to the
+# reference pose, so the engine never narrow-phases the articulation against
+# itself. Instead we reuse the body world positions the overlay already fetches
+# each frame (simulator.get_bodies_state(), common/kinematic ordering) and run a
+# link-vs-link proximity test. Being purely positional, it works on every backend
+# (isaacgym, isaaclab, newton) exactly like the ground/smoothness sphere overlays
+# -- unlike the arrow markers, which are isaaclab-only.
+SELF_COLLISION_MARKER_NAME = "self_collision_markers"
+
+
+def _segment_segment_distance(p1, q1, p2, q2, eps=1e-9):
+    """Closest distance between segment [p1,q1] and segment [p2,q2], batched.
+
+    All inputs are [..., 3]; returns [...]. Standard clamped closest-point
+    solution (Ericson, Real-Time Collision Detection): solve the unconstrained
+    line-line params, then clamp both to [0,1] with a re-projection so the result
+    is exact for the segment (not the infinite line) case, including parallel and
+    zero-length (a co-located multi-DOF joint) bones.
+    """
+    d1 = q1 - p1
+    d2 = q2 - p2
+    r = p1 - p2
+    a = (d1 * d1).sum(-1)  # |d1|^2
+    e = (d2 * d2).sum(-1)  # |d2|^2
+    f = (d2 * r).sum(-1)
+    c = (d1 * r).sum(-1)
+    b = (d1 * d2).sum(-1)
+    denom = a * e - b * b
+    # s along seg1: use line-line solution where segments aren't parallel,
+    # else pin to 0 and let the t-then-s reprojection below fix it.
+    s = torch.where(
+        denom > eps, (b * f - c * e) / denom.clamp_min(eps), torch.zeros_like(denom)
+    ).clamp(0.0, 1.0)
+    t = ((b * s + f) / e.clamp_min(eps)).clamp(0.0, 1.0)
+    s = ((t * b - c) / a.clamp_min(eps)).clamp(0.0, 1.0)
+    closest1 = p1 + s.unsqueeze(-1) * d1
+    closest2 = p2 + t.unsqueeze(-1) * d2
+    return (closest1 - closest2).norm(dim=-1)
+
+
+def build_self_collision_pairs(parent_indices, exclude_hops):
+    """Precompute which link-vs-link bone pairs to test each frame.
+
+    Each body i (with a parent) contributes a bone = segment(pos[i], pos[parent]).
+    We test bone pairs whose four endpoint bodies are all MORE than `exclude_hops`
+    joints apart in the kinematic tree, which drops:
+      * a bone against itself / its direct chain neighbours (shared endpoint, 0-1 hops),
+      * co-located multi-DOF joint clusters (hip yaw/pitch/roll stacked at one point),
+      * sibling limbs branching off a shared parent (2 hops).
+    Mirrors how self-collision libraries filter adjacent/parent-child pairs.
+
+    Returns (bone_child, bone_parent, pair_a, pair_b) as long tensors on CPU:
+      bone_child[k], bone_parent[k] are the two body indices of bone k;
+      pair_a[p], pair_b[p] index into the bone arrays for the p-th tested pair.
+    """
+    from collections import deque
+
+    num_bodies = len(parent_indices)
+    # Undirected adjacency for BFS hop distances.
+    adj = {i: [] for i in range(num_bodies)}
+    for i, par in enumerate(parent_indices):
+        if par != -1:
+            adj[i].append(par)
+            adj[par].append(i)
+    hop = [[999] * num_bodies for _ in range(num_bodies)]
+    for src in range(num_bodies):
+        hop[src][src] = 0
+        dq = deque([src])
+        while dq:
+            u = dq.popleft()
+            for v in adj[u]:
+                if hop[src][v] == 999:
+                    hop[src][v] = hop[src][u] + 1
+                    dq.append(v)
+
+    bones = [(i, parent_indices[i]) for i in range(num_bodies) if parent_indices[i] != -1]
+    pair_a, pair_b = [], []
+    for x in range(len(bones)):
+        for y in range(x + 1, len(bones)):
+            ex = bones[x]
+            ey = bones[y]
+            min_hop = min(hop[a][b] for a in ex for b in ey)
+            if min_hop <= exclude_hops:
+                continue
+            pair_a.append(x)
+            pair_b.append(y)
+    bone_child = torch.tensor([b[0] for b in bones], dtype=torch.long)
+    bone_parent = torch.tensor([b[1] for b in bones], dtype=torch.long)
+    return (
+        bone_child,
+        bone_parent,
+        torch.tensor(pair_a, dtype=torch.long),
+        torch.tensor(pair_b, dtype=torch.long),
+    )
+
+
+def compute_self_collision_body_mask(
+    positions, bone_child, bone_parent, pair_a, pair_b, radius, margin
+):
+    """Per-body self-collision mask for a batch of poses.
+
+    Args:
+        positions: [num_envs, num_bodies, 3] body world positions (kinematic order).
+        bone_child/bone_parent: [num_bones] body indices for each bone.
+        pair_a/pair_b: [num_pairs] indices into the bone arrays (already adjacency-filtered).
+        radius: capsule radius per link (uniform approximation).
+        margin: extra surface clearance added to the trigger distance.
+    Returns:
+        [num_envs, num_bodies] bool, True for every body that belongs to a bone
+        involved in at least one interpenetrating pair.
+    """
+    E, B, _ = positions.shape
+    mask = torch.zeros(E, B, dtype=torch.bool, device=positions.device)
+    if pair_a.numel() == 0:
+        return mask
+    ca = bone_child[pair_a]
+    pa = bone_parent[pair_a]
+    cb = bone_child[pair_b]
+    pb = bone_parent[pair_b]
+    dist = _segment_segment_distance(
+        positions[:, ca], positions[:, pa], positions[:, cb], positions[:, pb]
+    )  # [E, num_pairs]
+    collide = dist < (2.0 * radius + margin)  # [E, num_pairs]
+    # Light up all four endpoint bodies of every colliding bone pair. index_add_
+    # tolerates duplicate indices (accumulates), so overlapping pairs OR together.
+    acc = torch.zeros(E, B, device=positions.device)
+    collide_f = collide.float()
+    for idx in (ca, pa, cb, pb):
+        acc.index_add_(1, idx.to(positions.device), collide_f)
+    return acc > 0
+
+
 def create_checkerboard_ground(
     num_envs: int, device: torch.device, simulator_type: str = "isaacgym"
 ) -> SceneLib:
@@ -545,6 +718,19 @@ class MotionVisualizerSmoothness:
         self.metric = metric
         self.use_data_vel = use_data_vel  # If False (default), use finite differences
         self.window_frames = max(4, int(round(window_sec * FPS)))
+
+        # Self-collision overlay config (orange). Purely geometric, backend-agnostic.
+        self.self_collision_enabled = not args.disable_self_collision
+        self.self_collision_radius = args.self_collision_radius
+        self.self_collision_margin = args.self_collision_margin
+        self.self_collision_exclude_hops = args.self_collision_exclude_hops
+        self.self_collision_radius_step = 0.01  # metres, for the 7/8 live keys
+        # Bone/pair tensors are built in _initialize_body_markers once the
+        # kinematic info (parent_indices) is available.
+        self._sc_bone_child = None
+        self._sc_bone_parent = None
+        self._sc_pair_a = None
+        self._sc_pair_b = None
 
         # Load motion libraries (.pt files)
         from protomotions.components.motion_lib import MotionLibConfig
@@ -660,6 +846,10 @@ class MotionVisualizerSmoothness:
             # 1-4 are taken by speed and the smoothness threshold; 5/6 are free.
             custom_key_handlers["5"] = self.increase_force_pct
             custom_key_handlers["6"] = self.decrease_force_pct
+        if self.self_collision_enabled:
+            # 7/8 tune the self-collision capsule radius (independent of 5/6).
+            custom_key_handlers["7"] = self.increase_self_collision_radius
+            custom_key_handlers["8"] = self.decrease_self_collision_radius
 
         # Create checkerboard ground for visualization
         print("Creating checkerboard ground plane...")
@@ -696,6 +886,13 @@ class MotionVisualizerSmoothness:
         print("  Red spheres - Specified body markers")
         print("  Yellow spheres - Bodies exceeding smoothness threshold")
         print("  Purple spheres - Bodies in contact with ground")
+        if self.self_collision_enabled:
+            print(
+                "  Orange spheres - Bodies in SELF-COLLISION (robot-on-robot): "
+                f"non-adjacent links whose capsule surfaces interpenetrate "
+                f"(radius {self.self_collision_radius:.3f} m, margin "
+                f"{self.self_collision_margin:.3f} m)"
+            )
         print("Controls:")
         print("  'R' - Switch to next motion")
         print("  '1' - Increase playback speed by 150% (NumPad 1 for IsaacLab)")
@@ -707,6 +904,9 @@ class MotionVisualizerSmoothness:
                   f"{self.force_max_N:.0f} N")
             print("  '5' - Force override +10% of cap (NumPad 5 for IsaacLab)")
             print("  '6' - Force override -10% of cap; below 0% restores the ramp")
+        if self.self_collision_enabled:
+            print("  '7' - Increase self-collision capsule radius by 0.01 m (NumPad 7 for IsaacLab)")
+            print("  '8' - Decrease self-collision capsule radius by 0.01 m (NumPad 8 for IsaacLab)")
         print("Motion will play automatically and loop")
 
         self.simulator.user_requested_reset = True
@@ -774,6 +974,39 @@ class MotionVisualizerSmoothness:
             color=(0.8, 0.0, 0.8),  # purple
             markers=contact_marker_configs,
         )
+
+        # Orange self-collision (robot-on-robot) markers: one per body, same
+        # fixed-count / hide-below-ground idiom as the purple contact markers.
+        if self.self_collision_enabled:
+            (
+                self._sc_bone_child,
+                self._sc_bone_parent,
+                self._sc_pair_a,
+                self._sc_pair_b,
+            ) = build_self_collision_pairs(
+                list(self.kinematic_info.parent_indices),
+                self.self_collision_exclude_hops,
+            )
+            if self._sc_pair_a.numel() == 0:
+                print(
+                    "WARNING: no self-collision pairs survive the adjacency filter for "
+                    f"robot '{self.robot_name}' (--self-collision-exclude-hops="
+                    f"{self.self_collision_exclude_hops}); disabling the orange overlay."
+                )
+                self.self_collision_enabled = False
+            else:
+                self._sc_bone_child = self._sc_bone_child.to(self.device)
+                self._sc_bone_parent = self._sc_bone_parent.to(self.device)
+                self._sc_pair_a = self._sc_pair_a.to(self.device)
+                self._sc_pair_b = self._sc_pair_b.to(self.device)
+                self_collision_marker_configs = [
+                    MarkerConfig(size="regular") for _ in range(num_bodies)
+                ]
+                self.viz_markers[SELF_COLLISION_MARKER_NAME] = VisualizationMarkerConfig(
+                    type="sphere",
+                    color=(1.0, 0.5, 0.0),  # orange
+                    markers=self_collision_marker_configs,
+                )
 
         if self.force_caps is not None:
             # One arrow per wrist; the count is fixed here, so zero-force arrows
@@ -1001,6 +1234,39 @@ class MotionVisualizerSmoothness:
             )
         }
 
+    def _update_self_collision_markers(self) -> Dict[str, MarkerState]:
+        """Orange markers on links that interpenetrate a non-adjacent link.
+
+        Uses the SAME per-frame body positions as the ground/smoothness overlays
+        (get_bodies_state, common/kinematic ordering, which is how parent_indices
+        are indexed too) and the SAME hide-below-ground idiom as the purple
+        contact markers -- the marker count is fixed at build time, so a body that
+        is NOT in self-collision is pushed far below the floor rather than removed.
+        """
+        all_body_state = self.simulator.get_bodies_state()
+        all_translations = all_body_state.rigid_body_pos.detach().clone()
+        all_orientations = all_body_state.rigid_body_rot.detach().clone()
+
+        self_collision_mask = compute_self_collision_body_mask(
+            all_translations,
+            self._sc_bone_child,
+            self._sc_bone_parent,
+            self._sc_pair_a,
+            self._sc_pair_b,
+            self.self_collision_radius,
+            self.self_collision_margin,
+        )  # [num_envs, num_bodies]
+
+        mask = self_collision_mask.unsqueeze(-1)  # [num_envs, num_bodies, 1]
+        hidden_pos = torch.tensor([0.0, 0.0, -100.0], device=self.device).view(1, 1, 3)
+        translations = torch.where(mask, all_translations, hidden_pos)
+
+        return {
+            SELF_COLLISION_MARKER_NAME: MarkerState(
+                translation=translations, orientation=all_orientations
+            )
+        }
+
     def _update_joint_highlights(self) -> Dict[str, MarkerState]:
         """Get which joints to highlight based on pre-computed smoothness metrics and return marker states."""
 
@@ -1220,6 +1486,10 @@ class MotionVisualizerSmoothness:
         contact_marker_states = self._update_contact_markers()
         marker_states.update(contact_marker_states)
 
+        # Add/update self-collision markers (orange, robot-on-robot)
+        if self.self_collision_enabled:
+            marker_states.update(self._update_self_collision_markers())
+
         # Add/update wrist force arrows (only when --force-caps-json was given)
         if self.force_caps is not None:
             marker_states.update(self._update_force_arrows())
@@ -1259,6 +1529,30 @@ class MotionVisualizerSmoothness:
             print(f"Smoothness threshold decreased to {self.smoothness_threshold:.3f}")
         else:
             print(f"Smoothness threshold at minimum: {self.smoothness_threshold:.3f}")
+
+    def increase_self_collision_radius(self):
+        """Key 7: grow the self-collision capsule radius (more sensitive)."""
+        self.self_collision_radius += self.self_collision_radius_step
+        print(
+            f"Self-collision capsule radius increased to "
+            f"{self.self_collision_radius:.3f} m (trigger surface distance "
+            f"{2 * self.self_collision_radius + self.self_collision_margin:.3f} m)"
+        )
+
+    def decrease_self_collision_radius(self):
+        """Key 8: shrink the self-collision capsule radius (less sensitive)."""
+        new_radius = max(
+            self.self_collision_radius - self.self_collision_radius_step, 0.0
+        )
+        if new_radius != self.self_collision_radius:
+            self.self_collision_radius = new_radius
+            print(
+                f"Self-collision capsule radius decreased to "
+                f"{self.self_collision_radius:.3f} m (trigger surface distance "
+                f"{2 * self.self_collision_radius + self.self_collision_margin:.3f} m)"
+            )
+        else:
+            print("Self-collision capsule radius already at 0.000 m")
 
     def run(self):
         """Main simulation loop"""
