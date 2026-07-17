@@ -307,9 +307,21 @@ def main():
                 f"{specific_motion_ids[:4]}{'...' if len(specific_motion_ids) > 4 else ''}"
             )
         else:
-            env_config.motion_manager.subset_method = specific_motion_ids
+            # Load ONLY the requested motions. Without this the whole pack is loaded
+            # straight onto the GPU -- a 68k-clip / 12 GB corpus exhausts VRAM before
+            # PhysX can create its scene ("No physics scene created" / "Failed to
+            # create simulation view backend"). motion_subset slices on CPU via a
+            # memory-mapped read, so only these motions reach the device.
+            # The library is then re-indexed 0..N-1, so subset_method must refer to
+            # positions within the slice, not indices in the original pack.
+            motion_lib_config.motion_subset = ",".join(
+                str(i) for i in specific_motion_ids
+            )
+            env_config.motion_manager.subset_method = list(
+                range(len(specific_motion_ids))
+            )
             print(
-                f"Motion manager subset_method set to "
+                f"Motion library sliced to {len(specific_motion_ids)} motions "
                 f"{specific_motion_ids[:4]}{'...' if len(specific_motion_ids) > 4 else ''}"
             )
 

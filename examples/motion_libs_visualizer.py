@@ -49,6 +49,31 @@ parser.add_argument(
     "Indices are into the ORIGINAL pack; the on-screen 'motion i/N' counter is "
     "relative to the loaded slice.",
 )
+parser.add_argument(
+    "--motion-ids-json",
+    type=str,
+    default=None,
+    help="JSON file of motion indices to load, as an alternative to --motion-ids. "
+    "Either a flat list ([0, 5, 12]) or an object of named lists "
+    '({"TURN": [...], "SKATE": [...]}); with an object, pass --json-key to pick one. '
+    "Indices are positions in the pack given by --motion_files. Use this to review one "
+    "defect class at a time from a quality-scan split.",
+)
+parser.add_argument(
+    "--json-key",
+    type=str,
+    default=None,
+    help="Which named list to use from --motion-ids-json when it holds an object.",
+)
+parser.add_argument(
+    "--json-slice",
+    type=str,
+    default=None,
+    help="Take a half-open slice of the --motion-ids-json list before loading, e.g. "
+    "'0:1000' then '1000:2000'. This slices POSITIONS IN THE LIST, not motion indices, "
+    "so it walks a defect class in GPU-sized batches. Out-of-range ends are clamped "
+    "(a list of 2699 with '2000:3000' yields the last 699).",
+)
 parser.add_argument("--headless", action="store_true", help="Run in headless mode")
 parser.add_argument(
     "--cpu-only",
@@ -94,6 +119,71 @@ parser.add_argument(
     help="Target x,y position to move all motions to (default: 0.0 0.0)",
 )
 args = parser.parse_args()
+
+
+def _resolve_motion_subset(args) -> str:
+    """Fold --motion-ids / --motion-ids-json into a single MotionLibConfig.motion_subset.
+
+    Kept as plain stdlib so it runs before the simulator import ordering dance below.
+    """
+    if args.motion_ids and args.motion_ids_json:
+        raise SystemExit("Pass only one of --motion-ids / --motion-ids-json.")
+    if args.motion_ids:
+        return args.motion_ids
+    if not args.motion_ids_json:
+        return None
+
+    import json as _json
+
+    with open(args.motion_ids_json) as f:
+        data = _json.load(f)
+    if isinstance(data, dict):
+        if args.json_key is None:
+            raise SystemExit(
+                f"{args.motion_ids_json} holds an object; pass --json-key to choose one "
+                f"of: {', '.join(sorted(data))}"
+            )
+        if args.json_key not in data:
+            raise SystemExit(
+                f"--json-key '{args.json_key}' not in {args.motion_ids_json}; "
+                f"available: {', '.join(sorted(data))}"
+            )
+        ids = data[args.json_key]
+    else:
+        ids = data
+    if not isinstance(ids, list) or not all(isinstance(i, int) for i in ids):
+        raise SystemExit(
+            f"{args.motion_ids_json} must hold a list of ints (or an object of them)."
+        )
+    if not ids:
+        raise SystemExit(f"{args.motion_ids_json} selects no motions.")
+
+    total = len(ids)
+    label = f"{args.motion_ids_json}" + (f" [{args.json_key}]" if args.json_key else "")
+    if args.json_slice:
+        start_str, sep, end_str = args.json_slice.partition(":")
+        if not sep:
+            raise SystemExit(f"--json-slice '{args.json_slice}' must be 'start:end'.")
+        start = int(start_str) if start_str.strip() else 0
+        end = int(end_str) if end_str.strip() else total
+        if end <= start:
+            raise SystemExit(f"--json-slice '{args.json_slice}' is empty.")
+        if start >= total:
+            raise SystemExit(
+                f"--json-slice '{args.json_slice}' starts past the end: the list has "
+                f"{total} entries."
+            )
+        ids = ids[start:end]
+        print(
+            f"--motion-ids-json: {label} has {total} motions; slice "
+            f"[{start}:{min(end, total)}] -> loading {len(ids)}"
+        )
+    else:
+        print(f"--motion-ids-json: loading all {total} motions from {label}")
+    return ",".join(str(i) for i in ids)
+
+
+args.motion_subset = _resolve_motion_subset(args)
 
 # Import simulator before torch - isaacgym/isaaclab must be imported before torch
 # This also returns AppLauncher if using isaaclab, None otherwise
@@ -349,7 +439,7 @@ class MotionVisualizerSmoothness:
         self.motion_libs = [
             MotionLib(
                 config=MotionLibConfig(
-                    motion_file=str(motion_file), motion_subset=args.motion_ids
+                    motion_file=str(motion_file), motion_subset=args.motion_subset
                 ),
                 device=self.device,
             )
