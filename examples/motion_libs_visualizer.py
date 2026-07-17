@@ -83,7 +83,8 @@ parser.add_argument(
     "When given, an arrow is drawn at each wrist whose penetration through the wrist "
     "reads as the load the clip is allowed to carry: at 0 N the arrow's tip touches "
     "the wrist, at the cap its base sits on the wrist. Magnitude is cap * ramp(t), "
-    "with the ramp bracketed by the clip's reference-derived pickup_t/place_t. "
+    "with the ramp bracketed by the clip's carry_start_t/carry_end_t and scaled "
+    "by its force_scale (0 on ~40% of clips, i.e. unloaded). "
     "Off by default. Requires --simulator isaaclab (arrow markers are IsaacLab-only).",
 )
 parser.add_argument(
@@ -1058,7 +1059,13 @@ class MotionVisualizerSmoothness:
         if self.force_pct_override is not None:
             pct = self.force_pct_override / 100.0
         else:
-            pct = force_ramp(t, entry["pickup_t"], entry["place_t"], args.force_ramp_sec)
+            # carry_* is the SCHEDULE; pickup_t/place_t are still emitted by
+            # the sidecar for reference but no longer drive it (detection fires
+            # on ~1% of clips and cannot see a tabletop grasp at all, so it
+            # would leave the payload DR unexercised on the whole corpus).
+            pct = force_ramp(t, entry.get("carry_start_t"),
+                             entry.get("carry_end_t"), args.force_ramp_sec)
+            pct *= float(entry.get("force_scale", 1.0))
         return [entry["left_cap_N"] * pct, entry["right_cap_N"] * pct]
 
     def _update_force_arrows(self) -> Dict[str, MarkerState]:
