@@ -399,6 +399,16 @@ class MotionLibConfig:
             "help": "Path to motion file (.pt, .yaml, or .motion). None for empty library."
         },
     )
+    motion_subset: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Load only a subset of the motions in a packaged .pt, so a large "
+            "pack can be reviewed on a small GPU. Either a half-open index range "
+            "'start:end' (e.g. '0:1000', '1000:2000') or an explicit comma-separated "
+            "list (e.g. '5,10,15'). The slice happens on CPU via a memory-mapped read, "
+            "so only the selected motions are ever moved to the device. None loads all."
+        },
+    )
     get_motion_state_use_blend: bool = field(
         default=True,
         metadata={
@@ -1053,9 +1063,14 @@ class MotionLib:
             file_path: Path to the motion library file
         """
         print(f"Loading motion library from {file_path}")
-        loaded_data = torch.load(
-            file_path, map_location=self.device, weights_only=False
-        )
+        if self.config.motion_subset:
+            loaded_data = self._load_subset_from_file(
+                file_path, self.config.motion_subset
+            )
+        else:
+            loaded_data = torch.load(
+                file_path, map_location=self.device, weights_only=False
+            )
 
         # Runtime target-mass reweight (unsharded-load parity with
         # load_from_file_sharded): if a "<pack>.mix_target.json" sidecar is
@@ -1346,6 +1361,82 @@ class MotionLib:
             f"renormalized={report['renormalized']}), "
             f"{frames_expected} local frames | class mass: {frac_str}"
         )
+    @staticmethod
+    def parse_motion_subset(subset: str, num_motions: int) -> list:
+        """Resolve a motion_subset spec against a pack of `num_motions` motions.
+
+        Accepts a half-open range 'start:end' or an explicit list '5,10,15'.
+        Raises on an empty range or an out-of-bounds index rather than silently
+        clamping, so a mistyped slice fails loudly instead of showing the wrong
+        motions.
+        """
+        raw = subset.strip()
+        if ":" in raw:
+            start_str, _, end_str = raw.partition(":")
+            start = int(start_str) if start_str.strip() else 0
+            end = int(end_str) if end_str.strip() else num_motions
+            if end <= start:
+                raise ValueError(
+                    f"motion_subset '{subset}' is empty: end must exceed start."
+                )
+            ids = list(range(start, end))
+        else:
+            ids = [int(x) for x in raw.split(",") if x.strip()]
+            if not ids:
+                raise ValueError(f"motion_subset '{subset}' selects no motions.")
+        oob = [i for i in ids if i < 0 or i >= num_motions]
+        if oob:
+            raise ValueError(
+                f"motion_subset '{subset}' is out of bounds for a pack with "
+                f"{num_motions} motions (offending indices e.g. {oob[:5]})."
+            )
+        return ids
+
+    def _load_subset_from_file(self, file_path, subset: str) -> dict:
+        """Load only `subset` of a packaged .pt, keeping the full pack off the device.
+
+        The pack is memory-mapped on CPU (a 12 GB pack costs ~0.4 GB RSS), the selected
+        motions are gathered, and only those are moved to self.device. Loading the whole
+        pack straight to the GPU is what exhausts VRAM on large corpora.
+        """
+        src = torch.load(file_path, map_location="cpu", weights_only=False, mmap=True)
+        num_motions = len(src["motion_num_frames"])
+        ids = self.parse_motion_subset(subset, num_motions)
+
+        frame_indices = []
+        for i in ids:
+            start = int(src["length_starts"][i])
+            frame_indices.extend(range(start, start + int(src["motion_num_frames"][i])))
+        frame_indices = torch.tensor(frame_indices, dtype=torch.long)
+
+        frame_fields = ("gts", "grs", "gvs", "gavs", "dvs", "dps", "contacts", "lrs")
+        motion_fields = ("motion_num_frames", "motion_lengths", "motion_dt", "motion_weights")
+
+        out = {}
+        for key, val in src.items():
+            if key == "length_starts":
+                continue  # rebuilt below
+            if key in frame_fields and val is not None:
+                out[key] = val[frame_indices].to(self.device)
+            elif key in motion_fields and val is not None:
+                out[key] = val[torch.tensor(ids, dtype=torch.long)].to(self.device)
+            elif key == "motion_files" and val is not None:
+                out[key] = tuple(val[i] for i in ids)
+            elif torch.is_tensor(val):
+                out[key] = val.to(self.device)
+            else:
+                out[key] = val
+
+        num_frames = out["motion_num_frames"]
+        shifted = num_frames.roll(1)
+        shifted[0] = 0
+        out["length_starts"] = shifted.cumsum(0)
+
+        print(
+            f"  motion_subset '{subset}': loaded {len(ids)}/{num_motions} motions "
+            f"({len(frame_indices)} frames) onto {self.device}"
+        )
+        return out
 
     def smooth_contacts(self, window_size: int):
         """

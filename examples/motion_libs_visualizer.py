@@ -7,6 +7,7 @@
 
 from typing import Dict, List
 import argparse
+import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,6 +38,75 @@ parser.add_argument(
     choices=["g1", "rigv1", "h1_2", "smpl", "soma23"],
     default="g1",
     help="Robot to load (g1, rigv1, h1_2, smpl, or soma23)",
+)
+parser.add_argument(
+    "--motion-ids",
+    type=str,
+    default=None,
+    help="Load only a subset of motions from the pack: a half-open range '0:1000', "
+    "'1000:2000', or an explicit list '5,10,15'. The slice happens on CPU, so only "
+    "the selected motions reach the GPU -- use this to review a large pack (e.g. the "
+    "68k-clip PHUMA train set) a slice at a time instead of exhausting VRAM. "
+    "Indices are into the ORIGINAL pack; the on-screen 'motion i/N' counter is "
+    "relative to the loaded slice.",
+)
+parser.add_argument(
+    "--motion-ids-json",
+    type=str,
+    default=None,
+    help="JSON file of motion indices to load, as an alternative to --motion-ids. "
+    "Either a flat list ([0, 5, 12]) or an object of named lists "
+    '({"TURN": [...], "SKATE": [...]}); with an object, pass --json-key to pick one. '
+    "Indices are positions in the pack given by --motion_files. Use this to review one "
+    "defect class at a time from a quality-scan split.",
+)
+parser.add_argument(
+    "--json-key",
+    type=str,
+    default=None,
+    help="Which named list to use from --motion-ids-json when it holds an object.",
+)
+parser.add_argument(
+    "--json-slice",
+    type=str,
+    default=None,
+    help="Take a half-open slice of the --motion-ids-json list before loading, e.g. "
+    "'0:1000' then '1000:2000'. This slices POSITIONS IN THE LIST, not motion indices, "
+    "so it walks a defect class in GPU-sized batches. Out-of-range ends are clamped "
+    "(a list of 2699 with '2000:3000' yields the last 699).",
+)
+parser.add_argument(
+    "--force-caps-json",
+    type=str,
+    default=None,
+    help="Optional wrist force-cap sidecar (from precompute_motion_force_caps.py). "
+    "When given, an arrow is drawn at each wrist whose penetration through the wrist "
+    "reads as the load the clip is allowed to carry: at 0 N the arrow's tip touches "
+    "the wrist, at the cap its base sits on the wrist. Magnitude is cap * ramp(t), "
+    "with the ramp bracketed by the clip's carry_start_t/carry_end_t and scaled "
+    "by its force_scale (0 on ~40% of clips, i.e. unloaded). "
+    "Off by default. Requires --simulator isaaclab (arrow markers are IsaacLab-only).",
+)
+parser.add_argument(
+    "--force-arrow-len",
+    type=float,
+    default=0.3,
+    help="World length (m) of the wrist force arrow; the arrow keeps this length and "
+    "slides through the wrist, so penetration depth -- not length -- reads as force.",
+)
+parser.add_argument(
+    "--force-max-N",
+    type=float,
+    default=100.0,
+    help="Force at which an arrow fully penetrates (base on the wrist). Must match "
+    "MAX_CAP_N in the table that produced --force-caps-json, otherwise arrows are "
+    "scaled against the wrong reference.",
+)
+parser.add_argument(
+    "--force-ramp-sec",
+    type=float,
+    default=0.25,
+    help="Cosine ramp duration (s) at the pickup and at the place.",
 )
 parser.add_argument("--headless", action="store_true", help="Run in headless mode")
 parser.add_argument(
@@ -84,6 +154,71 @@ parser.add_argument(
 )
 args = parser.parse_args()
 
+
+def _resolve_motion_subset(args) -> str:
+    """Fold --motion-ids / --motion-ids-json into a single MotionLibConfig.motion_subset.
+
+    Kept as plain stdlib so it runs before the simulator import ordering dance below.
+    """
+    if args.motion_ids and args.motion_ids_json:
+        raise SystemExit("Pass only one of --motion-ids / --motion-ids-json.")
+    if args.motion_ids:
+        return args.motion_ids
+    if not args.motion_ids_json:
+        return None
+
+    import json as _json
+
+    with open(args.motion_ids_json) as f:
+        data = _json.load(f)
+    if isinstance(data, dict):
+        if args.json_key is None:
+            raise SystemExit(
+                f"{args.motion_ids_json} holds an object; pass --json-key to choose one "
+                f"of: {', '.join(sorted(data))}"
+            )
+        if args.json_key not in data:
+            raise SystemExit(
+                f"--json-key '{args.json_key}' not in {args.motion_ids_json}; "
+                f"available: {', '.join(sorted(data))}"
+            )
+        ids = data[args.json_key]
+    else:
+        ids = data
+    if not isinstance(ids, list) or not all(isinstance(i, int) for i in ids):
+        raise SystemExit(
+            f"{args.motion_ids_json} must hold a list of ints (or an object of them)."
+        )
+    if not ids:
+        raise SystemExit(f"{args.motion_ids_json} selects no motions.")
+
+    total = len(ids)
+    label = f"{args.motion_ids_json}" + (f" [{args.json_key}]" if args.json_key else "")
+    if args.json_slice:
+        start_str, sep, end_str = args.json_slice.partition(":")
+        if not sep:
+            raise SystemExit(f"--json-slice '{args.json_slice}' must be 'start:end'.")
+        start = int(start_str) if start_str.strip() else 0
+        end = int(end_str) if end_str.strip() else total
+        if end <= start:
+            raise SystemExit(f"--json-slice '{args.json_slice}' is empty.")
+        if start >= total:
+            raise SystemExit(
+                f"--json-slice '{args.json_slice}' starts past the end: the list has "
+                f"{total} entries."
+            )
+        ids = ids[start:end]
+        print(
+            f"--motion-ids-json: {label} has {total} motions; slice "
+            f"[{start}:{min(end, total)}] -> loading {len(ids)}"
+        )
+    else:
+        print(f"--motion-ids-json: loading all {total} motions from {label}")
+    return ",".join(str(i) for i in ids)
+
+
+args.motion_subset = _resolve_motion_subset(args)
+
 # Import simulator before torch - isaacgym/isaaclab must be imported before torch
 # This also returns AppLauncher if using isaaclab, None otherwise
 from protomotions.utils.simulator_imports import import_simulator_before_torch  # noqa: E402
@@ -113,6 +248,85 @@ from protomotions.components.scene_lib import (  # noqa: E402
     SubsetMethod,
 )
 import os  # noqa: E402
+
+
+# ----- Wrist force arrow -----
+# The sidecar's caps are a shoulder-torque proxy keyed to the REFERENCE motion,
+# so the arrow shown here is a function of the clip alone -- never of the
+# robot's achieved pose. Do not "improve" this by keying magnitude off the
+# simulated wrist: the cap relation is inverse (big load near the body, tiny
+# load extended), so a policy trained on a self-referential load would just
+# extend its arms to make the payload evaporate.
+FORCE_ARROW_MARKER_NAME = "wrist_force_markers"
+# The arrow asset (arrow_x.usd) is modelled along +X with its BASE at the prim
+# origin and unit length, so scale_x is the arrow's world length in metres.
+ARROW_ASSET_LEN_X = 1.0
+# Hidden markers go far below the ground: marker counts are fixed at build
+# time, so a zero-force arrow is moved away rather than removed.
+HIDDEN_Z = -100.0
+
+
+def load_force_caps(path: str, motion_subset: str, num_motions: int) -> Dict:
+    """Load the force-cap sidecar and re-key it to LOADED motion indices.
+
+    The sidecar is keyed by index into the ORIGINAL pack, while --motion-ids /
+    --motion-ids-json re-index the library. The mapping is recoverable and
+    unambiguous: MotionLib._load_subset_from_file keeps the parsed subset in
+    order, without sorting or de-duplicating, so loaded index j is original
+    index ids[j]. We rebuild ids with MotionLib's own parser rather than a
+    second implementation, so the two cannot disagree.
+    """
+    import json as _json
+
+    from protomotions.components.motion_lib import MotionLib
+
+    with open(path) as f:
+        caps = _json.load(f)
+
+    if motion_subset:
+        # parse_motion_subset needs the ORIGINAL pack size; the sidecar has one
+        # entry per original motion, so its length is exactly that.
+        ids = MotionLib.parse_motion_subset(motion_subset, len(caps))
+    else:
+        ids = list(range(num_motions))
+
+    remapped = {}
+    for loaded_idx, orig_idx in enumerate(ids):
+        entry = caps.get(str(orig_idx))
+        if entry is None:
+            raise SystemExit(
+                f"{path} has no entry for original motion index {orig_idx}. Is this "
+                f"sidecar built from the pack given by --motion_files?"
+            )
+        remapped[loaded_idx] = entry
+    print(
+        f"--force-caps-json: {path} -> {len(remapped)} caps mapped onto the loaded "
+        f"motions (original indices {ids[:3]}{'...' if len(ids) > 3 else ''})"
+    )
+    return remapped
+
+
+def force_ramp(t: float, pickup_t, place_t, ramp_sec: float) -> float:
+    """Reference-clock ramp: 0 -> cosine up -> 1 while carrying -> cosine down -> 0.
+
+    `t`, `pickup_t` and `place_t` are all seconds on the REFERENCE motion's own
+    clock. Full load spans the carry [pickup_t, place_t] that the sidecar
+    detected; the cosines only soften the two edges, rising into the pickup and
+    releasing after the place. Clips with no detected pickup never load.
+    """
+    if pickup_t is None or place_t is None:
+        return 0.0
+    # Never let the two ramps overlap on a short carry.
+    ramp = max(min(ramp_sec, (place_t - pickup_t) / 2.0), 1e-6)
+    if t <= pickup_t:
+        return 0.0
+    if t < pickup_t + ramp:
+        return 0.5 * (1.0 - math.cos(math.pi * (t - pickup_t) / ramp))
+    if t <= place_t:
+        return 1.0
+    if t < place_t + ramp:
+        return 0.5 * (1.0 + math.cos(math.pi * (t - place_t) / ramp))
+    return 0.0
 
 
 @dataclass
@@ -337,7 +551,10 @@ class MotionVisualizerSmoothness:
 
         self.motion_libs = [
             MotionLib(
-                config=MotionLibConfig(motion_file=str(motion_file)), device=self.device
+                config=MotionLibConfig(
+                    motion_file=str(motion_file), motion_subset=args.motion_subset
+                ),
+                device=self.device,
             )
             for motion_file in self.motion_files
         ]
@@ -391,6 +608,40 @@ class MotionVisualizerSmoothness:
         # Use torque control (zero torque) to maintain poses
         self.robot_cfg.control.control_type = ControlType.TORQUE
 
+        # Wrist force arrows (opt-in via --force-caps-json).
+        self.force_caps = None
+        self.force_pct_override = None  # None => follow the reference ramp
+        if args.force_caps_json:
+            if simulator_type != "isaaclab":
+                raise SystemExit(
+                    "--force-caps-json needs arrow markers, which only the isaaclab "
+                    f"simulator implements (got --simulator {simulator_type})."
+                )
+            if len(self.motion_files) > 1:
+                print(
+                    "WARNING: --force-caps-json holds caps for ONE pack, but "
+                    f"{len(self.motion_files)} motion files are loaded. The same cap "
+                    "is drawn in every env, which is only meaningful if the packs "
+                    "share motion indices."
+                )
+            self.force_caps = load_force_caps(
+                args.force_caps_json, args.motion_subset, self.total_motions
+            )
+            # Full penetration means --force-max-N, NOT the clip's own cap:
+            # normalizing per clip would make every clip's peak look identical
+            # and hide exactly what the table encodes (a 1 N clip should barely
+            # dent the wrist next to a 100 N one).
+            self.force_max_N = args.force_max_N
+            observed = max(
+                max(e["left_cap_N"], e["right_cap_N"]) for e in self.force_caps.values()
+            )
+            if observed > self.force_max_N:
+                print(
+                    f"WARNING: {args.force_caps_json} holds caps up to {observed:.1f} N, "
+                    f"above --force-max-N {self.force_max_N:.1f}; arrows will "
+                    "over-penetrate. Pass the table's MAX_CAP_N."
+                )
+
         # Create visualization markers
         self.viz_markers = self._create_visualization_markers()
 
@@ -399,11 +650,16 @@ class MotionVisualizerSmoothness:
 
         # Create custom key handlers for speed and threshold control
         custom_key_handlers = {
+            "R": self._request_next_motion,  # Key R: Switch to next motion
             "1": self.increase_speed,  # Key 1: Increase playback speed
             "2": self.decrease_speed,  # Key 2: Decrease playback speed
             "3": self.increase_smoothness_threshold,  # Key 3: Increase smoothness threshold
             "4": self.decrease_smoothness_threshold,  # Key 4: Decrease smoothness threshold
         }
+        if self.force_caps is not None:
+            # 1-4 are taken by speed and the smoothness threshold; 5/6 are free.
+            custom_key_handlers["5"] = self.increase_force_pct
+            custom_key_handlers["6"] = self.decrease_force_pct
 
         # Create checkerboard ground for visualization
         print("Creating checkerboard ground plane...")
@@ -446,6 +702,11 @@ class MotionVisualizerSmoothness:
         print("  '2' - Decrease playback speed by 150% (NumPad 2 for IsaacLab)")
         print("  '3' - Increase smoothness threshold by 1.5x (NumPad 3 for IsaacLab)")
         print("  '4' - Decrease smoothness threshold by 1.5x (NumPad 4 for IsaacLab)")
+        if self.force_caps is not None:
+            print("  Cyan arrows - Wrist force; tip at wrist = 0 N, base at wrist = "
+                  f"{self.force_max_N:.0f} N")
+            print("  '5' - Force override +10% of cap (NumPad 5 for IsaacLab)")
+            print("  '6' - Force override -10% of cap; below 0% restores the ramp")
         print("Motion will play automatically and loop")
 
         self.simulator.user_requested_reset = True
@@ -513,6 +774,30 @@ class MotionVisualizerSmoothness:
             color=(0.8, 0.0, 0.8),  # purple
             markers=contact_marker_configs,
         )
+
+        if self.force_caps is not None:
+            # One arrow per wrist; the count is fixed here, so zero-force arrows
+            # are hidden by translation rather than by dropping them.
+            self.force_wrist_bodies = ["left_wrist_yaw_link", "right_wrist_yaw_link"]
+            missing = [
+                b
+                for b in self.force_wrist_bodies
+                if b not in self.kinematic_info.body_names
+            ]
+            if missing:
+                raise SystemExit(
+                    f"--force-caps-json expects wrist bodies {missing} on robot "
+                    f"'{self.robot_name}'; the force table is H1-2 specific."
+                )
+            self.viz_markers[FORCE_ARROW_MARKER_NAME] = VisualizationMarkerConfig(
+                type="arrow",
+                color=(0.0, 0.6, 1.0),  # cyan, distinct from the sphere groups
+                markers=[MarkerConfig(size="regular") for _ in self.force_wrist_bodies],
+            )
+
+    def _request_next_motion(self):
+        """Ask the run loop to advance to the next motion."""
+        self.simulator.user_requested_reset = True
 
     def _switch_to_next_motion(self):
         """Switch to the next motion in the dataset"""
@@ -763,6 +1048,116 @@ class MotionVisualizerSmoothness:
             )
         }
 
+    def _current_force_fractions(self):
+        """Per-hand (left, right) force in N for the current REFERENCE frame.
+
+        The clock is the reference motion's, and the cap is the clip's: nothing
+        here reads the robot's achieved state. See FORCE_ARROW_MARKER_NAME.
+        """
+        entry = self.force_caps[self.current_motion_idx]
+        t = min(self.current_frame, self.current_motion_length - 1) / FPS
+        if self.force_pct_override is not None:
+            pct = self.force_pct_override / 100.0
+        else:
+            # carry_* is the SCHEDULE; pickup_t/place_t are still emitted by
+            # the sidecar for reference but no longer drive it (detection fires
+            # on ~1% of clips and cannot see a tabletop grasp at all, so it
+            # would leave the payload DR unexercised on the whole corpus).
+            pct = force_ramp(t, entry.get("carry_start_t"),
+                             entry.get("carry_end_t"), args.force_ramp_sec)
+            pct *= float(entry.get("force_scale", 1.0))
+        return [entry["left_cap_N"] * pct, entry["right_cap_N"] * pct]
+
+    def _update_force_arrows(self) -> Dict[str, MarkerState]:
+        """Arrow whose penetration through the wrist reads as wrist load.
+
+        Geometry (arrow points straight DOWN, along world -z): the arrow keeps a
+        constant length L and SLIDES through the wrist as force rises. At 0 N its
+        tip just touches the wrist; at --force-max-N its base sits on the wrist
+        and the whole shaft has passed through. So with f = force / force_max_N,
+        the arrow's base sits at wrist_z + (1 - f) * L and the fraction of shaft
+        below the wrist is exactly f.
+
+        -z is chosen because this table caps a SHOULDER-TORQUE proxy for carrying
+        a payload: the load a carried object applies at the wrist is its weight,
+        which points down in the world frame regardless of how the arm is posed.
+        A wrist-frame or arm-aligned direction would imply a specific grasp the
+        table does not model.
+        """
+        L = args.force_arrow_len
+        idx_in_common = [
+            self.simulator._body_names.index(b) for b in self.force_wrist_bodies
+        ]
+        wrist_pos = (
+            self.simulator.get_bodies_state()
+            .rigid_body_pos[:, idx_in_common, :]
+            .detach()
+            .clone()
+        )  # [num_envs, 2, 3]
+
+        forces = torch.tensor(
+            self._current_force_fractions(), device=self.device, dtype=wrist_pos.dtype
+        )  # [2]
+        frac = (forces / self.force_max_N).clamp(0.0, 1.0).view(1, -1, 1)
+
+        translations = wrist_pos.clone()
+        translations[..., 2:3] = wrist_pos[..., 2:3] + (1.0 - frac) * L
+
+        # Zero-force arrows are moved away, not removed: the marker count is
+        # fixed at build time (same idiom as _update_contact_markers).
+        hidden = torch.tensor(
+            [0.0, 0.0, HIDDEN_Z], device=self.device, dtype=wrist_pos.dtype
+        ).view(1, 1, 3)
+        visible = (forces > 0).view(1, -1, 1).expand_as(translations)
+        translations = torch.where(visible, translations, hidden)
+
+        # arrow_x.usd points +X; rotate +X onto -Z with +90 deg about Y.
+        # MarkerState.orientation uses the COMMON convention (xyzw) for every
+        # backend: RecordingMixin._update_markers (record.py) converts
+        # xyzw -> wxyz at the simulator boundary when config.w_last is False
+        # (IsaacLab). Emitting wxyz here would get double-converted and flip
+        # the arrow to point +Z (up) instead of -Z.
+        half = math.pi / 4.0
+        quat = [0.0, math.sin(half), 0.0, math.cos(half)]  # xyzw (common)
+        orientations = torch.tensor(
+            quat, device=self.device, dtype=wrist_pos.dtype
+        ).view(1, 1, 4).expand(self.num_envs, len(idx_in_common), 4).contiguous()
+
+        # Per-frame scale so the shaft is exactly L metres long in the world,
+        # independent of the marker-size defaults baked in at instantiation.
+        scales = torch.tensor(
+            [L / ARROW_ASSET_LEN_X, 0.2 * L, 0.2 * L],
+            device=self.device,
+            dtype=wrist_pos.dtype,
+        ).view(1, 1, 3).expand(self.num_envs, len(idx_in_common), 3).contiguous()
+
+        return {
+            FORCE_ARROW_MARKER_NAME: MarkerState(
+                translation=translations, orientation=orientations, scale=scales
+            )
+        }
+
+    def increase_force_pct(self):
+        """Key 5: sweep the force percentage up by hand, for inspection."""
+        base = 0.0 if self.force_pct_override is None else self.force_pct_override
+        self.force_pct_override = min(base + 10.0, 100.0)
+        print(
+            f"Force override: {self.force_pct_override:.0f}% of cap "
+            f"(manual; press 6 below 0% to return to the reference ramp)"
+        )
+
+    def decrease_force_pct(self):
+        """Key 6: sweep the force percentage down; below 0% restores the ramp."""
+        if self.force_pct_override is None:
+            print("Force already following the reference ramp (press 5 to override)")
+            return
+        self.force_pct_override -= 10.0
+        if self.force_pct_override < 0.0:
+            self.force_pct_override = None
+            print("Force override cleared: following the reference pickup/place ramp")
+        else:
+            print(f"Force override: {self.force_pct_override:.0f}% of cap (manual)")
+
     def _set_robot_pose(self, dof_pos, rigid_body_pos=None, rigid_body_rot=None):
         """Set the robot to the specified pose"""
         # for visualize, so we don't need to set the velocities, so just put to zero so it does not move before we reset pose
@@ -824,6 +1219,10 @@ class MotionVisualizerSmoothness:
         # Add/update contact markers
         contact_marker_states = self._update_contact_markers()
         marker_states.update(contact_marker_states)
+
+        # Add/update wrist force arrows (only when --force-caps-json was given)
+        if self.force_caps is not None:
+            marker_states.update(self._update_force_arrows())
 
         return marker_states
 
