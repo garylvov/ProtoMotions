@@ -149,7 +149,14 @@ class IsaacLabSimulator(Simulator):
 
         if self._visualization_markers:
             self._build_markers(self._visualization_markers)
-        self._sim.reset()
+        # Serialize the PhysX warm-start (SimulationContext.reset ->
+        # isaacsim SimulationManager.initialize_physics) across ranks
+        # co-located on one GPU under MPS -- no-op unless
+        # PM_STACK_RANKS_ON_GPU0=1 (see kit_init_lock docstring).
+        from protomotions.utils.kit_init_lock import kit_init_lock
+
+        with kit_init_lock("SimulationContext.reset/PhysX warm-start"):
+            self._sim.reset()
 
     def _get_scene_cfg(self) -> SceneCfg:
         """

@@ -806,7 +806,8 @@ def main():
     simulator_extra_params = {}
     if args.simulator == "isaaclab":
         app_launcher_flags = {"headless": args.headless, "device": str(fabric.device)}
-        if fabric.world_size > 1:
+        _stacked_on_one_gpu = os.environ.get("PM_STACK_RANKS_ON_GPU0") == "1"
+        if fabric.world_size > 1 and not _stacked_on_one_gpu:
             # This is needed when running with SLURM.
             # When launching multi-GPU/node jobs without SLURM, or differently, maybe this needs to be adapted accordingly.
             app_launcher_flags["distributed"] = True
@@ -821,7 +822,55 @@ def main():
             _stagger = float(os.environ.get("NFS_STAGGER_SEC", "0") or "0")
             if _stagger > 0:
                 time.sleep(fabric.local_rank * _stagger)
-        app_launcher = AppLauncher(app_launcher_flags)
+        elif fabric.world_size > 1 and _stacked_on_one_gpu:
+            # MPS-stacked mode (PM_STACK_RANKS_ON_GPU0=1): every rank of this
+            # gloo group shares ONE physical GPU behind one MPS daemon, and the
+            # process is masked to exactly one visible device
+            # (CUDA_VISIBLE_DEVICES=0 within the daemon set); fabric pins every
+            # rank's device to cuda:0. AppLauncher's distributed mode must NOT
+            # be used here: it overrides device/physics_gpu/active_gpu to
+            # cuda:<LOCAL_RANK> (isaaclab app_launcher.py _resolve_device_
+            # settings), so co-located rank>=1 would point PhysX at a GPU that
+            # does not exist behind the mask -> isaacsim simulation_manager
+            # initialize_physics busy-waits forever while rank0 blocks in
+            # fabric.all_gather (the 2026-07-18 8x2x8192 PhysX deadlock).
+            # Instead: plain single-GPU boot on the one visible device, with
+            # multi-GPU rendering off, plus the same CPU-thread caps that
+            # distributed mode would have applied (from OMP_NUM_THREADS, which
+            # the stacked launcher sets per-rank-count).
+            app_launcher_flags["device"] = "cuda:0"
+            app_launcher_flags["multi_gpu"] = False
+            os.environ["RANK"] = str(fabric.global_rank)
+            # Per-rank scratch isolation: the launcher's TMPDIR/WARP_CACHE_PATH
+            # are per-GPU, but co-located ranks would share them (Kit temp
+            # files, warp kernel-cache builds racing on the same paths). Give
+            # each rank its own subdir before Kit boots.
+            import tempfile
+
+            _rsub = f"r{fabric.local_rank}"
+            _tmp = os.path.join(
+                os.environ.get("TMPDIR", tempfile.gettempdir()), _rsub
+            )
+            os.makedirs(_tmp, exist_ok=True)
+            os.environ["TMPDIR"] = _tmp
+            tempfile.tempdir = None  # drop cached tempdir so the new TMPDIR wins
+            if os.environ.get("WARP_CACHE_PATH"):
+                _wc = os.path.join(os.environ["WARP_CACHE_PATH"], _rsub)
+                os.makedirs(_wc, exist_ok=True)
+                os.environ["WARP_CACHE_PATH"] = _wc
+            _tcap = os.environ.get("OMP_NUM_THREADS")
+            if _tcap:
+                os.environ.setdefault("PXR_WORK_THREAD_LIMIT", _tcap)
+                sys.argv.append(
+                    f"--/plugins/carb.tasking.plugin/threadCount={_tcap}"
+                )
+            _stagger = float(os.environ.get("NFS_STAGGER_SEC", "0") or "0")
+            if _stagger > 0:
+                time.sleep(fabric.local_rank * _stagger)
+        from protomotions.utils.kit_init_lock import kit_init_lock
+
+        with kit_init_lock("AppLauncher/Kit boot"):
+            app_launcher = AppLauncher(app_launcher_flags)
         simulator_extra_params["simulation_app"] = app_launcher.app
 
         # Suppress verbose PhysX/IsaacLab warnings that flood stdout.
