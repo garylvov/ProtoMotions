@@ -77,6 +77,29 @@ def _default_ddp_strategy() -> fabric.strategies.DDPStrategy:
     # so disabling it removes the offending collective with no behavioural cost.
     # Env-overridable to re-enable if a future model needs buffer sync.
     broadcast_buffers = os.environ.get("DDP_BROADCAST_BUFFERS", "0") == "1"
+    # Single-GPU multi-rank stacking hack (imprint issue #92, "protomotions
+    # single-GPU-DDP hack"): NCCL's bootstrap refuses two ranks sharing one
+    # physical GPU inside the same communicator ("Duplicate GPU detected"),
+    # even under MPS. Gated opt-in: when PM_STACK_RANKS_ON_GPU0=1, pin all
+    # PM_STACK_NRANKS ranks' parallel_devices to cuda:0 (already masked to
+    # the intended physical GPU via CUDA_VISIBLE_DEVICES at the process
+    # level) and switch the process-group backend to gloo, which has no such
+    # same-device restriction. Verified in #92: 2 stacked ranks + MPS gave
+    # ~2.3x aggregate throughput over a single monolithic rank at equal total
+    # envs (sim-bound Newton workload parallelizes across ranks while MPS
+    # overlaps their GPU kernels). Kept off by default (still NCCL).
+    if os.environ.get("PM_STACK_RANKS_ON_GPU0") == "1":
+        import torch
+
+        n = int(os.environ.get("PM_STACK_NRANKS", "2"))
+        return fabric.strategies.DDPStrategy(
+            parallel_devices=[torch.device("cuda", 0)] * n,
+            process_group_backend="gloo",
+            timeout=timedelta(seconds=timeout_sec),
+            find_unused_parameters=find_unused,
+            static_graph=static_graph,
+            broadcast_buffers=broadcast_buffers,
+        )
     return fabric.strategies.DDPStrategy(
         timeout=timedelta(seconds=timeout_sec),
         find_unused_parameters=find_unused,
@@ -122,6 +145,16 @@ class FabricConfig:
     )
 
     def __post_init__(self):
+        # Single-GPU rank-stacking hack (companion to _default_ddp_strategy's
+        # PM_STACK_RANKS_ON_GPU0 branch): the stacked DDPStrategy already pins
+        # world_size via parallel_devices=[cuda:0]*n, but Lightning's connector
+        # still calls CUDAAccelerator.parse_devices(devices) on the int `devices`
+        # (= args.ngpu = n) and rejects gpu-ids [0..n-1] against the single
+        # visible GPU ("You requested gpu: [0..n-1] But your machine only has:
+        # [0]"). Coerce devices to "auto" so parse_devices resolves to the 1
+        # visible GPU while the strategy's parallel_devices keeps world_size=n.
+        if os.environ.get("PM_STACK_RANKS_ON_GPU0") == "1":
+            self.devices = "auto"
         if self.strategy is not None and (
             isinstance(self.strategy, dict) or isinstance(self.strategy, DictConfig)
         ):

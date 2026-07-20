@@ -71,6 +71,52 @@ _SHARD_FRAME_FIELDS = (
 _SHARD_MOTION_FIELDS = ("motion_lengths", "motion_dt", "motion_num_frames")
 
 
+# --- Optional fp16 quantization of the big per-frame pose tensors -----------
+#
+# PM_MOTIONLIB_FP16=1 (opt-in, default off): store the static per-frame pose
+# tensors (positions, rotations, velocities) as fp16 GPU-resident, roughly
+# halving their VRAM footprint (~3 GiB on a 6 GiB pack like amass_good.pt).
+# Deliberately excludes everything timing/indexing/cumulative: motion_dt,
+# length_starts, motion_num_frames, motion_lengths, motion_weights, contacts,
+# lrs, goal_states are never touched. Quaternions (grs) are renormalized
+# immediately after the cast since fp16 rounding can nudge ||q|| off 1.0;
+# get_motion_state_exact_frame upcasts back to fp32 on read so downstream
+# interpolation/exp-map math is unaffected.
+_MOTIONLIB_FP16_ENV = "PM_MOTIONLIB_FP16"
+_FP16_QUANTIZE_FIELDS = ("gts", "grs", "gvs", "gavs", "dps", "dvs")
+_FP16_QUAT_FIELDS = ("grs",)
+
+
+def _motionlib_fp16_enabled() -> bool:
+    return os.environ.get(_MOTIONLIB_FP16_ENV, "0") == "1"
+
+
+def _quantize_motion_tensors_fp16(motion_lib) -> None:
+    """In-place fp16 downcast of the big static per-frame pose tensors.
+
+    Only touches fields in _FP16_QUANTIZE_FIELDS (positions/rotations/
+    velocities); quaternion fields are renormalized post-cast. No-op unless
+    PM_MOTIONLIB_FP16=1.
+    """
+    if not _motionlib_fp16_enabled():
+        return
+    for lib_field in _FP16_QUANTIZE_FIELDS:
+        tensor = getattr(motion_lib, lib_field, None)
+        if tensor is None or not torch.is_tensor(tensor):
+            continue
+        if tensor.dtype == torch.float16:
+            continue  # already quantized (e.g. re-entrant load path)
+        tensor = tensor.to(torch.float16)
+        if lib_field in _FP16_QUAT_FIELDS:
+            norm = tensor.float().norm(dim=-1, keepdim=True).clamp_min(1e-8)
+            tensor = (tensor.float() / norm).to(torch.float16)
+        setattr(motion_lib, lib_field, tensor)
+    print(
+        f"[motionlib-fp16] quantized {_FP16_QUANTIZE_FIELDS} to fp16 "
+        f"(quat fields {_FP16_QUAT_FIELDS} renormalized)"
+    )
+
+
 # --- Smoothed-contacts disk cache -------------------------------------------
 #
 # MotionLib.smooth_contacts() runs a per-motion conv1d over the (possibly
@@ -844,7 +890,12 @@ class MotionLib:
         for lib_field, motion_attr in _motion_field_mapping.items():
             field_data = getattr(self, lib_field)
             if field_data is not None:
-                motion_data[motion_attr] = field_data[fl].clone()
+                sampled = field_data[fl].clone()
+                if sampled.dtype == torch.float16:
+                    # PM_MOTIONLIB_FP16 storage: upcast to fp32 for downstream
+                    # interpolation/exp-map math (never keep fp16 past sampling).
+                    sampled = sampled.float()
+                motion_data[motion_attr] = sampled
 
         if self.lrs is not None:
             local_rigid_body_rot = self.lrs[fl].clone()
@@ -983,6 +1034,8 @@ class MotionLib:
 
         self.motion_files = tuple(motion_files)  # for saving to packed pt file
 
+        _quantize_motion_tensors_fp16(self)
+
         num_motions = len(motions)
         total_len = sum(motion_lengths)
         print(
@@ -1109,6 +1162,8 @@ class MotionLib:
 
         for field in loaded_data:
             setattr(self, field, loaded_data[field])
+
+        _quantize_motion_tensors_fp16(self)
 
         if (
             self.contacts is not None
@@ -1257,6 +1312,8 @@ class MotionLib:
         self.length_starts = lengths_shifted.cumsum(0)
 
         del loaded_data, frame_idx
+
+        _quantize_motion_tensors_fp16(self)
 
         if (
             self.contacts is not None

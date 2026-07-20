@@ -142,7 +142,17 @@ class NewtonSimulator(Simulator):
         self.graph = None
         self.use_cuda_graph = False
 
-        if wp.get_device().is_cuda and wp.is_mempool_enabled(wp.get_device()):
+        # PM_DISABLE_CUDA_GRAPH=1 (opt-in): skip warp CUDA-graph capture. At
+        # 4 ranks x 8192 envs per 96 GB GPU the steady-state footprint fits
+        # (~92.6 GiB) but the capturing rank transiently needs ~3 GiB extra in
+        # wp_cuda_graph_create_exec, and concurrent captures OOM the device
+        # (mps vrank sweep, 2026-07-18). Costs sim speed; throughput numbers
+        # taken with this set are NOT comparable to graph-enabled runs.
+        if (
+            wp.get_device().is_cuda
+            and wp.is_mempool_enabled(wp.get_device())
+            and os.environ.get("PM_DISABLE_CUDA_GRAPH") != "1"
+        ):
             print(f"[INFO] Using CUDA graph ({self.control_type.name})")
             self.use_cuda_graph = True
             zeros = torch.zeros(
@@ -162,9 +172,34 @@ class NewtonSimulator(Simulator):
             else:
                 self._update_pd_targets(zeros.squeeze(1))
 
-            with wp.ScopedCapture() as capture:
-                self._simulate()
-            self.graph = capture.graph
+            # PM_SERIALIZE_GRAPH_CAPTURE=1 (opt-in): serialize CUDA-graph
+            # capture across the MPS-stacked ranks sharing this physical GPU.
+            # Capture transiently needs ~3 GiB above steady state
+            # (wp_cuda_graph_create_exec instantiation pool); with 3-4 ranks
+            # capturing concurrently the transients stack and OOM the device
+            # even though steady state fits (mps vrank sweep 2026-07-18, runs
+            # e/f/h). An exclusive flock keyed by the per-GPU MPS pipe dir
+            # lets one rank capture at a time.
+            _lockf = None
+            if os.environ.get("PM_SERIALIZE_GRAPH_CAPTURE") == "1":
+                import fcntl
+
+                _pipe = os.environ.get("CUDA_MPS_PIPE_DIRECTORY", "nogpu")
+                _lock_path = "/tmp/pm_graphcap_%s.lock" % _pipe.replace("/", "_")
+                _lockf = open(_lock_path, "w")
+                fcntl.flock(_lockf, fcntl.LOCK_EX)
+                torch.cuda.synchronize()
+            try:
+                with wp.ScopedCapture() as capture:
+                    self._simulate()
+                self.graph = capture.graph
+            finally:
+                if _lockf is not None:
+                    torch.cuda.synchronize()
+                    import fcntl
+
+                    fcntl.flock(_lockf, fcntl.LOCK_UN)
+                    _lockf.close()
         else:
             print(f"[INFO] {self.control_type.name} mode (no CUDA graph)")
 
@@ -552,13 +587,13 @@ class NewtonSimulator(Simulator):
 
                     # Vectorized assignment across all envs at once
                     if static_friction is not None:
-                        friction_values = static_friction[bucket_ids, idx]
+                        friction_values = static_friction.to(bucket_ids.device)[bucket_ids, idx]
                         current_friction[:, 0, local_shape_indices] = (
                             friction_values.unsqueeze(1)
                         )
 
                     if restitution is not None:
-                        restitution_values = restitution[bucket_ids, idx]
+                        restitution_values = restitution.to(bucket_ids.device)[bucket_ids, idx]
                         current_restitution[:, 0, local_shape_indices] = (
                             restitution_values.unsqueeze(1)
                         )
