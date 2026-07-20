@@ -799,6 +799,17 @@ def main():
     fabric: Fabric = Fabric(**fabric_config.as_kwargs())
     fabric.launch()
 
+    # PM_CUDA_MEM_FRACTION (env-gated, prod-safety cap for co-located forks):
+    # hard-cap THIS process's share of the CUDA device fabric pinned it to
+    # (fabric.device), BEFORE any heavy sim/env allocation, so a fork that would
+    # exceed its VRAM budget OOMs itself instead of a co-located production rank
+    # sharing the GPU. No-op unless PM_CUDA_MEM_FRACTION is set.
+    _pm_mem_frac = os.environ.get("PM_CUDA_MEM_FRACTION")
+    if _pm_mem_frac and fabric.device.type == "cuda":
+        torch.cuda.set_per_process_memory_fraction(
+            float(_pm_mem_frac), device=fabric.device
+        )
+
     # ===================================================================
     # 4. Environment Setup: IsaacLab, Seeding
     # ===================================================================

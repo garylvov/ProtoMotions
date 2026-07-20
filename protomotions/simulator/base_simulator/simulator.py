@@ -23,6 +23,7 @@ Key Features:
 from abc import ABC, abstractmethod
 import logging
 import math
+import os
 
 from typing import Dict, List, Optional, Any, Tuple, Callable
 
@@ -626,7 +627,51 @@ class Simulator(RecordingMixin, ABC):
         ref_scale = getattr(self, "_wrench_ref_scale", None)
         if ref_scale is not None:
             total_f = total_f * ref_scale[..., None]
+        # --- Env-gated DR overrides (all no-ops unless the env var is set) ---
+        # PM_DR_ENV_FRACTION: restrict the SUMMED wrench+bag force/torque to a
+        # random per-env subset (persistent mask, resampled per reset in
+        # _reset_wrench_randomization); zero the unmasked (~1-fraction) envs.
+        mask = self._wrench_dr_env_mask()
+        if mask is not None:
+            keep = mask[:, None, None]
+            total_f = total_f * keep
+            total_t = total_t * keep
+        # PM_DR_FORCE_SCALE: runtime constant magnitude multiplier on the
+        # applied wrench+bag force/torque (distinct from the per-class epoch
+        # ramp); 0.2 = anneal to 20% force.
+        fscale = self._wrench_dr_force_scale()
+        if fscale is not None:
+            total_f = total_f * fscale
+            total_t = total_t * fscale
         return total_f, total_t
+
+    def _wrench_dr_force_scale(self):
+        """PM_DR_FORCE_SCALE: constant multiplier on the applied wrench+bag
+        force/torque. Returns None (a full no-op) when the env var is unset,
+        so the production run's applied forces are byte-for-byte unchanged.
+        Parsed once and cached."""
+        if not hasattr(self, "_pm_dr_force_scale"):
+            _v = os.environ.get("PM_DR_FORCE_SCALE")
+            self._pm_dr_force_scale = float(_v) if _v else None
+        return self._pm_dr_force_scale
+
+    def _wrench_dr_env_mask(self):
+        """PM_DR_ENV_FRACTION: persistent per-env boolean mask selecting the
+        fraction of envs that receive wrench+bag forces (resampled per reset).
+        Returns None (all envs forced -> current behavior) when the env var is
+        unset. Motor/friction/mass DR are unaffected. Parsed once and cached."""
+        if not hasattr(self, "_pm_dr_env_fraction"):
+            _v = os.environ.get("PM_DR_ENV_FRACTION")
+            self._pm_dr_env_fraction = float(_v) if _v else None
+            self._pm_dr_env_mask = None
+        if self._pm_dr_env_fraction is None:
+            return None
+        if self._pm_dr_env_mask is None:
+            self._pm_dr_env_mask = (
+                torch.rand(self.num_envs, device=self.device)
+                < self._pm_dr_env_fraction
+            )
+        return self._pm_dr_env_mask
 
     def set_wrench_reference_scale_from_reference(
         self,
@@ -956,6 +1001,15 @@ class Simulator(RecordingMixin, ABC):
         """Clear active wrenches (all classes) and reschedule for reset envs."""
         if getattr(self, "_push_grace_steps", 0) > 0 and len(env_ids) > 0:
             self._push_grace_left[env_ids] = 0
+        # PM_DR_ENV_FRACTION (env-gated): resample the persistent per-env force
+        # mask for the reset envs so cohort membership churns per episode.
+        # No-op unless PM_DR_ENV_FRACTION is set (the mask attr stays None).
+        pm_mask = getattr(self, "_pm_dr_env_mask", None)
+        if pm_mask is not None and len(env_ids) > 0:
+            pm_mask[env_ids] = (
+                torch.rand(len(env_ids), device=self.device)
+                < self._pm_dr_env_fraction
+            )
         if not self._wrench_enabled or len(env_ids) == 0:
             return
         need_apply = False

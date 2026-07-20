@@ -21,6 +21,7 @@ from protomotions.simulator.newton.config import NewtonSimParams
 from protomotions.components.pose_lib import ControlInfo
 from typing import List, Dict
 from dataclasses import dataclass, field
+import os
 
 
 # Armature constants for different joint types based on torque capabilities
@@ -43,6 +44,19 @@ DAMPING_300 = 2.0 * DAMPING_RATIO * ARMATURE_300 * NATURAL_FREQ
 DAMPING_200 = 2.0 * DAMPING_RATIO * ARMATURE_200 * NATURAL_FREQ
 DAMPING_60 = 2.0 * DAMPING_RATIO * ARMATURE_60 * NATURAL_FREQ
 DAMPING_40 = 2.0 * DAMPING_RATIO * ARMATURE_40 * NATURAL_FREQ
+
+# Env-gated ARM-joint PD-gain / armature overrides (shoulder pitch/roll/yaw, elbow,
+# wrist roll/pitch/yaw; left+right). Mirrors the PM_TRAINING_MAX_STEPS env-gate pattern
+# in agents/base_agent/agent.py: complete no-op when unset. These are scoped to the ARM
+# ControlInfo entries ONLY -- the leg/torso/ankle entries keep the raw module constants
+# (note ankle_roll uses `2 * STIFFNESS_40` etc., so we must NOT mutate the constants).
+# LIMITATION: a single scalar is applied uniformly to every arm joint (no per-joint JSON).
+_ARM_KP = os.environ.get("PM_ARM_KP")
+_ARM_KD = os.environ.get("PM_ARM_KD")
+_ARM_ARMATURE = os.environ.get("PM_ARM_ARMATURE")
+ARM_STIFFNESS = float(_ARM_KP) if _ARM_KP else STIFFNESS_40
+ARM_DAMPING = float(_ARM_KD) if _ARM_KD else DAMPING_40
+ARM_ARMATURE = float(_ARM_ARMATURE) if _ARM_ARMATURE else ARMATURE_40
 
 
 @dataclass
@@ -132,35 +146,35 @@ class H1_2RobotConfig(RobotConfig):
                 ),
                 # Shoulder pitch/roll joints (40 N⋅m, 9 rad/s)
                 ".*_shoulder_(pitch|roll)_joint": ControlInfo(
-                    stiffness=STIFFNESS_40,
-                    damping=DAMPING_40,
+                    stiffness=ARM_STIFFNESS,
+                    damping=ARM_DAMPING,
                     effort_limit=40,
                     velocity_limit=50,
-                    armature=ARMATURE_40,
+                    armature=ARM_ARMATURE,
                 ),
                 # Shoulder yaw joints (18 N⋅m, 20 rad/s)
                 ".*_shoulder_yaw_joint": ControlInfo(
-                    stiffness=STIFFNESS_40,
-                    damping=DAMPING_40,
+                    stiffness=ARM_STIFFNESS,
+                    damping=ARM_DAMPING,
                     effort_limit=18,
                     velocity_limit=50,
-                    armature=ARMATURE_40,
+                    armature=ARM_ARMATURE,
                 ),
                 # Elbow joints (18 N⋅m, 20 rad/s)
                 ".*_elbow_joint": ControlInfo(
-                    stiffness=STIFFNESS_40,
-                    damping=DAMPING_40,
+                    stiffness=ARM_STIFFNESS,
+                    damping=ARM_DAMPING,
                     effort_limit=18,
                     velocity_limit=50,
-                    armature=ARMATURE_40,
+                    armature=ARM_ARMATURE,
                 ),
                 # Wrist joints (19 N⋅m, 31.4 rad/s)
                 ".*_wrist_(roll|pitch|yaw)_joint": ControlInfo(
-                    stiffness=STIFFNESS_40,
-                    damping=DAMPING_40,
+                    stiffness=ARM_STIFFNESS,
+                    damping=ARM_DAMPING,
                     effort_limit=19,
                     velocity_limit=50,
-                    armature=ARMATURE_40,
+                    armature=ARM_ARMATURE,
                 ),
             },
         )
