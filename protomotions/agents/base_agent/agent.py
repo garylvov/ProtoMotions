@@ -123,8 +123,15 @@ class BaseAgent:
         all_ne = self.fabric.all_gather(local_ne)  # [world_size] or [world_size, 1]
         self._total_envs: int = int(all_ne.sum().item())
 
+        # Job-runner prod hotfix (2026-07-19): PM_TRAINING_MAX_STEPS env raises the
+        # training budget WITHOUT editing the frozen resolved_configs.pt (resume ignores
+        # CLI --overrides). The launcher's original 2e9 was a miscalculation (== only
+        # 3814 epochs at total_envs=16384*num_steps=32); the run completed there. This
+        # lets a resume continue the intended long teacher run with full state preserved.
+        _tms_override = os.environ.get("PM_TRAINING_MAX_STEPS")
+        _tms = int(_tms_override) if _tms_override else self.config.training_max_steps
         self.max_epochs: int = (
-            self.config.training_max_steps // self._total_envs // self.num_steps
+            _tms // self._total_envs // self.num_steps
         )
 
         # Validate max_num_batches matches across all ranks (prevents DDP deadlock).
@@ -301,6 +308,15 @@ class BaseAgent:
         )
 
     def _evaluation_due_this_epoch(self) -> bool:
+        # Job-runner prod hotfix (2026-07-18): PM_DISABLE_INTRAIN_EVAL=1 skips ALL
+        # in-training eval. Needed because the 71,688-clip good_corpus eval both
+        # OOMs (GPU 13.94 GiB / host ~91 GiB per rank) and, under EVAL_SUBSET_N,
+        # hits a size desync (buffers capped to subset, _build_eval_batches emits
+        # full-corpus motion_ids -> device-side index-out-of-bounds assert). Eval
+        # is instead run OFFLINE from the periodic epoch_*.ckpt. Env-gated: no
+        # effect unless explicitly set.
+        if os.environ.get("PM_DISABLE_INTRAIN_EVAL", "0") == "1":
+            return False
         cadence_due = (
             self.evaluator is not None
             and self.evaluator.config.eval_metrics_every is not None
