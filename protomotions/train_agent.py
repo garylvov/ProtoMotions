@@ -645,6 +645,65 @@ def main():
         env_config = resolved_configs["env"]
         agent_config = resolved_configs["agent"]
 
+        # PM_WRIST_*_WEIGHT / _SIGMA (env-gated, resume-safe): resume freezes
+        # reward config from the pickle, so the experiment file's env gates
+        # never run here. Re-apply them on the loaded components so reward
+        # ladders can ride a resume without a warm start.
+        _rc = getattr(env_config, "reward_components", None) or {}
+        for _comp, _wvar, _svar in (
+            ("wrist_relative_body_pos", "PM_WRIST_POS_WEIGHT", "PM_WRIST_POS_SIGMA"),
+            ("wrist_relative_body_ori", "PM_WRIST_ORI_WEIGHT", "PM_WRIST_ORI_SIGMA"),
+        ):
+            if _comp not in _rc:
+                continue
+            _sp = _rc[_comp].static_params
+            for _var, _key in ((_wvar, "weight"), (_svar, "sigma")):
+                _val = os.environ.get(_var)
+                if _val:
+                    log.info(
+                        f"RESUME override {_comp}.{_key}: "
+                        f"{_sp.get(_key)} -> {float(_val)} (from {_var})"
+                    )
+                    _sp[_key] = float(_val)
+
+        # PM_ARM_{KP,KD,EFFORT}[_SHOULDER|_ELBOW|_WRIST] (env-gated, resume-safe):
+        # robot_config is likewise frozen from the pickle, so the module-level
+        # PM_ARM_KP gate in robot_configs/h1_2.py never fires on resume.
+        # Per-group overrides beat the uniform PM_ARM_KP/KD when both are set.
+        _oci = getattr(getattr(robot_config, "control", None), "override_control_info", None) or {}
+        _arm_groups = {
+            "SHOULDER": [".*_shoulder_(pitch|roll)_joint", ".*_shoulder_yaw_joint"],
+            "ELBOW": [".*_elbow_joint"],
+            "WRIST": [".*_wrist_(roll|pitch|yaw)_joint"],
+        }
+        _arm_touched = False
+        for _grp, _patterns in _arm_groups.items():
+            for _field, _base in (("stiffness", "PM_ARM_KP"), ("damping", "PM_ARM_KD"), ("effort_limit", "PM_ARM_EFFORT")):
+                _val = os.environ.get(f"{_base}_{_grp}") or os.environ.get(_base)
+                if not _val:
+                    continue
+                for _pat in _patterns:
+                    if _pat in _oci:
+                        _old = getattr(_oci[_pat], _field, None)
+                        setattr(_oci[_pat], _field, float(_val))
+                        _arm_touched = True
+                        log.info(
+                            f"RESUME override arm {_pat}.{_field}: {_old} -> {float(_val)}"
+                        )
+        # The pickle also carries the BAKED per-DOF control_info built at the
+        # original launch; initialize_control_info() is a no-op when it exists
+        # (hasattr guard), so overrides above would never reach the sim. Drop
+        # it to force a rebuild from the MJCF + the mutated overrides.
+        _ctrl = getattr(robot_config, "control", None)
+        if _arm_touched and _ctrl is not None:
+            # Rebuild the baked per-DOF control_info in place (nothing on the
+            # resume path calls initialize_control_info, and the sim reads
+            # control.control_info directly).
+            if hasattr(_ctrl, "control_info"):
+                delattr(_ctrl, "control_info")
+            _ctrl.initialize_control_info(robot_config.asset)
+            log.info("RESUME override arm: rebuilt control_info from MJCF + overrides")
+
         args.checkpoint = checkpoint_path
         experiment_module = (
             None  # Intentionally skip loading - frozen config from pickle

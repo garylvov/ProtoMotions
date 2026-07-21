@@ -58,6 +58,22 @@ ARM_STIFFNESS = float(_ARM_KP) if _ARM_KP else STIFFNESS_40
 ARM_DAMPING = float(_ARM_KD) if _ARM_KD else DAMPING_40
 ARM_ARMATURE = float(_ARM_ARMATURE) if _ARM_ARMATURE else ARMATURE_40
 
+# Fresh-run twins of the resume-path PM_ARM_EFFORT_* gates in train_agent.py:
+# effort limits per arm group (hardware: shoulder/elbow 120 N·m, wrist 30).
+def _arm_effort(group, default):
+    v = os.environ.get(f"PM_ARM_EFFORT_{group}") or os.environ.get("PM_ARM_EFFORT")
+    return float(v) if v else default
+
+
+ARM_EFFORT_SHOULDER_PR = _arm_effort("SHOULDER", 40)
+ARM_EFFORT_SHOULDER_YAW = _arm_effort("SHOULDER", 18)
+ARM_EFFORT_ELBOW = _arm_effort("ELBOW", 18)
+ARM_EFFORT_WRIST = _arm_effort("WRIST", 19)
+
+# PM_COND_ELBOWS=1: add elbow links to trackable_bodies_subset so MaskedMimic
+# can condition on elbows (wrists/feet/torso already in the default subset).
+_COND_ELBOWS = os.environ.get("PM_COND_ELBOWS")
+
 
 @dataclass
 class H1_2RobotConfig(RobotConfig):
@@ -80,7 +96,7 @@ class H1_2RobotConfig(RobotConfig):
             "left_ankle_roll_link",
             "left_wrist_yaw_link",
             "right_wrist_yaw_link",
-        ]
+        ] + (["left_elbow_link", "right_elbow_link"] if _COND_ELBOWS else [])
     )
 
     default_root_height: float = 1.03
@@ -148,7 +164,7 @@ class H1_2RobotConfig(RobotConfig):
                 ".*_shoulder_(pitch|roll)_joint": ControlInfo(
                     stiffness=ARM_STIFFNESS,
                     damping=ARM_DAMPING,
-                    effort_limit=40,
+                    effort_limit=ARM_EFFORT_SHOULDER_PR,
                     velocity_limit=50,
                     armature=ARM_ARMATURE,
                 ),
@@ -156,7 +172,7 @@ class H1_2RobotConfig(RobotConfig):
                 ".*_shoulder_yaw_joint": ControlInfo(
                     stiffness=ARM_STIFFNESS,
                     damping=ARM_DAMPING,
-                    effort_limit=18,
+                    effort_limit=ARM_EFFORT_SHOULDER_YAW,
                     velocity_limit=50,
                     armature=ARM_ARMATURE,
                 ),
@@ -164,7 +180,7 @@ class H1_2RobotConfig(RobotConfig):
                 ".*_elbow_joint": ControlInfo(
                     stiffness=ARM_STIFFNESS,
                     damping=ARM_DAMPING,
-                    effort_limit=18,
+                    effort_limit=ARM_EFFORT_ELBOW,
                     velocity_limit=50,
                     armature=ARM_ARMATURE,
                 ),
@@ -172,7 +188,7 @@ class H1_2RobotConfig(RobotConfig):
                 ".*_wrist_(roll|pitch|yaw)_joint": ControlInfo(
                     stiffness=ARM_STIFFNESS,
                     damping=ARM_DAMPING,
-                    effort_limit=19,
+                    effort_limit=ARM_EFFORT_WRIST,
                     velocity_limit=50,
                     armature=ARM_ARMATURE,
                 ),

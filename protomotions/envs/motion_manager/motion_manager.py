@@ -497,6 +497,24 @@ class MotionManager:
                     f"Warning: skip loading motion weights due to motion file name mismatch: {state_dict['motion_file_name']} != {self.motion_lib.motion_file}"
                 )
             else:
-                self.motion_weights[:] = state_dict["motion_weights"].to(
-                    self.motion_weights.device
-                )
+                loaded = state_dict["motion_weights"].to(self.motion_weights.device)
+                n_new, n_old = self.motion_weights.shape[0], loaded.shape[0]
+                if n_old == n_new:
+                    self.motion_weights[:] = loaded
+                elif n_old < n_new:
+                    # Corpus grew since the checkpoint (clips appended at the
+                    # end). Keep learned weights for the original clips; new
+                    # clips start at the mean loaded weight so they are sampled
+                    # at an average rate until their own stats accumulate.
+                    self.motion_weights[:n_old] = loaded
+                    self.motion_weights[n_old:] = loaded.mean()
+                    print(
+                        f"Warning: motion corpus grew {n_old} -> {n_new}; "
+                        f"kept {n_old} learned weights, initialized "
+                        f"{n_new - n_old} appended clips at mean weight."
+                    )
+                else:
+                    print(
+                        f"Warning: skip loading motion weights; corpus shrank "
+                        f"{n_old} -> {n_new} (cannot map weights safely)."
+                    )

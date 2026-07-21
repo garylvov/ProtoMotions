@@ -62,6 +62,14 @@ class MaskedMimicControlConfig(MimicControlConfig):
     # Time sampling (beta distribution)
     time_alpha: float = 2.0
     time_beta: float = 5.0
+
+    # Optional absolute bounds on the sampled gap between consecutive
+    # conditioning times, in seconds. None keeps the legacy behavior
+    # (offset = beta * remaining clip time, unbounded above). Setting e.g.
+    # min_time_gap=0.02, max_time_gap=2.0 trains conditioning densities from
+    # every-control-step (50 Hz) down to one target every 2 s.
+    min_time_gap: Optional[float] = None
+    max_time_gap: Optional[float] = None
     
     # Joint masking
     repeat_mask_probability: float = 0.8
@@ -221,6 +229,12 @@ class MaskedMimicControl(MimicControl):
         
         # Calculate new times
         time_offsets = beta_samples * remaining_times
+        if self.config.min_time_gap is not None or self.config.max_time_gap is not None:
+            time_offsets = torch.clamp(
+                time_offsets,
+                min=self.config.min_time_gap,
+                max=self.config.max_time_gap,
+            )
         absolute_times = last_conditioned_times + time_offsets
         
         # Clip absolute times to be within valid bounds
