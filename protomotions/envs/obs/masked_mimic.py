@@ -49,6 +49,8 @@ def compute_target_poses_only(
     conditionable_body_ids: Tensor,
     future_steps: Union[int, List[int]] = None,
     include_root_relative: bool = True,
+    conditioning_noise_pos: float = 0.0,
+    conditioning_noise_rot: float = 0.0,
 ) -> Tensor:
     """Compute masked target poses (hidden bodies zeroed out).
     
@@ -82,7 +84,35 @@ def compute_target_poses_only(
         masked_mimic_target_bodies_masks = masks_selected.reshape(num_envs, -1)
     
     num_future_steps_actual = masked_mimic_ref_pos.shape[1]
-    
+
+    # Teleop-realism noise on the CONDITIONING TARGETS (student-side obs only;
+    # the frozen expert labels from dense clean mimic obs, so this cannot leak
+    # into distillation targets). White noise per sampled target: Gaussian
+    # position jitter [m] and small-angle axis-angle rotation jitter [rad].
+    if conditioning_noise_pos > 0.0:
+        masked_mimic_ref_pos = (
+            masked_mimic_ref_pos
+            + torch.randn_like(masked_mimic_ref_pos) * conditioning_noise_pos
+        )
+    if conditioning_noise_rot > 0.0:
+        aa = torch.randn_like(masked_mimic_ref_rot[..., :3]) * conditioning_noise_rot
+        half = aa.norm(dim=-1, keepdim=True).clamp(min=1e-8) * 0.5
+        axis = aa / (2.0 * half)
+        noise_q = torch.cat([axis * torch.sin(half), torch.cos(half)], dim=-1)  # w-last
+        q = masked_mimic_ref_rot
+        # quaternion multiply noise_q * q (w-last layout)
+        nw, nx, ny, nz = noise_q[..., 3], noise_q[..., 0], noise_q[..., 1], noise_q[..., 2]
+        qw, qx, qy, qz = q[..., 3], q[..., 0], q[..., 1], q[..., 2]
+        masked_mimic_ref_rot = torch.stack(
+            [
+                nw * qx + nx * qw + ny * qz - nz * qy,
+                nw * qy - nx * qz + ny * qw + nz * qx,
+                nw * qz + nx * qy - ny * qx + nz * qw,
+                nw * qw - nx * qx - ny * qy - nz * qz,
+            ],
+            dim=-1,
+        )
+
     obs = build_sparse_target_poses(
         current_state_body_pos=current_state_body_pos,
         current_state_body_rot=current_state_body_rot,
