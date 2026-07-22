@@ -590,6 +590,15 @@ class BaseAgent:
         log.info(f"Saved inference checkpoint: {inference_checkpoint}")
 
     def save(self, checkpoint_name: str = "last.ckpt", new_high_score: bool = False):
+        if os.environ.get("PM_SAVE_FAILURE_TOLERANT") == "1":
+            try:
+                return self._save_impl(checkpoint_name, new_high_score)
+            except OSError as e:
+                log.error(f"CKPT SAVE FAILED (tolerated, training continues): {e}")
+                return None
+        return self._save_impl(checkpoint_name, new_high_score)
+
+    def _save_impl(self, checkpoint_name: str = "last.ckpt", new_high_score: bool = False):
         """
         Save model checkpoint and environment state.
 

@@ -330,6 +330,7 @@ class MimicEvaluator(BaseEvaluator):
             # eval subset gate is active.
             if (
                 _eval_subset_n() <= 0
+                and os.environ.get("PM_DISABLE_PREDICTED_LIB_SAVE") != "1"
                 and self.config.save_predicted_motion_lib_every is not None
                 and self.eval_count % self.config.save_predicted_motion_lib_every == 0
             ):
