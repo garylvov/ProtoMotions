@@ -80,11 +80,6 @@ class MaskedMimicControlConfig(MimicControlConfig):
     # Fixed conditioning (optional)
     fixed_conditioning: Optional[List[FixedBodyCondition]] = None
 
-    # Bodies that may only ever be conditioned on POSITION (rotation masks are
-    # forced off, in both random sampling and repeats). E.g. ["torso_link"] for
-    # a "torso is a point" teleop interface while wrists carry pos+rot.
-    pos_only_body_names: Optional[List[str]] = None
-    
     # Probability that a pose is fully hidden (all bodies masked out)
     fully_hidden_pose_prob: float = 0.1
 
@@ -126,14 +121,7 @@ class MaskedMimicControl(MimicControl):
             dtype=torch.long,
         )
         self.num_conditionable_bodies = len(self.conditionable_body_ids)
-        self._pos_only_local_ids = []
-        if self.config.pos_only_body_names:
-            _cond_list = self.conditionable_body_ids.tolist()
-            for _nm in self.config.pos_only_body_names:
-                _bid = self._all_body_names.index(_nm)
-                if _bid in _cond_list:
-                    self._pos_only_local_ids.append(_cond_list.index(_bid))
-        
+
         # Initialize masked mimic state buffers
         self.masked_mimic_target_poses_masks = torch.zeros(
             self.env.num_envs,
@@ -435,9 +423,6 @@ class MaskedMimicControl(MimicControl):
         )
         new_mask[:, :, 0] = translation_mask
         new_mask[:, :, 1] = rotation_mask
-
-        if self._pos_only_local_ids:
-            new_mask[:, self._pos_only_local_ids, 1] = False
 
         return new_mask.view(num_envs, -1)
     
