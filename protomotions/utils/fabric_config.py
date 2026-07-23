@@ -100,6 +100,48 @@ def _default_ddp_strategy() -> fabric.strategies.DDPStrategy:
             static_graph=static_graph,
             broadcast_buffers=broadcast_buffers,
         )
+    # TRUE cross-GPU rank-stacking (imprint issues #116/#117): the prod
+    # launchers spawned N independent single-GPU train_agent.py processes
+    # (per-GPU MASTER_PORT + per-GPU --experiment-name + --ngpu 1) that never
+    # all-reduce gradients across GPUs -> N divergent models, only gpu0 ever
+    # evaluated. This mode builds ONE DDP process-group spanning all N physical
+    # GPUs with PM_STACK_NRANKS=S ranks pinned to EACH GPU:
+    #   parallel_devices = [cuda:0]*S + [cuda:1]*S + ... + [cuda:(N-1)]*S
+    #   world_size        = N * S
+    # so a single rendezvous / --experiment-name yields one data-parallel model.
+    # N is derived from PM_NGPU, else the count of CUDA_VISIBLE_DEVICES entries,
+    # else torch.cuda.device_count() (the launcher exports PM_NGPU=N and passes
+    # --ngpu N*S so Lightning's `devices` int equals world_size).
+    # The backend MUST be gloo when S>1: NCCL's bootstrap refuses two ranks
+    # sharing one physical GPU inside one communicator ("Duplicate GPU
+    # detected"), even under MPS -- the same restriction that forced gloo for the
+    # single-GPU PM_STACK_RANKS_ON_GPU0 hack (imprint #92). S=1 is plain
+    # one-rank-per-GPU cross-GPU DDP with no co-location, so it keeps the faster
+    # NCCL backend by falling through to the default strategy below.
+    if os.environ.get("PM_STACK_ACROSS_GPUS") == "1":
+        s = int(os.environ.get("PM_STACK_NRANKS", "1"))
+        if s > 1:
+            import torch
+
+            cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+            if os.environ.get("PM_NGPU"):
+                n = int(os.environ["PM_NGPU"])
+            elif cvd:
+                n = len([x for x in cvd.split(",") if x.strip() != ""])
+            else:
+                n = torch.cuda.device_count()
+            parallel_devices = [
+                torch.device("cuda", g) for g in range(n) for _ in range(s)
+            ]
+            return fabric.strategies.DDPStrategy(
+                parallel_devices=parallel_devices,
+                process_group_backend="gloo",
+                timeout=timedelta(seconds=timeout_sec),
+                find_unused_parameters=find_unused,
+                static_graph=static_graph,
+                broadcast_buffers=broadcast_buffers,
+            )
+        # s == 1: plain cross-GPU (one rank per GPU) -> NCCL default below.
     return fabric.strategies.DDPStrategy(
         timeout=timedelta(seconds=timeout_sec),
         find_unused_parameters=find_unused,
@@ -153,7 +195,16 @@ class FabricConfig:
         # visible GPU ("You requested gpu: [0..n-1] But your machine only has:
         # [0]"). Coerce devices to "auto" so parse_devices resolves to the 1
         # visible GPU while the strategy's parallel_devices keeps world_size=n.
-        if os.environ.get("PM_STACK_RANKS_ON_GPU0") == "1":
+        # PM_STACK_ACROSS_GPUS with S>1 has the same Lightning device-parsing
+        # problem: `devices` = args.ngpu = N*S, but the machine only has N
+        # visible GPUs, so CUDAAccelerator.parse_devices([0..N*S-1]) rejects the
+        # request. The strategy's parallel_devices (length N*S) already fixes
+        # world_size, so coerce devices to "auto" (resolves to the N visible
+        # GPUs). S=1 keeps devices=N (== visible GPU count, parses cleanly).
+        _across = os.environ.get("PM_STACK_ACROSS_GPUS") == "1" and (
+            int(os.environ.get("PM_STACK_NRANKS", "1")) > 1
+        )
+        if os.environ.get("PM_STACK_RANKS_ON_GPU0") == "1" or _across:
             self.devices = "auto"
         if self.strategy is not None and (
             isinstance(self.strategy, dict) or isinstance(self.strategy, DictConfig)

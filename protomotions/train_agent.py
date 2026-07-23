@@ -877,7 +877,21 @@ def main():
     if args.simulator == "isaaclab":
         app_launcher_flags = {"headless": args.headless, "device": str(fabric.device)}
         _stacked_on_one_gpu = os.environ.get("PM_STACK_RANKS_ON_GPU0") == "1"
-        if fabric.world_size > 1 and not _stacked_on_one_gpu:
+        # PM_STACK_ACROSS_GPUS with S>1 (imprint #116/#117) also co-locates
+        # multiple ranks on each physical GPU (S ranks/GPU across N GPUs via a
+        # gloo group, world_size N*S). Like the single-GPU stacking hack, these
+        # ranks must NOT use AppLauncher's distributed mode (which pins the
+        # device to cuda:LOCAL_RANK, and LOCAL_RANK runs 0..N*S-1 -> points
+        # PhysX at nonexistent GPU indices -> initialize_physics busy-waits
+        # forever). Instead every rank boots plain single-GPU on the device the
+        # fabric strategy already pinned it to (fabric.device = cuda:(rank//S)).
+        # S=1 is one-rank-per-GPU with no co-location, so it keeps the standard
+        # distributed path below (device = cuda:LOCAL_RANK is correct there).
+        _stacked_across_gpus = os.environ.get("PM_STACK_ACROSS_GPUS") == "1" and (
+            int(os.environ.get("PM_STACK_NRANKS", "1")) > 1
+        )
+        _colocated_ranks = _stacked_on_one_gpu or _stacked_across_gpus
+        if fabric.world_size > 1 and not _colocated_ranks:
             # This is needed when running with SLURM.
             # When launching multi-GPU/node jobs without SLURM, or differently, maybe this needs to be adapted accordingly.
             app_launcher_flags["distributed"] = True
@@ -892,7 +906,7 @@ def main():
             _stagger = float(os.environ.get("NFS_STAGGER_SEC", "0") or "0")
             if _stagger > 0:
                 time.sleep(fabric.local_rank * _stagger)
-        elif fabric.world_size > 1 and _stacked_on_one_gpu:
+        elif fabric.world_size > 1 and _colocated_ranks:
             # MPS-stacked mode (PM_STACK_RANKS_ON_GPU0=1): every rank of this
             # gloo group shares ONE physical GPU behind one MPS daemon, and the
             # process is masked to exactly one visible device
@@ -908,7 +922,11 @@ def main():
             # multi-GPU rendering off, plus the same CPU-thread caps that
             # distributed mode would have applied (from OMP_NUM_THREADS, which
             # the stacked launcher sets per-rank-count).
-            app_launcher_flags["device"] = "cuda:0"
+            # Pin to the device the fabric strategy chose for THIS rank:
+            # cuda:0 for the single-GPU hack (parallel_devices=[cuda:0]*S), or
+            # cuda:(rank//S) for PM_STACK_ACROSS_GPUS (parallel_devices spans
+            # all N GPUs). str(fabric.device) yields the right one in both.
+            app_launcher_flags["device"] = str(fabric.device)
             app_launcher_flags["multi_gpu"] = False
             os.environ["RANK"] = str(fabric.global_rank)
             # Per-rank scratch isolation: the launcher's TMPDIR/WARP_CACHE_PATH
