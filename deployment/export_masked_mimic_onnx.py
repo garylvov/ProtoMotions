@@ -255,11 +255,43 @@ def export_masked_mimic(
     model_in_keys = list(dict.fromkeys(prior_in + trunk_in))
     log.info(f"Model inference obs keys: {model_in_keys}")
 
+    # Training-only stochastic augmentation knobs that some obs kernels accept
+    # as static_params (e.g. masked_mimic's conditioning_noise_pos/rot teleop-
+    # realism jitter -- see protomotions/envs/obs/masked_mimic.py). These are
+    # baked into the ONNX graph as a FROZEN torch.randn() draw at trace time
+    # (ONNX has no live RNG), so leaving them enabled at export time does not
+    # give "noisy deploy conditioning" -- it gives one arbitrary, permanent
+    # noise offset for the model's entire deployed lifetime, and it also makes
+    # the exporter's own onnxruntime-vs-pytorch parity check meaningless (the
+    # pytorch reference forward and the traced/exported graph each draw an
+    # independent Gaussian sample, so the "parity" diff is actually just this
+    # noise's magnitude, not an export defect). Deploy/export must always use
+    # the clean (noise-free) conditioning kernel: real hardware/teleop signals
+    # already carry their own real-world noise, so re-injecting synthetic
+    # training-time jitter on top is never wanted at inference time.
+    _TRAINING_ONLY_NOISE_PARAMS = ("conditioning_noise_pos", "conditioning_noise_rot")
+
     obs_configs = {}
     for key in model_in_keys:
         comp = env_config.observation_components.get(key)
         if comp is None:
             raise ValueError(f"obs component '{key}' missing from env config")
+        stripped = {
+            p: comp.static_params[p]
+            for p in _TRAINING_ONLY_NOISE_PARAMS
+            if comp.static_params.get(p, 0.0)
+        }
+        if stripped:
+            import copy
+
+            comp = copy.copy(comp)
+            comp.static_params = dict(comp.static_params)
+            for p in stripped:
+                comp.static_params[p] = 0.0
+            log.info(
+                f"obs component '{key}': zeroed training-only noise params for "
+                f"deploy export -- {stripped} -> 0.0"
+            )
         obs_configs[key] = comp
 
     # ------------------------------------------------------------------
