@@ -100,20 +100,34 @@ def _quantize_motion_tensors_fp16(motion_lib) -> None:
     """
     if not _motionlib_fp16_enabled():
         return
+    freed_cuda = False
     for lib_field in _FP16_QUANTIZE_FIELDS:
         tensor = getattr(motion_lib, lib_field, None)
         if tensor is None or not torch.is_tensor(tensor):
             continue
         if tensor.dtype == torch.float16:
             continue  # already quantized (e.g. re-entrant load path)
+        if tensor.is_cuda:
+            freed_cuda = True
         tensor = tensor.to(torch.float16)
         if lib_field in _FP16_QUAT_FIELDS:
             norm = tensor.float().norm(dim=-1, keepdim=True).clamp_min(1e-8)
             tensor = (tensor.float() / norm).to(torch.float16)
         setattr(motion_lib, lib_field, tensor)
+    # Return the freed fp32 source blocks to CUDA. setattr above drops the last
+    # reference to each fp32 original, but the caching allocator keeps those
+    # blocks RESERVED (not returned to the driver). On a large pack they linger
+    # as ~13.9 GiB of reserved-but-unallocated, non-contiguous fragments that
+    # cannot satisfy the later single large contiguous rollout-buffer allocation
+    # (~12-16 GiB) -> spurious CUDA OOM at epoch 0 despite ample nominal free
+    # VRAM, even though fp16 lowered the *allocated* motion footprint. Dropping
+    # the cache here is what actually realizes the fp16 saving on-GPU and lets
+    # PhysX (which allocates outside the torch allocator) reuse the space.
+    if freed_cuda and torch.cuda.is_available():
+        torch.cuda.empty_cache()
     print(
         f"[motionlib-fp16] quantized {_FP16_QUANTIZE_FIELDS} to fp16 "
-        f"(quat fields {_FP16_QUAT_FIELDS} renormalized)"
+        f"(quat fields {_FP16_QUAT_FIELDS} renormalized; cuda cache dropped={freed_cuda})"
     )
 
 
