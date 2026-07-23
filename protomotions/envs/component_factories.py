@@ -952,6 +952,55 @@ def pow_rew_factory(
     )
 
 
+def dof_acc_penalty_factory(weight: float = -1e-6) -> MdpComponent:
+    """Factory for the DOF acceleration penalty (BeyondMimic-style smoothness).
+
+    Sum of squared per-control-step joint-velocity deltas (proxy for joint
+    acceleration; control dt folded into ``weight``). Requires
+    ``num_state_history_steps >= 1`` so the previous DOF velocity is available.
+    Reward-only, no observation-width change.
+
+    Args:
+        weight: Reward weight (typically a small negative value).
+
+    Returns:
+        MdpComponent configured for the DOF acceleration penalty.
+    """
+    from protomotions.envs.rewards import compute_dof_acc_penalty
+
+    return MdpComponent(
+        compute_func=compute_dof_acc_penalty,
+        dynamic_vars={
+            "current_dof_vel": EnvContext.current.dof_vel,
+            "historical_dof_vel": EnvContext.historical.dof_vel,
+        },
+        static_params={"weight": weight},
+    )
+
+
+def dof_vel_penalty_factory(weight: float = -1e-4) -> MdpComponent:
+    """Factory for the DOF velocity penalty (BeyondMimic-style smoothness).
+
+    Sum of squared joint velocities; discourages fast whole-body joint motion.
+    Reward-only, no observation-width change.
+
+    Args:
+        weight: Reward weight (typically a small negative value).
+
+    Returns:
+        MdpComponent configured for the DOF velocity penalty.
+    """
+    from protomotions.envs.rewards import compute_dof_vel_penalty
+
+    return MdpComponent(
+        compute_func=compute_dof_vel_penalty,
+        dynamic_vars={
+            "dof_vel": EnvContext.current.dof_vel,
+        },
+        static_params={"weight": weight},
+    )
+
+
 def contact_match_rew_factory(
     weight: float = -0.1,
     zero_during_grace_period: bool = True,
@@ -2191,6 +2240,8 @@ __all__ = [
     # Odometer observation factory
     "corrupted_xy_offset_factory",
     "pow_rew_factory",
+    "dof_acc_penalty_factory",
+    "dof_vel_penalty_factory",
     "contact_match_rew_factory",
     "reference_contact_liftoff_penalty_factory",
     "contact_force_change_rew_factory",

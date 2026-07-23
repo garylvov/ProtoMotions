@@ -32,7 +32,12 @@ import torch
 from torch import Tensor
 from typing import Optional
 
-from protomotions.envs.rewards.base import power_consumption_sum, delta_norm, delta_logmeanexp
+from protomotions.envs.rewards.base import (
+    power_consumption_sum,
+    delta_norm,
+    delta_logmeanexp,
+    velocity_squared_sum,
+)
 
 
 # =============================================================================
@@ -125,6 +130,58 @@ def compute_action_smoothness_logmeanexp(
         previous_processed_action,
         beta=beta,
     )
+
+
+def compute_dof_acc_penalty(
+    current_dof_vel: Tensor,
+    historical_dof_vel: Tensor,
+    indices: Optional[Tensor] = None,
+) -> Tensor:
+    """DOF acceleration penalty (BeyondMimic-style joint-acceleration smoothness).
+
+    Sum of squared per-control-step DOF velocity deltas -- a proxy for joint
+    acceleration. The fixed control dt is folded into the reward weight exactly
+    as ``compute_action_smoothness`` folds it into the action-rate weight, so no
+    dt is applied here. Requires ``num_state_history_steps >= 1`` so the previous
+    DOF velocity is available. Apply a small NEGATIVE weight in the factory.
+
+    Args:
+        current_dof_vel: Current joint velocities [num_envs, num_dofs].
+        historical_dof_vel: Historical joint velocities
+            [num_envs, history_steps, num_dofs] (slot 0 = previous control step)
+            or [num_envs, num_dofs].
+        indices: Optional DOF indices to subset.
+
+    Returns:
+        Joint-acceleration penalty tensor [num_envs].
+    """
+    if historical_dof_vel.dim() == 3:
+        previous_dof_vel = historical_dof_vel[:, 0, :]
+    else:
+        previous_dof_vel = historical_dof_vel
+    if indices is not None:
+        current_dof_vel = current_dof_vel[:, indices]
+        previous_dof_vel = previous_dof_vel[:, indices]
+    return (current_dof_vel - previous_dof_vel).pow(2).sum(dim=-1)
+
+
+def compute_dof_vel_penalty(
+    dof_vel: Tensor,
+    indices: Optional[Tensor] = None,
+) -> Tensor:
+    """DOF velocity penalty (L2 of joint velocities, BeyondMimic-style).
+
+    Sum of squared joint velocities (via ``velocity_squared_sum``); discourages
+    fast whole-body joint motion. Apply a small NEGATIVE weight in the factory.
+
+    Args:
+        dof_vel: Joint velocities [num_envs, num_dofs].
+        indices: Optional DOF indices to subset.
+
+    Returns:
+        Joint-velocity penalty tensor [num_envs].
+    """
+    return velocity_squared_sum(dof_vel, indices=indices)
 
 
 def compute_pow_rew(
@@ -428,6 +485,8 @@ __all__ = [
     # Main reward kernels
     "compute_action_smoothness",
     "compute_action_smoothness_logmeanexp",
+    "compute_dof_acc_penalty",
+    "compute_dof_vel_penalty",
     "compute_pow_rew",
     "compute_soft_pos_limit_rew",
     "compute_contact_match_rew",
