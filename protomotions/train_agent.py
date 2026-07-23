@@ -897,13 +897,29 @@ def main():
             app_launcher_flags["distributed"] = True
             os.environ["LOCAL_RANK"] = str(fabric.local_rank)
             os.environ["RANK"] = str(fabric.global_rank)
-            # 2026-07-04 crash-rootcause mitigation (patch-3): de-collide the
-            # 8-way concurrent NFS reads (motion-lib pickle, env_*.pt.ckpt on
-            # resume) that all ranks on a node issue at ~the same instant,
-            # which is the documented straggler source behind the
-            # BaseAgent.__init__ all_gather timeout. Opt-in (default 0 = off)
-            # so behavior is unchanged unless a wrapper sets NFS_STAGGER_SEC.
-            _stagger = float(os.environ.get("NFS_STAGGER_SEC", "0") or "0")
+            # FORK-BOMB FIX (imprint fork-bomb incident 2026-07-23): the Kit
+            # carb.tasking scheduler sizes its worker pool to *hardware
+            # concurrency* (~nproc) PER RANK, and TBB_THREAD_COUNT / OMP_* env
+            # vars do NOT bound it. With N ranks-per-node all booting Kit, that
+            # is N*nproc runnable threads (8*112 ~ 900 load on gpu3202) => the
+            # node fork-storm that OOM/SIGKILLed the 8x1x32768 DDP benchmark.
+            # This branch (one rank/GPU, world_size>1) previously skipped the
+            # cap that the co-located branch applies -> apply it here too.
+            _tcap = os.environ.get("OMP_NUM_THREADS")
+            if _tcap:
+                os.environ.setdefault("PXR_WORK_THREAD_LIMIT", _tcap)
+                sys.argv.append(
+                    f"--/plugins/carb.tasking.plugin/threadCount={_tcap}"
+                )
+            # Stagger Kit/PhysX boot per rank so the N ranks on a node do not
+            # warm-start PhysX simultaneously (concurrent thread + PhysX-tensor
+            # memory spike). PM_RANK_STAGGER_SEC is the DDP-path knob; the older
+            # NFS_STAGGER_SEC (de-collide concurrent NFS motion-lib reads) is
+            # honored too. Opt-in: default 0 = off, behavior unchanged.
+            _stagger = max(
+                float(os.environ.get("NFS_STAGGER_SEC", "0") or "0"),
+                float(os.environ.get("PM_RANK_STAGGER_SEC", "0") or "0"),
+            )
             if _stagger > 0:
                 time.sleep(fabric.local_rank * _stagger)
         elif fabric.world_size > 1 and _colocated_ranks:
@@ -952,9 +968,24 @@ def main():
                 sys.argv.append(
                     f"--/plugins/carb.tasking.plugin/threadCount={_tcap}"
                 )
-            _stagger = float(os.environ.get("NFS_STAGGER_SEC", "0") or "0")
+            _stagger = max(
+                float(os.environ.get("NFS_STAGGER_SEC", "0") or "0"),
+                float(os.environ.get("PM_RANK_STAGGER_SEC", "0") or "0"),
+            )
             if _stagger > 0:
                 time.sleep(fabric.local_rank * _stagger)
+        # Key the Kit-init flock by PHYSICAL GPU so co-located ranks on one GPU
+        # serialize their PhysX warm-start (deadlock defense-in-depth) while
+        # ranks on different GPUs boot in parallel. Set for every multi-rank
+        # case (incl. one-rank-per-GPU S=1 DDP): each rank then holds its own
+        # per-GPU lock uncontended, so the flock does NOT globally serialize the
+        # N boots (that job is left to PM_RANK_STAGGER_SEC). cuda:(rank//S) for
+        # across-GPU DDP, cuda:0 for the single-GPU hack, local_rank fallback.
+        if fabric.world_size > 1:
+            _dev = getattr(fabric.device, "index", None)
+            os.environ["PM_KIT_LOCK_KEY"] = str(
+                _dev if _dev is not None else fabric.local_rank
+            )
         from protomotions.utils.kit_init_lock import kit_init_lock
 
         with kit_init_lock("AppLauncher/Kit boot"):

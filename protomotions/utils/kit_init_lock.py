@@ -10,12 +10,13 @@
 # serialized here as defense in depth.
 #
 # Knobs:
-#   PM_SERIALIZE_KIT_INIT=0  -> disable the lock (default: enabled when
-#                               PM_STACK_RANKS_ON_GPU0=1; always a no-op
-#                               otherwise).
-#   Lockfile is keyed by CUDA_MPS_PIPE_DIRECTORY basename so only ranks sharing
-#   one GPU's MPS daemon serialize against each other; ranks on different GPUs
-#   proceed in parallel.
+#   PM_SERIALIZE_KIT_INIT=0  -> disable the lock (default: enabled when ranks
+#                               are co-located on a GPU: PM_STACK_RANKS_ON_GPU0=1
+#                               OR PM_STACK_ACROSS_GPUS=1; a no-op otherwise).
+#   Lockfile is keyed by PM_KIT_LOCK_KEY (the physical GPU index, set by
+#   train_agent for co-located ranks) if present, else CUDA_MPS_PIPE_DIRECTORY
+#   basename, so only ranks sharing ONE physical GPU serialize against each
+#   other; ranks on different GPUs proceed in parallel.
 
 import contextlib
 import fcntl
@@ -24,9 +25,15 @@ import time
 
 
 def _enabled() -> bool:
+    if os.environ.get("PM_SERIALIZE_KIT_INIT", "1") == "0":
+        return False
+    # Engage whenever multiple Kit/PhysX ranks may be co-located on one physical
+    # GPU: the single-GPU stacking hack (PM_STACK_RANKS_ON_GPU0) OR the
+    # across-GPU DDP path with S>1 ranks/GPU (PM_STACK_ACROSS_GPUS). No-op for
+    # ordinary one-rank-per-GPU runs (nothing to serialize).
     return (
         os.environ.get("PM_STACK_RANKS_ON_GPU0") == "1"
-        and os.environ.get("PM_SERIALIZE_KIT_INIT", "1") != "0"
+        or os.environ.get("PM_STACK_ACROSS_GPUS") == "1"
     )
 
 
@@ -41,7 +48,11 @@ def kit_init_lock(tag: str):
     if not _enabled():
         yield
         return
-    key = os.path.basename(os.environ.get("CUDA_MPS_PIPE_DIRECTORY", "").rstrip("/"))
+    key = os.environ.get("PM_KIT_LOCK_KEY", "")
+    if not key:
+        key = os.path.basename(
+            os.environ.get("CUDA_MPS_PIPE_DIRECTORY", "").rstrip("/")
+        )
     key = key or "nogpu"
     path = f"/tmp/kit_init_{key}.lock"
     f = open(path, "w")
