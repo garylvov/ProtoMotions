@@ -704,7 +704,9 @@ def main():
                 _cf = _rc[_comp].compute_func
                 _old = getattr(_cf, _key, None)
                 setattr(_cf, _key, _fval)
-            log.info(
+            # WARNING level: the resume log captures WARNING+ only, so INFO
+            # override lines were invisible on the gpu3202 gate resume.
+            log.warning(
                 f"RESUME override {_comp}.{_key} = {_fval} (was {_old}, from {_var})"
             )
 
