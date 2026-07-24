@@ -1081,6 +1081,7 @@ def max_feet_height_rew_factory(
     apex_target_height: float = 0.25,
     reward_mode: str = "shortfall",
     min_ref_speed: float = 0.0,
+    min_self_speed: float = 0.0,
     zero_during_grace_period: bool = True,
 ) -> MdpComponent:
     """Factory for the OmniH2O per-step swing-apex reward/penalty (dormant).
@@ -1113,9 +1114,17 @@ def max_feet_height_rew_factory(
         min_ref_speed: Reference root xy speed gate in m/s applied in
             ``"lift"`` mode ONLY (default 0.0 = ungated, byte-identical to the
             pre-gate reward). When positive, a completed swing pays lift only
-            while the reference root is moving, closing the march-in-place
-            exploit (imprint PR #119 step-in-place investigation). Ignored in
-            ``"shortfall"`` mode.
+            while the reference root OR the robot's own root is moving (see
+            ``min_self_speed``), closing the march-in-place exploit (imprint PR
+            #119 step-in-place investigation). Ignored in ``"shortfall"`` mode.
+        min_self_speed: Robot's OWN simulated root xy speed gate in m/s applied
+            in ``"lift"`` mode ONLY (default 0.0 = disabled). REF-OR-SELF: a
+            completed swing pays when EITHER the reference root exceeds
+            ``min_ref_speed`` OR the robot's own root exceeds ``min_self_speed``.
+            This is the fall-RECOVERY escape hatch — a shoved/fallen robot can
+            take a big recovery step and still be paid, gated relative to itself.
+            An in-place march keeps self-speed ~0 on a static ref so it still
+            pays 0. Ignored in ``"shortfall"`` mode.
         zero_during_grace_period: Zero the reward during post-reset grace.
 
     Returns:
@@ -1128,6 +1137,7 @@ def max_feet_height_rew_factory(
             apex_target_height=apex_target_height,
             reward_mode=reward_mode,
             min_ref_speed=min_ref_speed,
+            min_self_speed=min_self_speed,
         ),
         dynamic_vars={
             "sim_contacts": EnvContext.current.rigid_body_contacts,
@@ -1136,6 +1146,7 @@ def max_feet_height_rew_factory(
             "contact_body_ids": EnvContext.contact_body_ids,
             "progress_buf": EnvContext.progress_buf,
             "ref_rigid_body_vel": EnvContext.mimic.ref_state.rigid_body_vel,
+            "rigid_body_vel": EnvContext.current.rigid_body_vel,
         },
         static_params={
             "weight": weight,

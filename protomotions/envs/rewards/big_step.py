@@ -134,11 +134,20 @@ class FeetApexHeightReward(_FootContactTransitionTracker):
       the target, and NEVER penalizes a shortfall (the raw is always ≥ 0).
       Weight POSITIVELY. "Always reward high steps": a taller swing always earns
       strictly more, up to the cap, so the gradient points up toward the target
-      instead of merely relaxing a cost. Optionally GATED on reference root xy
-      speed via ``min_ref_speed`` (default 0.0 = ungated): when set, a completed
-      swing pays only while the reference root is moving, so marching in place
-      against a stationary reference earns no lift (imprint PR #119 step-in-place
-      investigation). ``"shortfall"`` is never gated.
+      instead of merely relaxing a cost. Optionally GATED by a REF-OR-SELF motion
+      test (default OFF = ungated): a completed swing pays only when the REFERENCE
+      root xy speed exceeds ``min_ref_speed`` OR the ROBOT's OWN (simulated) root
+      xy speed exceeds ``min_self_speed``. The ref side blocks marching in place
+      against a stationary / frozen-lower-body reference; the self side is a
+      fall-RECOVERY escape hatch — if the robot is shoved or falls (wrench DR
+      fires on static clips constantly) it MUST be able to take a big recovery
+      step and still get paid, gated "relative to itself, not the ref traj". An
+      in-place march keeps the root stationary (self-speed ~0) on a static ref
+      (ref-speed ~0) so it still pays 0; swaying to unlock is self-defeating
+      because root motion on a static ref directly costs the anchor pos/ori
+      tracking rewards (imprint PR #119 step-in-place investigation). Each side
+      is active only when its threshold > 0 and its velocity tensor is present;
+      both 0/absent = ungated. ``"shortfall"`` is never gated.
 
     Nothing is emitted while the foot is in the air or in stance (continuous
     air-time / height terms cause stomping; OmniH2O ships the continuous
@@ -156,6 +165,7 @@ class FeetApexHeightReward(_FootContactTransitionTracker):
         apex_target_height: float = 0.25,
         reward_mode: str = "shortfall",
         min_ref_speed: float = 0.0,
+        min_self_speed: float = 0.0,
     ):
         super().__init__()
         if apex_target_height <= 0.0:
@@ -167,9 +177,12 @@ class FeetApexHeightReward(_FootContactTransitionTracker):
             )
         if min_ref_speed < 0.0:
             raise ValueError("min_ref_speed must be non-negative.")
+        if min_self_speed < 0.0:
+            raise ValueError("min_self_speed must be non-negative.")
         self.apex_target_height = apex_target_height
         self.reward_mode = reward_mode
         self.min_ref_speed = min_ref_speed
+        self.min_self_speed = min_self_speed
         self._swing_apex = None
 
     @_dynamo_disable
@@ -181,6 +194,7 @@ class FeetApexHeightReward(_FootContactTransitionTracker):
         contact_body_ids: Tensor,
         progress_buf: Tensor,
         ref_rigid_body_vel: Tensor = None,
+        rigid_body_vel: Tensor = None,
     ) -> Tensor:
         contacts = sim_contacts[:, contact_body_ids].bool()
         touchdown, reset_mask = self._update_transitions(contacts, progress_buf)
@@ -217,23 +231,33 @@ class FeetApexHeightReward(_FootContactTransitionTracker):
                 torch.zeros_like(self._swing_apex),
             )
 
-        # Reference-motion gate — "lift" mode ONLY: pay the positive lift income
-        # only while the REFERENCE root is moving in xy above ``min_ref_speed``,
-        # so a policy marching in place against a stationary / frozen-lower-body
-        # reference earns no lift (imprint PR #119 step-in-place investigation).
-        # Mirrors StepDisplacementReward's gate above (reshape + unsqueeze), so a
-        # flattened or [envs, bodies, 3] ref-vel tensor both work. "shortfall"
-        # stays UNGATED (a low step is bad whenever it happens). ``min_ref_speed
-        # == 0.0`` (the default) leaves emission byte-identical to ungated.
-        if (
-            self.reward_mode == "lift"
-            and ref_rigid_body_vel is not None
-            and self.min_ref_speed > 0.0
-        ):
-            ref_vel = ref_rigid_body_vel.reshape(emission.shape[0], -1, 3)
-            ref_speed_xy = ref_vel[:, 0, :2].norm(dim=-1)
-            gate = (ref_speed_xy > self.min_ref_speed).unsqueeze(-1)
-            emission = emission * gate
+        # REF-OR-SELF motion gate — "lift" mode ONLY. Pay the positive lift
+        # income only when the REFERENCE root is moving (blocks marching in place
+        # against a stationary / frozen-lower-body reference) OR the ROBOT's OWN
+        # simulated root is moving (fall-RECOVERY escape hatch — a shoved/fallen
+        # robot must still be paid for a big recovery step, gated relative to
+        # itself, not the ref traj; imprint PR #119 step-in-place investigation).
+        # Each side mirrors StepDisplacementReward's gate idiom (reshape +
+        # unsqueeze, flattened or [envs, bodies, 3] both work) and is active ONLY
+        # when its own threshold > 0.0 and its tensor is present; both thresholds
+        # 0.0 (the default) leave ``gate`` None => emission byte-identical to
+        # ungated. "shortfall" stays UNGATED (a low step is bad whenever it
+        # happens). An in-place march has self-speed ~0 on a static ref
+        # (ref-speed ~0) so it still pays 0; swaying to unlock costs the anchor
+        # pos/ori tracking rewards, so it is self-defeating.
+        if self.reward_mode == "lift":
+            gate = None
+            if ref_rigid_body_vel is not None and self.min_ref_speed > 0.0:
+                ref_vel = ref_rigid_body_vel.reshape(emission.shape[0], -1, 3)
+                ref_speed_xy = ref_vel[:, 0, :2].norm(dim=-1)
+                gate = ref_speed_xy > self.min_ref_speed
+            if rigid_body_vel is not None and self.min_self_speed > 0.0:
+                self_vel = rigid_body_vel.reshape(emission.shape[0], -1, 3)
+                self_speed_xy = self_vel[:, 0, :2].norm(dim=-1)
+                self_gate = self_speed_xy > self.min_self_speed
+                gate = self_gate if gate is None else (gate | self_gate)
+            if gate is not None:
+                emission = emission * gate.unsqueeze(-1)
 
         self._swing_apex = torch.where(
             touchdown, torch.zeros_like(self._swing_apex), self._swing_apex

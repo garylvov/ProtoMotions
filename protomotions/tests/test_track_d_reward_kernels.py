@@ -37,6 +37,12 @@ REF_VEL_MOVING = torch.zeros(NUM_ENVS, NUM_BODIES, 3)
 REF_VEL_MOVING[:, 0, 0] = 1.0  # root moving 1 m/s in x
 REF_VEL_STATIC = torch.zeros(NUM_ENVS, NUM_BODIES, 3)
 
+# Robot's OWN (simulated) root velocities [NUM_ENVS, NUM_BODIES, 3] for the
+# REF-OR-SELF lift gate: stationary vs shoved/fallen (root moving 0.5 m/s).
+SELF_VEL_STATIC = torch.zeros(NUM_ENVS, NUM_BODIES, 3)
+SELF_VEL_SHOVED = torch.zeros(NUM_ENVS, NUM_BODIES, 3)
+SELF_VEL_SHOVED[:, 0, 0] = 0.5  # robot root shoved 0.5 m/s in x
+
 
 def _positions(foot0_xy=(0.0, 0.0), foot0_z=0.0, foot1_xy=(0.0, 0.1), foot1_z=0.0):
     """Body positions [NUM_ENVS, NUM_BODIES, 3]; only env 0's feet move."""
@@ -162,17 +168,18 @@ def test_apex_lift_reward_mode_validation():
         FeetApexHeightReward(apex_target_height=0.18, reward_mode="bogus")
 
 
-def _lift_big_high_step(rew, progress, ref_vel):
+def _lift_big_high_step(rew, progress, ref_vel, self_vel=None):
     """Drive one BIG HIGH swing of foot 0 (apex 0.30 >= 0.18 target -> pays the
     capped 1.0 when ungated) through to touchdown; return (reward, progress).
-    ``ref_vel`` is threaded through so the LIFT gate can see the reference."""
+    ``ref_vel`` / ``self_vel`` are threaded through so the REF-OR-SELF lift gate
+    can see the reference and the robot's own root velocity."""
     for z in (0.10, 0.30, 0.20):
         progress = progress + 1
         rew(_contacts(False), _positions(foot0_z=z), GROUND, FOOT_IDS, progress,
-            ref_rigid_body_vel=ref_vel)
+            ref_rigid_body_vel=ref_vel, rigid_body_vel=self_vel)
     progress = progress + 1
     r = rew(_contacts(True), _positions(foot0_z=0.0), GROUND, FOOT_IDS, progress,
-            ref_rigid_body_vel=ref_vel)
+            ref_rigid_body_vel=ref_vel, rigid_body_vel=self_vel)
     return r, progress
 
 
@@ -241,6 +248,80 @@ def test_apex_lift_gate_zero_min_ref_speed_is_byte_identical_to_ungated():
     progress = progress + 1
     r = both(_contacts(True), _positions(foot0_z=0.0), progress)
     torch.testing.assert_close(r, torch.tensor([0.25, 0.0]))
+
+
+def test_apex_lift_ref_or_self_gate_blocks_march_in_place():
+    """REF-OR-SELF gate (min_ref=0.05, min_self=0.25): a big high step with BOTH
+    the reference AND the robot's own root stationary earns exactly 0 — an
+    in-place march has self-speed ~0 on a static ref, so it stays blocked."""
+    rew = FeetApexHeightReward(
+        apex_target_height=0.18, reward_mode="lift",
+        min_ref_speed=0.05, min_self_speed=0.25,
+    )
+    progress = torch.tensor([1, 1])
+    rew(_contacts(True), _positions(), GROUND, FOOT_IDS, progress,
+        ref_rigid_body_vel=REF_VEL_STATIC, rigid_body_vel=SELF_VEL_STATIC)
+    r, _ = _lift_big_high_step(rew, progress, REF_VEL_STATIC, SELF_VEL_STATIC)
+    torch.testing.assert_close(r, torch.tensor([0.0, 0.0]))
+
+
+def test_apex_lift_self_gate_pays_shoved_robot_under_static_ref():
+    """REF-OR-SELF gate: a big high step under a STATIONARY reference but with the
+    robot's OWN root moving 0.5 m/s (shoved / fallen) PAYS the full 1.0 — the
+    fall-RECOVERY escape hatch, gated relative to itself, not the ref traj."""
+    rew = FeetApexHeightReward(
+        apex_target_height=0.18, reward_mode="lift",
+        min_ref_speed=0.05, min_self_speed=0.25,
+    )
+    progress = torch.tensor([1, 1])
+    rew(_contacts(True), _positions(), GROUND, FOOT_IDS, progress,
+        ref_rigid_body_vel=REF_VEL_STATIC, rigid_body_vel=SELF_VEL_SHOVED)
+    r, _ = _lift_big_high_step(rew, progress, REF_VEL_STATIC, SELF_VEL_SHOVED)
+    torch.testing.assert_close(r, torch.tensor([1.0, 0.0]))
+
+
+def test_apex_lift_ref_gate_pays_moving_ref_even_if_robot_still():
+    """REF-OR-SELF gate: a big high step under a MOVING reference pays 1.0 even
+    with the robot's own root stationary — the ref side alone opens the gate."""
+    rew = FeetApexHeightReward(
+        apex_target_height=0.18, reward_mode="lift",
+        min_ref_speed=0.05, min_self_speed=0.25,
+    )
+    progress = torch.tensor([1, 1])
+    rew(_contacts(True), _positions(), GROUND, FOOT_IDS, progress,
+        ref_rigid_body_vel=REF_VEL_MOVING, rigid_body_vel=SELF_VEL_STATIC)
+    r, _ = _lift_big_high_step(rew, progress, REF_VEL_MOVING, SELF_VEL_STATIC)
+    torch.testing.assert_close(r, torch.tensor([1.0, 0.0]))
+
+
+def test_apex_lift_both_gates_zero_is_byte_identical_to_ungated():
+    """Regression guard for the LIVE gpu3202 run: BOTH thresholds 0.0 (the
+    launcher default PM_STEP_LIFT_MIN_REF_SPEED=0 / PM_STEP_LIFT_MIN_SELF_SPEED=0)
+    leave the lift reward byte-identical to the ungated kernel — even when a
+    STATIONARY ref AND a SHOVED self-vel tensor are both supplied. Steps the same
+    sequence through a both-zero kernel and an ungated kernel in lockstep."""
+    gated0 = FeetApexHeightReward(
+        apex_target_height=0.18, reward_mode="lift",
+        min_ref_speed=0.0, min_self_speed=0.0,
+    )
+    ungated = FeetApexHeightReward(apex_target_height=0.18, reward_mode="lift")
+    progress = torch.tensor([1, 1])
+
+    def both(contacts, pos, p):
+        rg = gated0(contacts, pos, GROUND, FOOT_IDS, p,
+                    ref_rigid_body_vel=REF_VEL_STATIC,
+                    rigid_body_vel=SELF_VEL_SHOVED)
+        ru = ungated(contacts, pos, GROUND, FOOT_IDS, p)
+        assert torch.equal(rg, ru), "both thresholds 0.0 must not alter emission"
+        return rg
+
+    both(_contacts(True), _positions(), progress)
+    for z in (0.10, 0.30, 0.20):
+        progress = progress + 1
+        both(_contacts(False), _positions(foot0_z=z), progress)
+    progress = progress + 1
+    r = both(_contacts(True), _positions(foot0_z=0.0), progress)
+    torch.testing.assert_close(r, torch.tensor([1.0, 0.0]))
 
 
 def test_step_displacement_reward_thresholds_and_caps_when_ref_moving():
@@ -421,13 +502,16 @@ def test_track_d_factories_are_dormant_by_default():
     assert apex_lift.compute_func.reward_mode == "lift"
     assert apex_lift.compute_func.apex_target_height == 0.18
     assert apex_lift.static_params["weight"] == 1.5
-    # LIFT ref-speed gate defaults OFF (0.0 = ungated) and passes through when set
-    # (imprint PR #119 step-in-place guard).
+    # LIFT REF-OR-SELF gate defaults OFF (both 0.0 = ungated) and both thresholds
+    # pass through when set (imprint PR #119 step-in-place guard).
     assert apex_lift.compute_func.min_ref_speed == 0.0
+    assert apex_lift.compute_func.min_self_speed == 0.0
     apex_lift_gated = max_feet_height_rew_factory(
-        weight=1.5, apex_target_height=0.18, reward_mode="lift", min_ref_speed=0.05
+        weight=1.5, apex_target_height=0.18, reward_mode="lift",
+        min_ref_speed=0.05, min_self_speed=0.25,
     )
     assert apex_lift_gated.compute_func.min_ref_speed == 0.05
+    assert apex_lift_gated.compute_func.min_self_speed == 0.25
     assert set(apex.dynamic_vars) == {
         "sim_contacts",
         "rigid_body_pos",
@@ -435,6 +519,7 @@ def test_track_d_factories_are_dormant_by_default():
         "contact_body_ids",
         "progress_buf",
         "ref_rigid_body_vel",
+        "rigid_body_vel",
     }
 
     step = step_displacement_rew_factory(
