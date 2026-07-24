@@ -162,6 +162,87 @@ def test_apex_lift_reward_mode_validation():
         FeetApexHeightReward(apex_target_height=0.18, reward_mode="bogus")
 
 
+def _lift_big_high_step(rew, progress, ref_vel):
+    """Drive one BIG HIGH swing of foot 0 (apex 0.30 >= 0.18 target -> pays the
+    capped 1.0 when ungated) through to touchdown; return (reward, progress).
+    ``ref_vel`` is threaded through so the LIFT gate can see the reference."""
+    for z in (0.10, 0.30, 0.20):
+        progress = progress + 1
+        rew(_contacts(False), _positions(foot0_z=z), GROUND, FOOT_IDS, progress,
+            ref_rigid_body_vel=ref_vel)
+    progress = progress + 1
+    r = rew(_contacts(True), _positions(foot0_z=0.0), GROUND, FOOT_IDS, progress,
+            ref_rigid_body_vel=ref_vel)
+    return r, progress
+
+
+def test_apex_lift_gate_blocks_static_reference():
+    """LIFT gate (min_ref_speed=0.05): a BIG HIGH step (would pay 1.0 ungated)
+    against a STATIONARY reference earns exactly 0 — this is the march-in-place
+    exploit close (imprint PR #119 step-in-place investigation)."""
+    rew = FeetApexHeightReward(
+        apex_target_height=0.18, reward_mode="lift", min_ref_speed=0.05
+    )
+    progress = torch.tensor([1, 1])
+    rew(_contacts(True), _positions(), GROUND, FOOT_IDS, progress,
+        ref_rigid_body_vel=REF_VEL_STATIC)
+    r, _ = _lift_big_high_step(rew, progress, REF_VEL_STATIC)
+    torch.testing.assert_close(r, torch.tensor([0.0, 0.0]))
+
+
+def test_apex_lift_gate_open_when_reference_moving():
+    """LIFT gate (min_ref_speed=0.05): the SAME big high step against a MOVING
+    reference is unchanged — pays the full capped 1.0. The gate only removes
+    stepping-in-place income; a genuine step is untouched."""
+    rew = FeetApexHeightReward(
+        apex_target_height=0.18, reward_mode="lift", min_ref_speed=0.05
+    )
+    progress = torch.tensor([1, 1])
+    rew(_contacts(True), _positions(), GROUND, FOOT_IDS, progress,
+        ref_rigid_body_vel=REF_VEL_MOVING)
+    r, _ = _lift_big_high_step(rew, progress, REF_VEL_MOVING)
+    torch.testing.assert_close(r, torch.tensor([1.0, 0.0]))
+
+
+def test_apex_lift_gate_zero_min_ref_speed_is_byte_identical_to_ungated():
+    """Regression guard for the LIVE gpu3202 run: min_ref_speed=0.0 (the default;
+    launcher ships PM_STEP_LIFT_MIN_REF_SPEED=0) leaves the lift reward
+    byte-identical to the pre-gate kernel — even under a STATIONARY reference and
+    even with no ref-vel tensor supplied. Steps the SAME sequence through a
+    gate-0.0 kernel (fed the static ref) and an ungated kernel (no ref) in
+    lockstep and asserts exact equality at every emission."""
+    gated0 = FeetApexHeightReward(
+        apex_target_height=0.18, reward_mode="lift", min_ref_speed=0.0
+    )
+    ungated = FeetApexHeightReward(apex_target_height=0.18, reward_mode="lift")
+    progress = torch.tensor([1, 1])
+
+    def both(contacts, pos, p):
+        rg = gated0(contacts, pos, GROUND, FOOT_IDS, p,
+                    ref_rigid_body_vel=REF_VEL_STATIC)
+        ru = ungated(contacts, pos, GROUND, FOOT_IDS, p)
+        assert torch.equal(rg, ru), "min_ref_speed=0.0 must not alter emission"
+        return rg
+
+    both(_contacts(True), _positions(), progress)
+
+    # Big high step under a STATIONARY ref: ungated pays 1.0, so gate-0.0 must
+    # ALSO pay 1.0 (the gate is off) — not the 0.0 the 0.05 gate would give.
+    for z in (0.10, 0.30, 0.20):
+        progress = progress + 1
+        both(_contacts(False), _positions(foot0_z=z), progress)
+    progress = progress + 1
+    r = both(_contacts(True), _positions(foot0_z=0.0), progress)
+    torch.testing.assert_close(r, torch.tensor([1.0, 0.0]))
+
+    # A following shuffle swing (apex 0.045 -> 0.045/0.18 = 0.25) also matches.
+    progress = progress + 1
+    both(_contacts(False), _positions(foot0_z=0.045), progress)
+    progress = progress + 1
+    r = both(_contacts(True), _positions(foot0_z=0.0), progress)
+    torch.testing.assert_close(r, torch.tensor([0.25, 0.0]))
+
+
 def test_step_displacement_reward_thresholds_and_caps_when_ref_moving():
     rew = StepDisplacementReward(min_step_length=0.1, reward_cap=0.5,
                                  min_ref_speed=0.1)
@@ -340,12 +421,20 @@ def test_track_d_factories_are_dormant_by_default():
     assert apex_lift.compute_func.reward_mode == "lift"
     assert apex_lift.compute_func.apex_target_height == 0.18
     assert apex_lift.static_params["weight"] == 1.5
+    # LIFT ref-speed gate defaults OFF (0.0 = ungated) and passes through when set
+    # (imprint PR #119 step-in-place guard).
+    assert apex_lift.compute_func.min_ref_speed == 0.0
+    apex_lift_gated = max_feet_height_rew_factory(
+        weight=1.5, apex_target_height=0.18, reward_mode="lift", min_ref_speed=0.05
+    )
+    assert apex_lift_gated.compute_func.min_ref_speed == 0.05
     assert set(apex.dynamic_vars) == {
         "sim_contacts",
         "rigid_body_pos",
         "ground_heights",
         "contact_body_ids",
         "progress_buf",
+        "ref_rigid_body_vel",
     }
 
     step = step_displacement_rew_factory(

@@ -134,7 +134,11 @@ class FeetApexHeightReward(_FootContactTransitionTracker):
       the target, and NEVER penalizes a shortfall (the raw is always ≥ 0).
       Weight POSITIVELY. "Always reward high steps": a taller swing always earns
       strictly more, up to the cap, so the gradient points up toward the target
-      instead of merely relaxing a cost.
+      instead of merely relaxing a cost. Optionally GATED on reference root xy
+      speed via ``min_ref_speed`` (default 0.0 = ungated): when set, a completed
+      swing pays only while the reference root is moving, so marching in place
+      against a stationary reference earns no lift (imprint PR #119 step-in-place
+      investigation). ``"shortfall"`` is never gated.
 
     Nothing is emitted while the foot is in the air or in stance (continuous
     air-time / height terms cause stomping; OmniH2O ships the continuous
@@ -151,6 +155,7 @@ class FeetApexHeightReward(_FootContactTransitionTracker):
         self,
         apex_target_height: float = 0.25,
         reward_mode: str = "shortfall",
+        min_ref_speed: float = 0.0,
     ):
         super().__init__()
         if apex_target_height <= 0.0:
@@ -160,8 +165,11 @@ class FeetApexHeightReward(_FootContactTransitionTracker):
                 "reward_mode must be 'shortfall' (negative apex-shortfall "
                 "penalty) or 'lift' (positive apex reward)."
             )
+        if min_ref_speed < 0.0:
+            raise ValueError("min_ref_speed must be non-negative.")
         self.apex_target_height = apex_target_height
         self.reward_mode = reward_mode
+        self.min_ref_speed = min_ref_speed
         self._swing_apex = None
 
     @_dynamo_disable
@@ -172,6 +180,7 @@ class FeetApexHeightReward(_FootContactTransitionTracker):
         ground_heights: Tensor,
         contact_body_ids: Tensor,
         progress_buf: Tensor,
+        ref_rigid_body_vel: Tensor = None,
     ) -> Tensor:
         contacts = sim_contacts[:, contact_body_ids].bool()
         touchdown, reset_mask = self._update_transitions(contacts, progress_buf)
@@ -207,6 +216,25 @@ class FeetApexHeightReward(_FootContactTransitionTracker):
                 (self.apex_target_height - self._swing_apex).clamp(min=0.0),
                 torch.zeros_like(self._swing_apex),
             )
+
+        # Reference-motion gate — "lift" mode ONLY: pay the positive lift income
+        # only while the REFERENCE root is moving in xy above ``min_ref_speed``,
+        # so a policy marching in place against a stationary / frozen-lower-body
+        # reference earns no lift (imprint PR #119 step-in-place investigation).
+        # Mirrors StepDisplacementReward's gate above (reshape + unsqueeze), so a
+        # flattened or [envs, bodies, 3] ref-vel tensor both work. "shortfall"
+        # stays UNGATED (a low step is bad whenever it happens). ``min_ref_speed
+        # == 0.0`` (the default) leaves emission byte-identical to ungated.
+        if (
+            self.reward_mode == "lift"
+            and ref_rigid_body_vel is not None
+            and self.min_ref_speed > 0.0
+        ):
+            ref_vel = ref_rigid_body_vel.reshape(emission.shape[0], -1, 3)
+            ref_speed_xy = ref_vel[:, 0, :2].norm(dim=-1)
+            gate = (ref_speed_xy > self.min_ref_speed).unsqueeze(-1)
+            emission = emission * gate
+
         self._swing_apex = torch.where(
             touchdown, torch.zeros_like(self._swing_apex), self._swing_apex
         )

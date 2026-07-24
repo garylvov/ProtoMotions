@@ -1080,6 +1080,7 @@ def max_feet_height_rew_factory(
     weight: float = 0.0,
     apex_target_height: float = 0.25,
     reward_mode: str = "shortfall",
+    min_ref_speed: float = 0.0,
     zero_during_grace_period: bool = True,
 ) -> MdpComponent:
     """Factory for the OmniH2O per-step swing-apex reward/penalty (dormant).
@@ -1109,6 +1110,12 @@ def max_feet_height_rew_factory(
         apex_target_height: Target swing apex height in meters.
         reward_mode: ``"shortfall"`` (negative penalty) or ``"lift"``
             (positive reward).
+        min_ref_speed: Reference root xy speed gate in m/s applied in
+            ``"lift"`` mode ONLY (default 0.0 = ungated, byte-identical to the
+            pre-gate reward). When positive, a completed swing pays lift only
+            while the reference root is moving, closing the march-in-place
+            exploit (imprint PR #119 step-in-place investigation). Ignored in
+            ``"shortfall"`` mode.
         zero_during_grace_period: Zero the reward during post-reset grace.
 
     Returns:
@@ -1118,7 +1125,9 @@ def max_feet_height_rew_factory(
 
     return MdpComponent(
         compute_func=FeetApexHeightReward(
-            apex_target_height=apex_target_height, reward_mode=reward_mode
+            apex_target_height=apex_target_height,
+            reward_mode=reward_mode,
+            min_ref_speed=min_ref_speed,
         ),
         dynamic_vars={
             "sim_contacts": EnvContext.current.rigid_body_contacts,
@@ -1126,6 +1135,7 @@ def max_feet_height_rew_factory(
             "ground_heights": EnvContext.ground_heights,
             "contact_body_ids": EnvContext.contact_body_ids,
             "progress_buf": EnvContext.progress_buf,
+            "ref_rigid_body_vel": EnvContext.mimic.ref_state.rigid_body_vel,
         },
         static_params={
             "weight": weight,
