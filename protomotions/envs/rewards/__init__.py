@@ -62,6 +62,7 @@ from protomotions.envs.rewards.tracking import (
 from protomotions.envs.rewards.big_step import (
     FeetApexHeightReward,
     StepDisplacementReward,
+    MicroStepTax,
     compute_in_the_air_penalty,
 )
 
@@ -85,6 +86,7 @@ from protomotions.envs.rewards.regularization import (
     compute_reference_contact_liftoff_penalty,
     compute_contact_force_change_rew,
     compute_foot_contact_force_penalty,
+    compute_foot_slip_penalty,
     compute_fall_penalty,
     # Helper functions
     joint_limit_violation,
@@ -133,6 +135,7 @@ __all__ = [
     # Big-step reward kernels (Track D, OmniH2O-style, dormant)
     "FeetApexHeightReward",
     "StepDisplacementReward",
+    "MicroStepTax",
     "compute_in_the_air_penalty",
     # Task reward kernels
     "compute_heading_velocity_rew",
@@ -150,6 +153,7 @@ __all__ = [
     "compute_reference_contact_liftoff_penalty",
     "compute_contact_force_change_rew",
     "compute_foot_contact_force_penalty",
+    "compute_foot_slip_penalty",
     "compute_fall_penalty",
     # Regularization helper functions
     "joint_limit_violation",

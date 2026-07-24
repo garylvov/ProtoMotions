@@ -1207,6 +1207,90 @@ def in_the_air_penalty_factory(
     )
 
 
+def micro_step_tax_factory(
+    weight: float = 0.0,
+    max_step_length: float = 0.10,
+    max_apex_height: float = 0.06,
+    zero_during_grace_period: bool = True,
+) -> MdpComponent:
+    """Factory for the MicroStepTax anti-shuffle kernel (dormant by default).
+
+    Taxes the shuffle signature: touchdowns whose completed step was BOTH short
+    (xy travel < ``max_step_length``) AND low (swing apex < ``max_apex_height``).
+    Emits a per-step count of such events, summed over feet; apply a NEGATIVE
+    ``weight``. Standing feet (no touchdown) and big steps (travel above the
+    threshold, any height) are never taxed -- see ``MicroStepTax``. Stateful
+    kernel; per-env state resets automatically with the episode via
+    ``progress_buf``. Default ``weight=0.0`` = dormant.
+
+    Args:
+        weight: Reward weight (default 0.0 = dormant; NEGATIVE to enable --
+            the kernel emits a positive shuffle-event count).
+        max_step_length: Short-step threshold in meters (default 0.10). A step
+            at or above this is never taxed regardless of apex.
+        max_apex_height: Low-step threshold in meters (default 0.06). A step at
+            or above this apex is never taxed regardless of length.
+        zero_during_grace_period: Zero the tax during post-reset grace.
+
+    Returns:
+        MdpComponent configured for the micro-step (shuffle) tax.
+    """
+    from protomotions.envs.rewards import MicroStepTax
+
+    return MdpComponent(
+        compute_func=MicroStepTax(
+            max_step_length=max_step_length,
+            max_apex_height=max_apex_height,
+        ),
+        dynamic_vars={
+            "sim_contacts": EnvContext.current.rigid_body_contacts,
+            "rigid_body_pos": EnvContext.current.rigid_body_pos,
+            "ground_heights": EnvContext.ground_heights,
+            "contact_body_ids": EnvContext.contact_body_ids,
+            "progress_buf": EnvContext.progress_buf,
+        },
+        static_params={
+            "weight": weight,
+            "zero_during_grace_period": zero_during_grace_period,
+        },
+    )
+
+
+def foot_slip_penalty_factory(
+    weight: float = 0.0,
+    zero_during_grace_period: bool = True,
+) -> MdpComponent:
+    """Factory for the foot-slip (drag) penalty (dormant by default).
+
+    Penalizes the horizontal speed of feet that are currently in contact
+    (contact AND moving = a drag). Summed over the configured foot bodies; apply
+    a small NEGATIVE ``weight``. A planted (zero-velocity) stance foot pays
+    nothing; an airborne swing foot is not penalized regardless of speed -- see
+    ``compute_foot_slip_penalty``. Stateless. Default ``weight=0.0`` = dormant.
+
+    Args:
+        weight: Reward weight (default 0.0 = dormant; NEGATIVE to enable).
+        zero_during_grace_period: Zero the penalty during post-reset grace.
+
+    Returns:
+        MdpComponent configured for the foot-slip penalty.
+    """
+    from protomotions.envs.rewards import compute_foot_slip_penalty
+
+    return MdpComponent(
+        compute_func=compute_foot_slip_penalty,
+        dynamic_vars={
+            "sim_contacts": EnvContext.current.rigid_body_contacts,
+            "rigid_body_vel": EnvContext.current.rigid_body_vel,
+            "contact_body_ids": EnvContext.contact_body_ids,
+        },
+        static_params={
+            "weight": weight,
+            "zero_during_grace_period": zero_during_grace_period,
+        },
+    )
+
+
 def contact_force_change_rew_factory(
     weight: float = -1e-5,
     min_value: Optional[float] = -0.5,

@@ -259,6 +259,106 @@ class StepDisplacementReward(_FootContactTransitionTracker):
         return step_reward.sum(dim=-1)
 
 
+class MicroStepTax(_FootContactTransitionTracker):
+    """Per-touchdown tax on the shuffle signature: steps that are BOTH short AND low.
+
+    At each foot touchdown, emits ``1.0`` (summed over feet) ONLY when the
+    completed step was simultaneously
+
+    - SHORT: xy travel since that foot's previous touchdown < ``max_step_length``
+      (default 0.10 m), AND
+    - LOW: swing apex above ground since liftoff < ``max_apex_height``
+      (default 0.06 m).
+
+    This is exactly the shuffle: a tiny, ground-hugging shuffle-step. Weight it
+    NEGATIVELY.
+
+    What this kernel deliberately does NOT tax (the two hard constraints):
+
+    - PLANTED / STANDING feet: a stance foot never lifts off and never lands, so
+      it produces no touchdown transition -> no tax, ever. Stance = exactly 0.
+    - BIG steps: any touchdown whose xy travel >= ``max_step_length`` is NOT
+      taxed, regardless of how low it was. A big low-clearance stride (a genuine
+      drag) is out of scope here -- that is the foot-slip penalty's job. Only the
+      short-AND-low intersection is taxed; either condition alone spares the step.
+
+    Stateful (per-foot swing apex + last-touchdown xy). Per-env state resets
+    automatically with the episode via ``progress_buf``, and touchdown events on
+    reset steps are suppressed by the shared transition tracker, so the first
+    post-reset landing is never taxed off a stale anchor.
+
+    Raw units: count of short-AND-low touchdown events this step, summed over
+    feet (0, 1, or 2 for two feet).
+    """
+
+    __name__ = "micro_step_tax"
+
+    def __init__(
+        self,
+        max_step_length: float = 0.10,
+        max_apex_height: float = 0.06,
+    ):
+        super().__init__()
+        if max_step_length < 0.0:
+            raise ValueError("max_step_length must be non-negative.")
+        if max_apex_height < 0.0:
+            raise ValueError("max_apex_height must be non-negative.")
+        self.max_step_length = max_step_length
+        self.max_apex_height = max_apex_height
+        self._swing_apex = None
+        self._last_touchdown_xy = None
+
+    @_dynamo_disable
+    def __call__(
+        self,
+        sim_contacts: Tensor,
+        rigid_body_pos: Tensor,
+        ground_heights: Tensor,
+        contact_body_ids: Tensor,
+        progress_buf: Tensor,
+    ) -> Tensor:
+        contacts = sim_contacts[:, contact_body_ids].bool()
+        touchdown, reset_mask = self._update_transitions(contacts, progress_buf)
+
+        if self._swing_apex is None or self._swing_apex.shape != contacts.shape:
+            self._swing_apex = torch.zeros(
+                contacts.shape, dtype=torch.float32, device=contacts.device
+            )
+        self._swing_apex[reset_mask] = 0.0
+
+        foot_xy = rigid_body_pos[:, contact_body_ids, :2]
+        if (
+            self._last_touchdown_xy is None
+            or self._last_touchdown_xy.shape != foot_xy.shape
+        ):
+            self._last_touchdown_xy = foot_xy.clone()
+        self._last_touchdown_xy[reset_mask] = foot_xy[reset_mask]
+
+        heights = _foot_heights(rigid_body_pos, contact_body_ids, ground_heights)
+
+        # Track swing apex for airborne feet (including the liftoff frame).
+        in_air = ~contacts
+        self._swing_apex = torch.where(
+            in_air, torch.maximum(self._swing_apex, heights), self._swing_apex
+        )
+
+        step_length = torch.norm(foot_xy - self._last_touchdown_xy, dim=-1)
+        is_short = step_length < self.max_step_length
+        is_low = self._swing_apex < self.max_apex_height
+        tax = (touchdown & is_short & is_low).float()
+
+        # Clear the apex accumulator and re-anchor the step measurement at this
+        # touchdown position (only for feet that just landed).
+        self._swing_apex = torch.where(
+            touchdown, torch.zeros_like(self._swing_apex), self._swing_apex
+        )
+        self._last_touchdown_xy = torch.where(
+            touchdown.unsqueeze(-1), foot_xy, self._last_touchdown_xy
+        )
+
+        return tax.sum(dim=-1)
+
+
 def compute_in_the_air_penalty(
     sim_contacts: Tensor,
     contact_body_ids: Tensor,
@@ -279,5 +379,6 @@ def compute_in_the_air_penalty(
 __all__ = [
     "FeetApexHeightReward",
     "StepDisplacementReward",
+    "MicroStepTax",
     "compute_in_the_air_penalty",
 ]

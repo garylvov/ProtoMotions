@@ -361,6 +361,43 @@ def compute_foot_contact_force_penalty(
     return excess.sum(dim=-1)
 
 
+def compute_foot_slip_penalty(
+    sim_contacts: Tensor,
+    rigid_body_vel: Tensor,
+    contact_body_ids: Tensor,
+) -> Tensor:
+    """Foot-slip (drag) penalty: horizontal speed of feet while in contact.
+
+    Classic slip term: a foot that is touching the ground should not be
+    translating. Emits, summed over the configured foot bodies, the horizontal
+    (xy) speed of each foot that is CURRENTLY IN CONTACT. Apply a small NEGATIVE
+    weight in the factory.
+
+    The two hard constraints are satisfied by construction:
+
+    - PLANTED / STANDING feet: a stance foot has (near) zero velocity, so a
+      still-standing foot contributes (near) 0. A perfectly planted foot =
+      exactly 0. There is no penalty for merely being in contact.
+    - SWING feet: a foot that is airborne (not in contact) is multiplied by a
+      zero contact mask, so it is NOT penalized no matter how fast it moves --
+      big fast swings are free; only contact-AND-moving (a drag) is taxed.
+
+    Stateless. Raw units: sum over contact feet of xy speed (m/s).
+
+    Args:
+        sim_contacts: Simulated contact flags [num_envs, num_bodies].
+        rigid_body_vel: Per-body linear velocities [num_envs, num_bodies, 3].
+        contact_body_ids: Indices of the foot bodies to penalize [num_feet].
+
+    Returns:
+        Sum over in-contact feet of horizontal foot speed [num_envs].
+    """
+    contacts = sim_contacts[:, contact_body_ids].bool()
+    foot_vel_xy = rigid_body_vel[:, contact_body_ids, :2]
+    speed_xy = torch.norm(foot_vel_xy, dim=-1)
+    return (speed_xy * contacts.float()).sum(dim=-1)
+
+
 def compute_fall_penalty(
     current_anchor_pos: Tensor,
     ref_rigid_body_pos: Tensor,
@@ -493,6 +530,7 @@ __all__ = [
     "compute_reference_contact_liftoff_penalty",
     "compute_contact_force_change_rew",
     "compute_foot_contact_force_penalty",
+    "compute_foot_slip_penalty",
     "compute_fall_penalty",
     # Helper functions
     "joint_limit_violation",
