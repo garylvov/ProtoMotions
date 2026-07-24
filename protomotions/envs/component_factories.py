@@ -1079,35 +1079,47 @@ def reference_contact_liftoff_penalty_factory(
 def max_feet_height_rew_factory(
     weight: float = 0.0,
     apex_target_height: float = 0.25,
+    reward_mode: str = "shortfall",
     zero_during_grace_period: bool = True,
 ) -> MdpComponent:
-    """Factory for the OmniH2O per-step swing-apex SHORTFALL penalty (dormant).
+    """Factory for the OmniH2O per-step swing-apex reward/penalty (dormant).
 
     Track D objective 2, REWORKED 2026-07-10 per the OmniH2O code audit
     (arXiv 2406.08858; their yaml ships a raw −2500 apex-shortfall term,
-    un-gated): tracks each foot's swing apex between touchdowns and emits
-    ``max(0, apex_target_height - apex)`` ONCE at the touchdown transition —
-    never continuously (continuous feet-height / air-time terms cause
-    stomping; their continuous feet-height term ships at weight 0). Weight it
-    NEGATIVELY: shuffle steps cost their shortfall, target-height steps cost
-    nothing, standing still emits nothing. Stateful kernel; per-env state
-    resets automatically with the episode via ``progress_buf``. Default
-    ``weight=0.0`` = dormant.
+    un-gated): tracks each foot's swing apex between touchdowns and emits ONCE
+    at the touchdown transition — never continuously (continuous feet-height /
+    air-time terms cause stomping; their continuous feet-height term ships at
+    weight 0). Stateful kernel; per-env state resets automatically with the
+    episode via ``progress_buf``. Default ``weight=0.0`` = dormant.
+
+    Two ``reward_mode`` forms (see ``FeetApexHeightReward``):
+
+    - ``"shortfall"`` (default, back-compat): emits
+      ``max(0, apex_target_height - apex)``; weight NEGATIVELY. Shuffle steps
+      cost their shortfall, target-height steps cost nothing, standing emits
+      nothing — but a policy eating the penalty gets no gradient toward a
+      HIGHER step.
+    - ``"lift"`` (v2): emits ``min(apex, apex_target_height)/apex_target_height``
+      in ``[0, 1]``; weight POSITIVELY. Pays for lifting and always rewards a
+      higher step up to the target (imprint PR #119 stepping-rebalance).
 
     Args:
-        weight: Reward weight (default 0.0 = dormant; NEGATIVE to enable —
-            the kernel emits a positive shortfall).
-        apex_target_height: Target swing apex height in meters (shortfall is
-            measured against this).
+        weight: Reward weight (default 0.0 = dormant; NEGATIVE for
+            ``"shortfall"``, POSITIVE for ``"lift"``).
+        apex_target_height: Target swing apex height in meters.
+        reward_mode: ``"shortfall"`` (negative penalty) or ``"lift"``
+            (positive reward).
         zero_during_grace_period: Zero the reward during post-reset grace.
 
     Returns:
-        MdpComponent configured for the swing-apex shortfall penalty.
+        MdpComponent configured for the swing-apex reward/penalty.
     """
     from protomotions.envs.rewards import FeetApexHeightReward
 
     return MdpComponent(
-        compute_func=FeetApexHeightReward(apex_target_height=apex_target_height),
+        compute_func=FeetApexHeightReward(
+            apex_target_height=apex_target_height, reward_mode=reward_mode
+        ),
         dynamic_vars={
             "sim_contacts": EnvContext.current.rigid_body_contacts,
             "rigid_body_pos": EnvContext.current.rigid_body_pos,

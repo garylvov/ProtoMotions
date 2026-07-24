@@ -118,6 +118,50 @@ def test_apex_shortfall_reset_clears_state_and_suppresses_touchdown():
     torch.testing.assert_close(r, torch.tensor([0.18, 0.0]))
 
 
+def test_apex_lift_pays_positive_capped_at_target_and_zero_for_stance():
+    """v2 positive LIFT mode (imprint PR #119): a completed swing earns
+    ``min(apex, target)/target`` at touchdown — a big high step pays the max
+    (1.0), a shuffle pays proportionally small, a planted stance foot never
+    lands and pays exactly 0. NEVER negative (no shortfall penalty)."""
+    rew = FeetApexHeightReward(apex_target_height=0.18, reward_mode="lift")
+    progress = torch.tensor([1, 1])
+
+    # Step 1: both feet planted (state init) -> 0.
+    r = rew(_contacts(True), _positions(), GROUND, FOOT_IDS, progress)
+    assert torch.equal(r, torch.zeros(NUM_ENVS))
+
+    # BIG HIGH step: apex 0.30 >= 0.18 target -> capped at max pay 1.0, once,
+    # env 0 only; env 1 (planted stance) stays 0.
+    for z in (0.10, 0.30, 0.20):
+        progress = progress + 1
+        r = rew(_contacts(False), _positions(foot0_z=z), GROUND, FOOT_IDS, progress)
+        assert torch.equal(r, torch.zeros(NUM_ENVS)), "no emission during swing"
+    progress = progress + 1
+    r = rew(_contacts(True), _positions(foot0_z=0.0), GROUND, FOOT_IDS, progress)
+    torch.testing.assert_close(r, torch.tensor([1.0, 0.0]))
+
+    # Standing after the landing pays nothing (no touchdown).
+    progress = progress + 1
+    r = rew(_contacts(True), _positions(), GROUND, FOOT_IDS, progress)
+    assert torch.equal(r, torch.zeros(NUM_ENVS))
+
+    # SHUFFLE swing: apex only 0.045 -> small proportional pay 0.045/0.18=0.25,
+    # never negative.
+    progress = progress + 1
+    r = rew(_contacts(False), _positions(foot0_z=0.045), GROUND, FOOT_IDS, progress)
+    assert torch.equal(r, torch.zeros(NUM_ENVS))
+    progress = progress + 1
+    r = rew(_contacts(True), _positions(foot0_z=0.0), GROUND, FOOT_IDS, progress)
+    torch.testing.assert_close(r, torch.tensor([0.25, 0.0]))
+
+
+def test_apex_lift_reward_mode_validation():
+    import pytest
+
+    with pytest.raises(ValueError):
+        FeetApexHeightReward(apex_target_height=0.18, reward_mode="bogus")
+
+
 def test_step_displacement_reward_thresholds_and_caps_when_ref_moving():
     rew = StepDisplacementReward(min_step_length=0.1, reward_cap=0.5,
                                  min_ref_speed=0.1)
@@ -288,6 +332,14 @@ def test_track_d_factories_are_dormant_by_default():
 
     apex = max_feet_height_rew_factory(weight=-8.0, apex_target_height=0.25)
     assert apex.compute_func.apex_target_height == 0.25
+    assert apex.compute_func.reward_mode == "shortfall"  # back-compat default
+    # v2 positive LIFT mode passes through (imprint PR #119).
+    apex_lift = max_feet_height_rew_factory(
+        weight=1.5, apex_target_height=0.18, reward_mode="lift"
+    )
+    assert apex_lift.compute_func.reward_mode == "lift"
+    assert apex_lift.compute_func.apex_target_height == 0.18
+    assert apex_lift.static_params["weight"] == 1.5
     assert set(apex.dynamic_vars) == {
         "sim_contacts",
         "rigid_body_pos",

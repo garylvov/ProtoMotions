@@ -111,28 +111,57 @@ class _FootContactTransitionTracker:
 
 
 class FeetApexHeightReward(_FootContactTransitionTracker):
-    """Per-step swing-apex SHORTFALL penalty (OmniH2O max-feet-height form).
+    """Per-step swing-apex reward — SHORTFALL penalty OR positive LIFT reward.
 
     Tracks each foot's swing apex (max height above ground since liftoff) and
-    emits ``max(0, apex_target_height - apex)`` ONCE at touchdown, summed over
-    feet. Weight NEGATIVELY: a shuffle step with a 5 cm apex against the
-    default 0.25 m target costs 0.20 raw; a step at/above the target costs
-    nothing; standing still emits nothing (no touchdown events). Nothing is
-    emitted while the foot is in the air or in stance — continuous air-time /
-    height terms cause stomping (OmniH2O, arXiv 2406.08858; their shipped
-    config carries the raw −2500 apex-shortfall term un-gated and the
-    continuous feet-height term at weight 0).
+    emits ONCE at touchdown, summed over feet. Two ``reward_mode`` forms share
+    this identical touchdown gating (standing / stance feet never land, so they
+    always emit exactly 0):
 
-    Raw units: meters of apex shortfall per touchdown event, summed over feet.
+    - ``"shortfall"`` (default, back-compat): emits
+      ``max(0, apex_target_height - apex)``. Weight NEGATIVELY — a shuffle step
+      with a 5 cm apex against the default 0.25 m target costs 0.20 raw; a step
+      at/above the target costs nothing. This is OmniH2O's anti-stomp economics
+      (arXiv 2406.08858; their yaml ships the raw −2500 apex-shortfall term
+      un-gated and the continuous feet-height term at weight 0) but it only ever
+      REMOVES a penalty as the foot lifts — it never pays for lifting, so a
+      policy already eating the penalty has no positive gradient toward a higher
+      step (the ep2502 freeze-attractor; see imprint PR #119).
+
+    - ``"lift"`` (v2, positive): emits ``min(apex, apex_target_height) /
+      apex_target_height`` — a normalized reward in ``[0, 1]`` per completed
+      swing that PAYS for lifting, grows monotonically with apex, saturates at
+      the target, and NEVER penalizes a shortfall (the raw is always ≥ 0).
+      Weight POSITIVELY. "Always reward high steps": a taller swing always earns
+      strictly more, up to the cap, so the gradient points up toward the target
+      instead of merely relaxing a cost.
+
+    Nothing is emitted while the foot is in the air or in stance (continuous
+    air-time / height terms cause stomping; OmniH2O ships the continuous
+    feet-height term at weight 0).
+
+    Raw units: ``"shortfall"`` = meters of apex shortfall per touchdown,
+    summed over feet; ``"lift"`` = normalized apex fraction in ``[0, 1]`` per
+    touchdown, summed over feet.
     """
 
     __name__ = "feet_apex_height_reward"
 
-    def __init__(self, apex_target_height: float = 0.25):
+    def __init__(
+        self,
+        apex_target_height: float = 0.25,
+        reward_mode: str = "shortfall",
+    ):
         super().__init__()
         if apex_target_height <= 0.0:
             raise ValueError("apex_target_height must be positive.")
+        if reward_mode not in ("shortfall", "lift"):
+            raise ValueError(
+                "reward_mode must be 'shortfall' (negative apex-shortfall "
+                "penalty) or 'lift' (positive apex reward)."
+            )
         self.apex_target_height = apex_target_height
+        self.reward_mode = reward_mode
         self._swing_apex = None
 
     @_dynamo_disable
@@ -161,17 +190,28 @@ class FeetApexHeightReward(_FootContactTransitionTracker):
             in_air, torch.maximum(self._swing_apex, heights), self._swing_apex
         )
 
-        # Emit the apex shortfall once, at touchdown; then clear that apex.
-        shortfall = torch.where(
-            touchdown,
-            (self.apex_target_height - self._swing_apex).clamp(min=0.0),
-            torch.zeros_like(self._swing_apex),
-        )
+        # Emit once, at touchdown; then clear that apex. "shortfall" pays the
+        # (non-negative) apex deficit to be weighted NEGATIVELY; "lift" pays the
+        # normalized achieved apex, capped at the target, to be weighted
+        # POSITIVELY. Both are 0 off a touchdown (standing/stance never lands).
+        if self.reward_mode == "lift":
+            emission = torch.where(
+                touchdown,
+                self._swing_apex.clamp(max=self.apex_target_height)
+                / self.apex_target_height,
+                torch.zeros_like(self._swing_apex),
+            )
+        else:  # "shortfall"
+            emission = torch.where(
+                touchdown,
+                (self.apex_target_height - self._swing_apex).clamp(min=0.0),
+                torch.zeros_like(self._swing_apex),
+            )
         self._swing_apex = torch.where(
             touchdown, torch.zeros_like(self._swing_apex), self._swing_apex
         )
 
-        return shortfall.sum(dim=-1)
+        return emission.sum(dim=-1)
 
 
 class StepDisplacementReward(_FootContactTransitionTracker):
