@@ -43,6 +43,7 @@
 #    - Works with any subset_method configuration
 
 
+import os
 import torch
 import numpy as np
 from omegaconf.listconfig import ListConfig
@@ -85,6 +86,35 @@ class MotionManager:
             self.num_envs, dtype=torch.long, device=self.device
         )
         self.motion_times = torch.zeros(num_envs, device=device)
+
+        # -- Online sagittal mirror augmentation (ref-side) --------------------
+        # PM_MIRROR_PROB (env-gated, resume-safe): per-episode Bernoulli prob of
+        # serving the sampled REFERENCE motion mirrored across the sagittal plane
+        # (see components/motion_mirror.py). Read LIVE from os.environ (like
+        # PM_ARM_KP in robot_configs/h1_2.py) so a resume rebuilds the manager and
+        # picks up a newly-exported prob without the frozen-config problem. Default
+        # 0.0 == OFF == byte-identical (the per-env flags stay all-False and every
+        # mirror call site is bypassed at the python level). Config field
+        # ``mirror_prob`` provides a non-env default; the env var wins when set.
+        _env_prob = os.environ.get("PM_MIRROR_PROB")
+        if _env_prob is not None:
+            self.mirror_prob = float(_env_prob)
+        else:
+            self.mirror_prob = float(getattr(self.config, "mirror_prob", 0.0) or 0.0)
+        assert 0.0 <= self.mirror_prob <= 1.0, (
+            f"PM_MIRROR_PROB must be in [0,1], got {self.mirror_prob}"
+        )
+        # Per-env mirror flag; persists for the whole episode (only overwritten at
+        # that env's next sample_motions), so every ref access for the episode
+        # (current + future frames) sees a consistent handedness.
+        self.mirror_flags = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        if self.mirror_prob > 0.0:
+            print(
+                f"Motion Manager: ONLINE MIRROR augmentation ENABLED "
+                f"(PM_MIRROR_PROB={self.mirror_prob})"
+            )
 
         # Sampling vectors
         self.init_start_probs = (
@@ -470,6 +500,14 @@ class MotionManager:
 
         self.motion_ids[env_ids] = new_motion_ids
         self.motion_times[env_ids] = new_times
+
+        # Draw a fresh per-episode mirror coin for the reset envs (default OFF ->
+        # stays all-False -> no behavioral change).
+        if self.mirror_prob > 0.0:
+            probs = torch.full(
+                (len(env_ids),), self.mirror_prob, device=self.device
+            )
+            self.mirror_flags[env_ids] = torch.bernoulli(probs).bool()
 
     def update_sampling_weights(self, weights: torch.Tensor):
         k = min(50, weights.shape[0])

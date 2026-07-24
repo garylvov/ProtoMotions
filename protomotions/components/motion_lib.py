@@ -807,8 +807,17 @@ class MotionLib:
         return self._goal_state_time_cache[motion_ids]
 
     def get_motion_state(
-        self, motion_ids, motion_times, joint_3d_format="exp_map"
+        self, motion_ids, motion_times, joint_3d_format="exp_map", mirror_flags=None
     ) -> RobotState:
+        """Sample interpolated reference state.
+
+        mirror_flags: optional bool tensor aligned 1:1 with ``motion_ids`` rows.
+        When provided (and mirror maps are attached via ``set_mirror_maps``), the
+        selected rows are sagittal-mirrored in place AFTER blending -- a rigid
+        reflection is linear, so mirror-after-blend == blend-of-mirrors, and
+        doing it once post-blend is cheaper. ``None`` (the default) is a total
+        no-op, so ``PM_MIRROR_PROB=0`` stays byte-identical.
+        """
         frame_idx0, frame_idx1, blend = self._calc_frame_blend_from_id_and_time(
             motion_ids, motion_times
         )
@@ -878,7 +887,26 @@ class MotionLib:
                     + motion_state_1.rigid_body_contacts
                 ) / 2.0
 
+        # Online sagittal mirror augmentation (ref-side). No-op unless mirror
+        # maps are attached AND a per-row flag tensor is supplied.
+        if mirror_flags is not None and self._mirror_maps is not None:
+            from protomotions.components.motion_mirror import mirror_robot_state
+
+            mirror_robot_state(motion_state_0, mirror_flags, self._mirror_maps)
+
         return motion_state_0
+
+    # ---- Online mirror augmentation plumbing --------------------------------
+    _mirror_maps = None
+
+    def set_mirror_maps(self, mirror_maps) -> None:
+        """Attach precomputed sagittal-mirror maps (built once, on device).
+
+        Set by the env after robot_config is available. When unset,
+        ``get_motion_state(..., mirror_flags=...)`` is a no-op regardless of the
+        flags, so the default path is byte-identical.
+        """
+        self._mirror_maps = mirror_maps
 
     def get_motion_state_exact_frame(
         self,

@@ -645,6 +645,27 @@ def main():
         env_config = resolved_configs["env"]
         agent_config = resolved_configs["agent"]
 
+        # PM_MIRROR_PROB (env-gated, resume-safe): online sagittal-mirror ref
+        # augmentation. Unlike the reward gates below, this lives on the motion
+        # manager, which IS rebuilt fresh from motion_lib_config on resume -- and
+        # MotionManager.__init__ reads PM_MIRROR_PROB LIVE from os.environ,
+        # preferring it over the frozen config field. So enabling mirror at a
+        # resume boundary just works: export PM_MIRROR_PROB=0.5 and resume. We
+        # still stamp the frozen config here so resolved_configs.pt reflects the
+        # active value (keeps the human-readable snapshot honest). No-op unless
+        # the env var is explicitly present.
+        _mirror_env = os.environ.get("PM_MIRROR_PROB")
+        if _mirror_env is not None:
+            _mm_cfg = getattr(motion_lib_config, "motion_manager", None) \
+                or getattr(env_config, "motion_manager", None)
+            if _mm_cfg is not None and hasattr(_mm_cfg, "mirror_prob"):
+                log.info(
+                    f"RESUME override motion_manager.mirror_prob: "
+                    f"{getattr(_mm_cfg, 'mirror_prob', None)} -> {float(_mirror_env)} "
+                    f"(from PM_MIRROR_PROB; live-read also applies)"
+                )
+                _mm_cfg.mirror_prob = float(_mirror_env)
+
         # PM_WRIST_*_WEIGHT / _SIGMA (env-gated, resume-safe): resume freezes
         # reward config from the pickle, so the experiment file's env gates
         # never run here. Re-apply them on the loaded components so reward

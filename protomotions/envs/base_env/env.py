@@ -268,6 +268,7 @@ class BaseEnv:
         if self.motion_lib.num_motions() > 0:
             self._validate_motion_lib_compatibility()
             self.create_motion_manager()
+            self._init_mirror_maps()
         else:
             self.motion_manager = None
 
@@ -321,6 +322,36 @@ class BaseEnv:
                 f"checkpoint/config.\n"
                 f"{'=' * 70}"
             )
+
+    def _init_mirror_maps(self):
+        """Build + attach sagittal-mirror maps for online mirror augmentation.
+
+        Built once here (env init) from robot kinematics, moved to device, and
+        attached to the motion lib. Cheap and side-effect-free: the maps are only
+        consulted when ``get_motion_state`` is called with ``mirror_flags`` (which
+        the call sites pass only when ``motion_manager.mirror_prob > 0``), so
+        attaching them unconditionally keeps the default path byte-identical while
+        letting a resume enable the feature via PM_MIRROR_PROB.
+        """
+        from protomotions.components.motion_mirror import build_mirror_maps
+
+        ki = self.robot_config.kinematic_info
+        try:
+            maps = build_mirror_maps(
+                body_names=ki.body_names,
+                dof_names=ki.dof_names,
+                hinge_axes_map=ki.hinge_axes_map,
+                w_last=True,  # COMMON RobotState.rigid_body_rot is XYZW
+                device=self.device,
+            )
+        except ValueError as e:
+            # Robot is not left/right symmetric -> mirror unsupported. Only a hard
+            # error if the user actually asked for it; otherwise stay silent.
+            if getattr(self.motion_manager, "mirror_prob", 0.0) > 0.0:
+                raise
+            print(f"[mirror] disabled (robot not L/R symmetric): {e}")
+            return
+        self.motion_lib.set_mirror_maps(maps)
 
     ###############################################################
     # Getters
@@ -804,9 +835,16 @@ class BaseEnv:
             env_ids: Environment indices to align
             root_pos: Desired root positions [len(env_ids), 3]
         """
+        _mm = self.motion_manager
+        _mirror_flags = (
+            _mm.mirror_flags[env_ids]
+            if (_mm is not None and getattr(_mm, "mirror_prob", 0.0) > 0.0)
+            else None
+        )
         ref_state = self.motion_lib.get_motion_state(
             self.motion_manager.motion_ids[env_ids],
             self.motion_manager.motion_times[env_ids],
+            mirror_flags=_mirror_flags,
         )
 
         self.respawn_root_offset[env_ids, :2] = (
@@ -1687,7 +1725,18 @@ class BaseEnv:
             Tuple of (reset_state, object_reset_state)
         """
 
-        ref_state = self.motion_lib.get_motion_state(motion_ids, motion_times)
+        # Mirror the RSI init pose for envs whose fresh per-episode coin came up
+        # mirrored (flags set in sample_motions, called just before this). Aligned
+        # to env_ids == ref_env_ids. None when PM_MIRROR_PROB=0.
+        _mm = self.motion_manager
+        _mirror_flags = (
+            _mm.mirror_flags[env_ids]
+            if (_mm is not None and getattr(_mm, "mirror_prob", 0.0) > 0.0)
+            else None
+        )
+        ref_state = self.motion_lib.get_motion_state(
+            motion_ids, motion_times, mirror_flags=_mirror_flags
+        )
         new_states = ResetState.from_robot_state(ref_state)
 
         new_object_states = self.scene_lib.get_scene_pose(
@@ -1951,9 +2000,22 @@ class BaseEnv:
             flat_motion_ids = expanded_motion_ids.reshape(-1)
             flat_motion_times = expanded_motion_times.reshape(-1)
 
+            # Mirror the historical window consistently with the episode's coin.
+            # motion_ids here == motion_manager.motion_ids[ref_env_ids]; broadcast
+            # the per-env flags across buffer_size (envs-major, matching the
+            # [num_ref_envs, buffer_size] flatten above). None when prob=0.
+            _mm = self.motion_manager
+            if _mm is not None and getattr(_mm, "mirror_prob", 0.0) > 0.0:
+                _flags = _mm.mirror_flags[ref_env_ids]
+                flat_mirror_flags = (
+                    _flags.unsqueeze(1).expand(-1, buffer_size).reshape(-1)
+                )
+            else:
+                flat_mirror_flags = None
+
             # Query motion library
             historical_state = self.motion_lib.get_motion_state(
-                flat_motion_ids, flat_motion_times
+                flat_motion_ids, flat_motion_times, mirror_flags=flat_mirror_flags
             )
 
             # Motion library data is recorded on flat terrain (height = 0)

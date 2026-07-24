@@ -55,6 +55,21 @@ class MotionManagerConfig:
         }
     )
 
+    mirror_prob: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "Online sagittal-mirror augmentation: per-episode Bernoulli "
+                "probability of serving the sampled reference motion mirrored "
+                "left<->right (components/motion_mirror.py). 0.0 disables "
+                "(byte-identical). The PM_MIRROR_PROB env var overrides this at "
+                "runtime (resume-safe)."
+            ),
+            "min": 0.0,
+            "max": 1.0,
+        },
+    )
+
 
 @dataclass
 class MimicMotionManagerConfig(MotionManagerConfig):

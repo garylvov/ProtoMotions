@@ -103,9 +103,18 @@ class MimicControl(ControlComponent):
         device = self.env.device
         motion_ids = self.env.motion_manager.motion_ids
         motion_times = self.env.motion_manager.motion_times
-        
+
+        # Online mirror augmentation: per-env flags (None when PM_MIRROR_PROB=0
+        # -> byte-identical fast path, no mirror work). The SAME per-env flags key
+        # both the current ref (rewards) and the future window (obs), so a mirrored
+        # env sees a fully consistent mirrored reference this step.
+        _mm = self.env.motion_manager
+        mirror_flags = _mm.mirror_flags if _mm.mirror_prob > 0.0 else None
+
         # Get single-step reference state at current time (for rewards)
-        ref_state = self.env.motion_lib.get_motion_state(motion_ids, motion_times)
+        ref_state = self.env.motion_lib.get_motion_state(
+            motion_ids, motion_times, mirror_flags=mirror_flags
+        )
         
         # Apply terrain height correction to reference state
         ref_gt = ref_state.rigid_body_pos.clone()
@@ -153,10 +162,18 @@ class MimicControl(ControlComponent):
             num_envs, future_steps
         ).reshape(-1)
         flat_future_times = future_times.reshape(-1)
-        
+
+        # Same per-env flags, broadcast across the future window (envs-major, to
+        # match flat_motion_ids' [num_envs, future_steps] flattening).
+        flat_mirror_flags = (
+            mirror_flags.unsqueeze(-1).expand(num_envs, future_steps).reshape(-1)
+            if mirror_flags is not None
+            else None
+        )
+
         # Query motion lib for all future steps
         future_state = self.env.motion_lib.get_motion_state(
-            flat_motion_ids, flat_future_times
+            flat_motion_ids, flat_future_times, mirror_flags=flat_mirror_flags
         )
         
         # Reshape to [envs, future_steps, ...] and apply terrain correction
@@ -257,9 +274,14 @@ class MimicControl(ControlComponent):
         
         markers_state = {}
         
-        # Get reference state at current time (access motion_manager via env)
+        # Get reference state at current time (access motion_manager via env).
+        # Mirror the markers to match the (possibly mirrored) served reference.
+        _mm = self.env.motion_manager
+        _mflags = _mm.mirror_flags if _mm.mirror_prob > 0.0 else None
         ref_state = self.env.motion_lib.get_motion_state(
-            self.env.motion_manager.motion_ids, self.env.motion_manager.motion_times
+            self.env.motion_manager.motion_ids,
+            self.env.motion_manager.motion_times,
+            mirror_flags=_mflags,
         )
         
         target_pos = ref_state.rigid_body_pos.clone()
