@@ -908,8 +908,14 @@ def main():
             _tcap = os.environ.get("OMP_NUM_THREADS")
             if _tcap:
                 os.environ.setdefault("PXR_WORK_THREAD_LIMIT", _tcap)
+                # carb.tasking needs >=1 worker; a hard 1 can deadlock its
+                # nested task-wait under high STACK. Decouple carb from OMP via
+                # PM_CARB_THREAD_COUNT (fallback _tcap) so the launcher can
+                # starve OMP/TBB/PXR to 1 for STACK>=4 while keeping carb at a
+                # safe floor of 2 (imprint fork-bomb 2026-07-24, 8x5x8192).
+                _carb = os.environ.get("PM_CARB_THREAD_COUNT", _tcap)
                 sys.argv.append(
-                    f"--/plugins/carb.tasking.plugin/threadCount={_tcap}"
+                    f"--/plugins/carb.tasking.plugin/threadCount={_carb}"
                 )
             # Stagger Kit/PhysX boot per rank so the N ranks on a node do not
             # warm-start PhysX simultaneously (concurrent thread + PhysX-tensor
@@ -965,8 +971,14 @@ def main():
             _tcap = os.environ.get("OMP_NUM_THREADS")
             if _tcap:
                 os.environ.setdefault("PXR_WORK_THREAD_LIMIT", _tcap)
+                # carb.tasking needs >=1 worker; a hard 1 can deadlock its
+                # nested task-wait under high STACK. Decouple carb from OMP via
+                # PM_CARB_THREAD_COUNT (fallback _tcap) so the launcher can
+                # starve OMP/TBB/PXR to 1 for STACK>=4 while keeping carb at a
+                # safe floor of 2 (imprint fork-bomb 2026-07-24, 8x5x8192).
+                _carb = os.environ.get("PM_CARB_THREAD_COUNT", _tcap)
                 sys.argv.append(
-                    f"--/plugins/carb.tasking.plugin/threadCount={_tcap}"
+                    f"--/plugins/carb.tasking.plugin/threadCount={_carb}"
                 )
             _stagger = max(
                 float(os.environ.get("NFS_STAGGER_SEC", "0") or "0"),
