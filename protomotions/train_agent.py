@@ -666,6 +666,48 @@ def main():
                     )
                     _sp[_key] = float(_val)
 
+        # PM v2 REWARD-GATE FAMILY (env-gated, resume-safe): resume freezes the
+        # reward config from the pickle so teacher.py's env gates never run on a
+        # resume -- the REF-OR-SELF lift gate (and the rest of the v2 stepping /
+        # anti-shuffle stack) would silently stay at their frozen values. Re-apply
+        # the family onto the loaded components so gate ladders ride a resume
+        # without a warm start (imprint PR #119 step-in-place: resume re-apply gap).
+        # STORAGE SPLIT: weight/sigma live in component.static_params; the motion-
+        # gate / geometry thresholds live as attributes on the stateful
+        # component.compute_func object (e.g. FeetApexHeightReward.min_ref_speed).
+        # GUARD: each override fires ONLY when its env var is EXPLICITLY PRESENT in
+        # os.environ (not default-valued), so an ordinary resume (no launcher env)
+        # is byte-identical to the frozen config.
+        _SP, _CF = "sp", "cf"
+        for _comp, _var, _loc, _key in (
+            ("feet_apex_height", "PM_STEP_LIFT_WEIGHT", _SP, "weight"),
+            ("feet_apex_height", "PM_STEP_LIFT_MIN_REF_SPEED", _CF, "min_ref_speed"),
+            ("feet_apex_height", "PM_STEP_LIFT_MIN_SELF_SPEED", _CF, "min_self_speed"),
+            ("stepping", "PM_STEPPING_WEIGHT", _SP, "weight"),
+            ("stepping", "PM_STEPPING_MIN_REF_SPEED", _CF, "min_ref_speed"),
+            ("micro_step_tax", "PM_ANTISHUFFLE_WEIGHT", _SP, "weight"),
+            ("micro_step_tax", "PM_ANTISHUFFLE_MAX_STEP", _CF, "max_step_length"),
+            ("micro_step_tax", "PM_ANTISHUFFLE_MAX_APEX", _CF, "max_apex_height"),
+            ("foot_slip", "PM_FOOT_SLIP_WEIGHT", _SP, "weight"),
+            ("global_anchor_pos", "PM_GLOBAL_POS_WEIGHT", _SP, "weight"),
+            ("global_anchor_pos", "PM_GLOBAL_POS_SIGMA", _SP, "sigma"),
+            ("heading_local_anchor_drift", "PM_HEADING_DRIFT_WEIGHT", _SP, "weight"),
+        ):
+            _val = os.environ.get(_var)
+            if _val is None or _comp not in _rc:
+                continue
+            _fval = float(_val)
+            if _loc == _SP:
+                _old = _rc[_comp].static_params.get(_key)
+                _rc[_comp].static_params[_key] = _fval
+            else:
+                _cf = _rc[_comp].compute_func
+                _old = getattr(_cf, _key, None)
+                setattr(_cf, _key, _fval)
+            log.info(
+                f"RESUME override {_comp}.{_key} = {_fval} (was {_old}, from {_var})"
+            )
+
         # PM_ARM_{KP,KD,EFFORT}[_SHOULDER|_ELBOW|_WRIST] (env-gated, resume-safe):
         # robot_config is likewise frozen from the pickle, so the module-level
         # PM_ARM_KP gate in robot_configs/h1_2.py never fires on resume.
