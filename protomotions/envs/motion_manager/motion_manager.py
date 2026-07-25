@@ -47,7 +47,12 @@ import os
 import torch
 import numpy as np
 from omegaconf.listconfig import ListConfig
-from protomotions.components.motion_lib import MotionLib
+from protomotions.components.motion_lib import (
+    MotionLib,
+    heldout_file_path,
+    load_heldout_global_ids,
+    map_heldout_to_local,
+)
 from protomotions.envs.motion_manager.config import MotionManagerConfig
 from typing import Optional, Tuple
 
@@ -130,6 +135,10 @@ class MotionManager:
 
         # Handle motion exclusion (store excluded IDs to apply during sampling)
         self._setup_motion_exclusion()
+
+        # Handle held-out eval split (PM_HELDOUT_FILE): permanently mask a small
+        # never-trained clip set from the RSI sampler (default OFF).
+        self._setup_heldout()
 
         # Handle fixed motion IDs for scene-motion correspondence
         self._setup_fixed_motion_ids(fixed_motion_ids_per_env)
@@ -277,6 +286,79 @@ class MotionManager:
         if len(motion_ids) <= 50:
             print(f"Excluded motion IDs: {motion_ids}")
 
+    def _setup_heldout(self):
+        """Held-out eval support (env-gated via PM_HELDOUT_FILE, default OFF).
+
+        When PM_HELDOUT_FILE points at a "<pack>.heldout.json" split artifact,
+        the clips it names are permanently removed from the RSI training sampler:
+        their sampling weights are zeroed (and the remaining mass renormalized)
+        so the policy NEVER trains on them, leaving them as a trustworthy
+        held-out set for in-training evaluation (see MimicEvaluator). Read LIVE
+        from os.environ (like PM_MIRROR_PROB) so a plain resume rebuilds the
+        manager and re-applies the mask with no checkpoint surgery. Default
+        (unset) is byte-identical: ``heldout_motion_ids`` stays None and every
+        call site is a python-level no-op.
+
+        Global held-out ids are translated to this rank's shard-local ids via
+        the same global<->local map used for motion exclusions; ids owned by
+        other ranks are dropped (those ranks mask them on their own shard).
+        """
+        self.heldout_motion_ids = None
+        path = heldout_file_path()
+        if path is None:
+            return
+
+        heldout_global = load_heldout_global_ids(path)
+        sharded = getattr(self.motion_lib, "sharded_across_ranks", False)
+        gids = self.motion_lib.global_motion_ids if sharded else None
+        local_ids = map_heldout_to_local(
+            heldout_global, gids, self.motion_lib.num_motions()
+        )
+        if local_ids.numel() == 0:
+            print(
+                f"Motion Manager: [heldout] {path}: 0 held-out clips resident on "
+                f"this rank; nothing masked"
+            )
+            return
+
+        local_ids = local_ids.to(self.device)
+        total_mass = float(self.motion_weights.sum())
+        masked_mass = float(self.motion_weights[local_ids].sum())
+        masked_frac = masked_mass / total_mass if total_mass > 0 else 0.0
+        # The split holds out ~frac (default 2%) per class, so the masked
+        # sampling mass MUST be small. A large fraction means a bad/mismatched
+        # artifact (wrong pack, wrong ids) -- refuse rather than silently gut the
+        # training distribution.
+        assert masked_frac < 0.10, (
+            f"[heldout] masked sampling mass fraction {masked_frac:.4f} >= 0.10 "
+            f"({local_ids.numel()} clips) -- artifact likely mismatched to this "
+            f"pack; refusing to mask"
+        )
+
+        self.heldout_motion_ids = local_ids
+        self._apply_heldout_mask()
+        # Renormalize remaining mass back to the pre-mask total. multinomial only
+        # uses relative mass, so this is cosmetic, but it keeps logged/queried
+        # weights on the same scale as before masking.
+        remaining = float(self.motion_weights.sum())
+        if remaining > 0:
+            self.motion_weights *= total_mass / remaining
+        print(
+            f"Motion Manager: [heldout] masking {local_ids.numel()} clips from "
+            f"sampling (masked mass fraction {masked_frac:.4f}) via {path}"
+        )
+
+    def _apply_heldout_mask(self):
+        """Zero held-out clips' sampling weights.
+
+        Called before every sample and after every weight (re)assignment so
+        held-out clips are never sampled -- even after a resume restores
+        checkpoint weights or the eval curriculum rewrites weights. No-op when
+        the held-out gate is off.
+        """
+        if getattr(self, "heldout_motion_ids", None) is not None:
+            self.motion_weights[self.heldout_motion_ids] = 0.0
+
     def _setup_fixed_motion_ids(self, fixed_motion_ids_per_env: Optional[torch.Tensor]):
         """Setup fixed motion IDs. Use -1 for environments that should use random sampling."""
         if (
@@ -412,6 +494,8 @@ class MotionManager:
 
         # Apply exclusions before sampling
         self._apply_motion_exclusions()
+        # Apply held-out mask before sampling (default OFF -> no-op)
+        self._apply_heldout_mask()
         return torch.multinomial(self.motion_weights, num_samples=n, replacement=True)
 
     def sample_time(
@@ -519,6 +603,9 @@ class MotionManager:
         self.motion_weights[:] = weights
         # Apply exclusions after updating weights
         self._apply_motion_exclusions()
+        # Re-apply held-out mask so an eval-curriculum weight rewrite can never
+        # resurrect a held-out clip into the sampler (default OFF -> no-op)
+        self._apply_heldout_mask()
 
     def get_state_dict(self):
         state_dict = {
@@ -556,3 +643,6 @@ class MotionManager:
                         f"Warning: skip loading motion weights; corpus shrank "
                         f"{n_old} -> {n_new} (cannot map weights safely)."
                     )
+            # Resume re-apply: checkpoint weights predate the held-out mask, so
+            # re-zero held-out clips after restoring them (default OFF -> no-op).
+            self._apply_heldout_mask()

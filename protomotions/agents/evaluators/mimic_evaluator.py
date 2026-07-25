@@ -36,8 +36,12 @@ logger = logging.getLogger(__name__)
 class MimicEpisodeContext:
     """Per-episode-batch state for mimic evaluation."""
 
-    motion_ids: Tensor  # which motion each env is tracking
+    motion_ids: Tensor  # metric-buffer position for each env (compact [0, K))
     frame_limits: Tensor  # how many frames before clip ends
+    # Actual shard-local clip id each env tracks. Equals ``motion_ids`` in every
+    # mode except held-out eval, where buffers are compact [0, K) but the clips
+    # to track live at scattered shard-local ids (see _episode_track_ids).
+    track_ids: Tensor = None
 
 
 class MimicEvaluator(BaseEvaluator):
@@ -81,20 +85,55 @@ class MimicEvaluator(BaseEvaluator):
 
         return metrics
 
+    def _heldout_local_ids(self) -> Optional[Tensor]:
+        """Shard-local ids of the held-out clips to evaluate, or None when the
+        held-out eval gate (PM_HELDOUT_FILE) is off.
+
+        Reuses the mask the motion manager already computed at init -- the
+        global->local translation happens once, in MotionManager._setup_heldout.
+        """
+        if os.environ.get("PM_HELDOUT_FILE") is None:
+            return None
+        ho = getattr(self.motion_manager, "heldout_motion_ids", None)
+        if ho is None or ho.numel() == 0:
+            return None
+        return ho.to(self.device)
+
     def initialize_eval(self) -> Dict:
         """Initialize evaluation tracking and cache env state for restoration."""
-        num_motions = self.motion_lib.num_motions()
-        # EVAL-OOM/SPEED FIX (night13): cap buffers to the eval subset (see
-        # _eval_subset_n). Buffers, component accumulators and the eval batch
-        # (below, in _build_eval_batches) all use the same [0, num_motions) ids.
         subset_n = _eval_subset_n()
-        if subset_n > 0:
-            num_motions = min(subset_n, num_motions)
         motion_lengths = self.motion_lib.get_motion_length(None)
         motion_num_frames = (motion_lengths / self.env.dt).floor().long()
         motion_num_frames = motion_num_frames.clamp(max=self.config.max_eval_steps)
-        if subset_n > 0:
-            motion_num_frames = motion_num_frames[:num_motions]
+
+        # HELD-OUT eval (env-gated via PM_HELDOUT_FILE): evaluate ONLY the
+        # held-out clips resident in this rank's shard -- the clips the sampler
+        # never trains on (masked in MotionManager._setup_heldout) -- so the
+        # reported SR is decoupled from training fit. Capped at EVAL_SUBSET_N per
+        # rank for the SAME buffer/VRAM bound as the subset path. Buffers are
+        # compact [0, K); ``_heldout_track_ids`` maps each compact eval position
+        # to its actual shard-local clip id (drives tracking + clip lengths).
+        heldout = self._heldout_local_ids()
+        if heldout is not None:
+            cap = subset_n if subset_n > 0 else heldout.numel()
+            k = min(cap, heldout.numel())
+            self._heldout_track_ids = heldout[:k]
+            num_motions = k
+            motion_num_frames = motion_num_frames[self._heldout_track_ids]
+            print(
+                f"[eval-heldout] rank {self.fabric.global_rank}: evaluating {k} "
+                f"held-out clips ({heldout.numel()} resident; cap {cap})"
+            )
+        else:
+            # EVAL-OOM/SPEED FIX (night13): cap buffers to the eval subset (see
+            # _eval_subset_n). Buffers, component accumulators and the eval batch
+            # all use the same [0, num_motions) ids.
+            self._heldout_track_ids = None
+            num_motions = self.motion_lib.num_motions()
+            if subset_n > 0:
+                num_motions = min(subset_n, num_motions)
+                motion_num_frames = motion_num_frames[:num_motions]
+
         self._init_eval_component_buffers(num_motions)
 
         # Cache env + motion manager state (restored in cleanup_after_evaluation)
@@ -216,10 +255,20 @@ class MimicEvaluator(BaseEvaluator):
             self._check_eval_components(env_ids, step_idx)
             self._on_episode_step(env_ids, extras, actions)
 
+    def _episode_track_ids(self, motion_ids: Tensor) -> Tensor:
+        """Map compact metric-buffer ids to the actual shard-local clips to
+        track. Identity in every mode except held-out eval (where ``motion_ids``
+        are compact [0, K) buffer positions into ``_heldout_track_ids``)."""
+        tids = getattr(self, "_heldout_track_ids", None)
+        if tids is not None:
+            return tids[motion_ids]
+        return motion_ids
+
     def run_evaluation(self) -> None:
         """Run evaluation across multiple motions."""
         for env_ids, motion_ids in self._build_eval_batches():
-            motion_lengths = self.motion_lib.get_motion_length(motion_ids)
+            track_ids = self._episode_track_ids(motion_ids)
+            motion_lengths = self.motion_lib.get_motion_length(track_ids)
             max_len = min(
                 (motion_lengths.max() / self.env.dt).floor().long().item(),
                 self.config.max_eval_steps,
@@ -227,6 +276,7 @@ class MimicEvaluator(BaseEvaluator):
             # Build episode context before evaluate_episode so hooks can read it
             self._episode_ctx = MimicEpisodeContext(
                 motion_ids=motion_ids,
+                track_ids=track_ids,
                 frame_limits=(motion_lengths / self.env.dt)
                 .floor()
                 .long()
@@ -240,6 +290,16 @@ class MimicEvaluator(BaseEvaluator):
         Returns:
             List of (env_ids, motion_ids) tuples
         """
+        # HELD-OUT eval (PM_HELDOUT_FILE): a single batch of the K held-out clips
+        # selected in initialize_eval. env_ids/motion_ids are compact [0, K)
+        # buffer positions; _episode_track_ids maps them to the real clips.
+        if getattr(self, "_heldout_track_ids", None) is not None:
+            k = self._heldout_track_ids.numel()
+            env_ids = torch.arange(k, device=self.device)
+            motion_ids = torch.arange(k, device=self.device)
+            print(f"[eval-heldout] evaluating {k} held-out clips of the shard")
+            return [(env_ids, motion_ids)]
+
         # EVAL-OOM/SPEED FIX (night13): evaluate only the first-N motions of this
         # rank's shard when the subset gate is set. ids == buffer positions.
         subset_n = _eval_subset_n()
@@ -271,8 +331,15 @@ class MimicEvaluator(BaseEvaluator):
     # --- Hook overrides ---
 
     def _on_episode_start(self, env_ids: Tensor) -> None:
-        """Set motion_ids/times in the motion manager before reset."""
-        self.motion_manager.motion_ids[env_ids] = self._episode_ctx.motion_ids
+        """Set motion_ids/times in the motion manager before reset.
+
+        Uses track_ids (actual shard-local clips) so held-out eval tracks the
+        held-out clips rather than the compact buffer positions. track_ids
+        defaults to motion_ids (identity) in every non-held-out mode.
+        """
+        ctx = self._episode_ctx
+        track_ids = ctx.track_ids if ctx.track_ids is not None else ctx.motion_ids
+        self.motion_manager.motion_ids[env_ids] = track_ids
         self.motion_manager.motion_times[env_ids] = 0.0
 
     def _get_reset_kwargs(self) -> dict:
@@ -318,7 +385,16 @@ class MimicEvaluator(BaseEvaluator):
     def process_eval_results(self) -> Tuple[Dict, Optional[float], int]:
         """Process results and update motion sampling weights."""
         to_log, success_rate, num_eval_items = super().process_eval_results()
-        self._update_motion_sampling_weights()
+        heldout_active = getattr(self, "_heldout_track_ids", None) is not None
+        if heldout_active:
+            # Held-out eval results must NOT steer the training sampler: it would
+            # both leak held-out signal into the curriculum AND index the wrong
+            # clips (failure ids here are compact eval positions, not shard-local
+            # sampler ids). Tag the curves so the (honest, lower) held-out SR is
+            # never confused with the train-subset SR.
+            to_log["eval/heldout"] = 1.0
+        else:
+            self._update_motion_sampling_weights()
 
         additional_metrics = self._compute_additional_metrics(self._metrics)
         to_log.update(additional_metrics)
@@ -327,9 +403,10 @@ class MimicEvaluator(BaseEvaluator):
             # EVAL-OOM/SPEED FIX (night13): the predicted-lib save packs over the
             # FULL num_motions and would both mismatch the subset-sized buffers
             # and re-introduce the slow O(42k) per-motion loop -> skip it while the
-            # eval subset gate is active.
+            # eval subset gate (or held-out compact buffers) is active.
             if (
-                _eval_subset_n() <= 0
+                not heldout_active
+                and _eval_subset_n() <= 0
                 and os.environ.get("PM_DISABLE_PREDICTED_LIB_SAVE") != "1"
                 and self.config.save_predicted_motion_lib_every is not None
                 and self.eval_count % self.config.save_predicted_motion_lib_every == 0

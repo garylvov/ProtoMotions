@@ -437,6 +437,78 @@ def rescale_to_target_mass(motion_weights, class_boundaries, target_fractions):
     return out.to(dtype=orig_dtype, device=motion_weights.device)
 
 
+# --- Held-out eval split (env-gated via PM_HELDOUT_FILE) ---------------------
+#
+# A "<pack>.heldout.json" split artifact (built by
+# integrations/wbc/training/motion_aug/build_heldout_split.py) names a small,
+# stratified set of GLOBAL clip ids to reserve as a NEVER-TRAINED evaluation
+# set. When PM_HELDOUT_FILE points at such an artifact, the RSI sampler zeroes
+# those clips' sampling weights (MotionManager._setup_heldout) and the
+# in-training evaluator targets exactly those clips (MimicEvaluator), so the
+# reported success rate is decoupled from training fit. Default OFF (unset) is
+# byte-identical: the helpers below are simply never called.
+_HELDOUT_FILE_ENV = "PM_HELDOUT_FILE"
+
+
+def heldout_file_path():
+    """Return the PM_HELDOUT_FILE path, or None when unset/empty (default OFF)."""
+    p = os.environ.get(_HELDOUT_FILE_ENV)
+    return p if p else None
+
+
+def load_heldout_global_ids(path):
+    """Read a "<pack>.heldout.json" split artifact -> sorted unique GLOBAL ids.
+
+    Pure I/O helper (CPU, unit-testable). The artifact stores an "ids" list of
+    global pack indices. Returns an empty LongTensor (and logs) when the file is
+    missing or malformed so callers fall back to no masking.
+    """
+    if path is None or not os.path.isfile(path):
+        log.warning(f"[heldout] split file not found: {path}")
+        return torch.empty(0, dtype=torch.long)
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        log.warning(f"[heldout] failed to read {path}: {e}")
+        return torch.empty(0, dtype=torch.long)
+    ids = data.get("ids")
+    if not ids:
+        log.warning(f"[heldout] {path} has no non-empty 'ids' list")
+        return torch.empty(0, dtype=torch.long)
+    return torch.tensor(sorted({int(i) for i in ids}), dtype=torch.long)
+
+
+def map_heldout_to_local(heldout_global_ids, global_motion_ids, num_motions):
+    """Map GLOBAL held-out clip ids to this rank's SHARD-LOCAL ids.
+
+    Pure function (no torch.distributed), unit-testable on CPU. Mirrors the
+    global->local translation ``MotionManager._setup_motion_exclusion`` uses.
+
+    Args:
+        heldout_global_ids: 1-D LongTensor of global pack ids to hold out.
+        global_motion_ids: ``local_id -> global_id`` map (a sharded MotionLib's
+            ``self.global_motion_ids``), or None when the lib is not sharded (in
+            which case global ids ARE local ids).
+        num_motions: motions resident on this rank (range check, unsharded case).
+
+    Returns:
+        Sorted 1-D LongTensor of shard-local ids present on this rank (empty if
+        none of the held-out clips live here).
+    """
+    if heldout_global_ids.numel() == 0:
+        return torch.empty(0, dtype=torch.long)
+    g = heldout_global_ids.to(dtype=torch.long, device="cpu").unique()
+    if global_motion_ids is None:
+        # Not sharded: global ids == local ids; keep only those in range.
+        in_range = g[(g >= 0) & (g < num_motions)]
+        return in_range.sort().values
+    gids = global_motion_ids.to(dtype=torch.long, device="cpu")
+    local_mask = torch.isin(gids, g)
+    local_ids = torch.nonzero(local_mask, as_tuple=False).flatten()
+    return local_ids.sort().values
+
+
 # Mapping from MotionLib (packaged motion) field names to RobotState (single motion/sim state) field names
 _motion_field_mapping = {
     "gts": "rigid_body_pos",
