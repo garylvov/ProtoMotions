@@ -505,3 +505,52 @@ def test_tracking_rewards_cover_standard_and_beyond_mimic_variants():
         ),
         torch.ones(2),
     )
+
+
+def test_dof_pos_track_reward_pins_joint_space_posture():
+    """Joint-space DOF posture tracking reward (posture-tightening bundle).
+
+    Covers: a perfect / stance-held track (reward == 1), a tight vs loose track
+    ordering, the exp(-mean(dof_err^2)/sigma^2) math, sigma sensitivity, and DOF
+    subsetting.
+    """
+    # 27-DOF reference posture (H1_2 has 27 dofs); a fixed stance/reference pose.
+    ref = torch.linspace(-1.0, 1.0, 27).unsqueeze(0).repeat(3, 1)
+
+    # Env 0: PERFECT / STANCE-HELD track (current == ref) -> reward == 1.
+    # Env 1: TIGHT track (small per-DOF error).
+    # Env 2: LOOSE track (large per-DOF error, the sim2sim loose optimum).
+    current = ref.clone()
+    current[1] = ref[1] + 0.30  # ~0.30 rad, the transferring-policy scale
+    current[2] = ref[2] + 1.50  # ~1.50 rad, the loose PhysX-only optimum
+
+    sigma = 0.35
+    rew = tracking.compute_dof_pos_track_rew(current, ref, sigma=sigma)
+
+    # Perfect track scores exactly 1.
+    assert torch.isclose(rew[0], torch.tensor(1.0))
+    # Reward strictly decreases as the posture loosens.
+    assert rew[0] > rew[1] > rew[2]
+    # The loose optimum is squeezed to ~0; the tight track stays well above it.
+    assert rew[2] < 0.01
+    assert rew[1] > 0.4
+
+    # Exact kernel math: exp(-mean(dof_err^2) / sigma^2).
+    expected = torch.exp(
+        -((current - ref).pow(2).mean(dim=-1)) / (sigma ** 2)
+    )
+    assert torch.allclose(rew, expected)
+
+    # A smaller sigma penalizes the SAME error harder (tighter posture demand).
+    rew_tight_sigma = tracking.compute_dof_pos_track_rew(current, ref, sigma=0.20)
+    assert rew_tight_sigma[1] < rew[1]
+
+    # DOF subsetting: restricting to a single DOF matches the single-DOF kernel.
+    idx = torch.tensor([5])
+    rew_sub = tracking.compute_dof_pos_track_rew(
+        current, ref, sigma=sigma, indices=idx
+    )
+    expected_sub = torch.exp(
+        -((current[:, idx] - ref[:, idx]).pow(2).mean(dim=-1)) / (sigma ** 2)
+    )
+    assert torch.allclose(rew_sub, expected_sub)

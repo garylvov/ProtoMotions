@@ -49,6 +49,7 @@ from protomotions.envs.rewards.tracking import (
     compute_global_anchor_ori_rew,
     compute_relative_body_pos_rew,
     compute_relative_body_ori_rew,
+    compute_dof_pos_track_rew,
     compute_global_body_lin_vel_rew,
     compute_global_body_ang_vel_rew,
     # Track D root displacement kernels (Option-B fallback, dormant)
@@ -125,6 +126,7 @@ __all__ = [
     "compute_global_anchor_ori_rew",
     "compute_relative_body_pos_rew",
     "compute_relative_body_ori_rew",
+    "compute_dof_pos_track_rew",
     "compute_global_body_lin_vel_rew",
     "compute_global_body_ang_vel_rew",
     # Track D root displacement kernels (Option-B fallback, dormant)

@@ -1871,6 +1871,41 @@ def relative_body_ori_rew_factory(
     )
 
 
+def dof_pos_track_rew_factory(
+    weight: float = 1.0,
+    sigma: float = 0.35,
+) -> MdpComponent:
+    """Factory for the joint-space (DOF) position tracking reward.
+
+    Scores the mean squared per-DOF error against the reference joint positions
+    with a Gaussian kernel (``exp(-mean(dof_err^2) / sigma^2)``), pinning the
+    policy to the reference posture in JOINT space in addition to the Cartesian
+    body-position tracking. Closes the sim2sim posture-divergence loophole where
+    a redundant-kinematics policy tracks body positions with a LOOSE per-DOF
+    posture that only stands up in one simulator. Reward-only, no obs-width
+    change (resume-safe). Default ``weight=1.0``; the teacher gate leaves it
+    UNSET (unregistered) so canonical is unchanged.
+
+    Args:
+        weight: Reward weight (POSITIVE; the posture pin is a reward, not a
+            penalty).
+        sigma: Gaussian kernel width in rad. Smaller = tighter posture demand.
+
+    Returns:
+        MdpComponent configured for the joint-space DOF position tracking reward.
+    """
+    from protomotions.envs.rewards import compute_dof_pos_track_rew
+
+    return MdpComponent(
+        compute_func=compute_dof_pos_track_rew,
+        dynamic_vars={
+            "current_dof_pos": EnvContext.current.dof_pos,
+            "ref_dof_pos": EnvContext.mimic.ref_state.dof_pos,
+        },
+        static_params={"weight": weight, "sigma": sigma},
+    )
+
+
 def global_body_lin_vel_rew_factory(
     weight: float = 1.0,
     sigma: float = 1.0,
@@ -2370,6 +2405,7 @@ __all__ = [
     "global_anchor_ori_rew_factory",
     "relative_body_pos_rew_factory",
     "relative_body_ori_rew_factory",
+    "dof_pos_track_rew_factory",
     "global_body_lin_vel_rew_factory",
     "global_body_ang_vel_rew_factory",
     # Termination factories

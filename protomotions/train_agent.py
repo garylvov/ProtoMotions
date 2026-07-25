@@ -710,6 +710,8 @@ def main():
             ("micro_step_tax", "PM_ANTISHUFFLE_MAX_STEP", _CF, "max_step_length"),
             ("micro_step_tax", "PM_ANTISHUFFLE_MAX_APEX", _CF, "max_apex_height"),
             ("foot_slip", "PM_FOOT_SLIP_WEIGHT", _SP, "weight"),
+            ("dof_pos_track", "PM_DOF_POS_TRACK_WEIGHT", _SP, "weight"),
+            ("dof_pos_track", "PM_DOF_POS_TRACK_SIGMA", _SP, "sigma"),
             ("global_anchor_pos", "PM_GLOBAL_POS_WEIGHT", _SP, "weight"),
             ("global_anchor_pos", "PM_GLOBAL_POS_SIGMA", _SP, "sigma"),
             ("heading_local_anchor_drift", "PM_HEADING_DRIFT_WEIGHT", _SP, "weight"),

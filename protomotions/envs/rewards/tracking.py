@@ -393,6 +393,43 @@ def compute_relative_body_ori_rew(
     )
 
 
+def compute_dof_pos_track_rew(
+    current_dof_pos: Tensor,
+    ref_dof_pos: Tensor,
+    sigma: float = 0.35,
+    indices: Optional[Tensor] = None,
+) -> Tensor:
+    """Joint-space (DOF) position tracking reward: exp(-mean(dof_err^2) / sigma^2).
+
+    Pins the policy to the REFERENCE posture in JOINT space, not only in the
+    Cartesian body-position space the BeyondMimic ``relative_body_pos`` reward
+    scores. Because the arm/leg kinematics are redundant, many joint
+    configurations satisfy a given set of body positions, so a policy can track
+    bodies while drifting to a LOOSE per-DOF posture that only stands up in one
+    simulator -- the sim2sim posture-divergence failure mode (loose optimum
+    joint err ~1.5 rad vs ~0.30 rad for a transferring policy). This kernel
+    scores the mean squared per-DOF error against the reference joint positions
+    with a Gaussian kernel, mirroring ``compute_global_position_error_exp`` (the
+    sigma form): a tight posture earns ~1 and a loose one falls off sharply, so
+    the reward stops being indifferent between the two.
+
+    Args:
+        current_dof_pos: Current joint positions [num_envs, num_dofs] (rad).
+        ref_dof_pos: Reference joint positions [num_envs, num_dofs] (rad).
+        sigma: Gaussian kernel width (rad). Smaller = tighter posture demand.
+        indices: Optional DOF indices to restrict to a subset.
+
+    Returns:
+        Reward tensor [num_envs] in (0, 1].
+    """
+    if indices is not None:
+        current_dof_pos = current_dof_pos[:, indices]
+        ref_dof_pos = ref_dof_pos[:, indices]
+
+    error = (current_dof_pos - ref_dof_pos).pow(2).mean(dim=-1)
+    return torch.exp(-error / (sigma ** 2))
+
+
 def compute_global_body_lin_vel_rew(
     current_rigid_body_vel: Tensor,
     ref_rigid_body_vel: Tensor,
@@ -613,6 +650,7 @@ __all__ = [
     "compute_global_anchor_ori_rew",
     "compute_relative_body_pos_rew",
     "compute_relative_body_ori_rew",
+    "compute_dof_pos_track_rew",
     "compute_global_body_lin_vel_rew",
     "compute_global_body_ang_vel_rew",
     # Heading-local anchor drift reward (twin of build_mimic_future_displacement_cmd)
