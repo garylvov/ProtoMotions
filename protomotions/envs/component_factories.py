@@ -1084,6 +1084,8 @@ def max_feet_height_rew_factory(
     min_self_speed: float = 0.0,
     min_swing_sec: float = 0.0,
     control_dt: float = 0.02,
+    placement_sigma: float = 0.0,
+    require_alternation: bool = False,
     zero_during_grace_period: bool = True,
 ) -> MdpComponent:
     """Factory for the OmniH2O per-step swing-apex reward/penalty (dormant).
@@ -1152,6 +1154,8 @@ def max_feet_height_rew_factory(
             min_self_speed=min_self_speed,
             min_swing_sec=min_swing_sec,
             control_dt=control_dt,
+            placement_sigma=placement_sigma,
+            require_alternation=require_alternation,
         ),
         dynamic_vars={
             "sim_contacts": EnvContext.current.rigid_body_contacts,
@@ -1161,6 +1165,7 @@ def max_feet_height_rew_factory(
             "progress_buf": EnvContext.progress_buf,
             "ref_rigid_body_vel": EnvContext.mimic.ref_state.rigid_body_vel,
             "rigid_body_vel": EnvContext.current.rigid_body_vel,
+            "ref_rigid_body_pos": EnvContext.mimic.ref_state.rigid_body_pos,
         },
         static_params={
             "weight": weight,

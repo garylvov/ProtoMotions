@@ -168,6 +168,8 @@ class FeetApexHeightReward(_FootContactTransitionTracker):
         min_self_speed: float = 0.0,
         min_swing_sec: float = 0.0,
         control_dt: float = 0.02,
+        placement_sigma: float = 0.0,
+        require_alternation: bool = False,
     ):
         super().__init__()
         if apex_target_height <= 0.0:
@@ -191,6 +193,11 @@ class FeetApexHeightReward(_FootContactTransitionTracker):
         self.min_self_speed = min_self_speed
         self.min_swing_sec = min_swing_sec
         self.control_dt = control_dt
+        if placement_sigma < 0.0:
+            raise ValueError("placement_sigma must be non-negative.")
+        self.placement_sigma = placement_sigma
+        self.require_alternation = bool(require_alternation)
+        self._last_paid_foot = None
         self._swing_apex = None
         self._swing_steps = None
 
@@ -204,6 +211,7 @@ class FeetApexHeightReward(_FootContactTransitionTracker):
         progress_buf: Tensor,
         ref_rigid_body_vel: Tensor = None,
         rigid_body_vel: Tensor = None,
+        ref_rigid_body_pos: Tensor = None,
     ) -> Tensor:
         contacts = sim_contacts[:, contact_body_ids].bool()
         touchdown, reset_mask = self._update_transitions(contacts, progress_buf)
@@ -218,6 +226,16 @@ class FeetApexHeightReward(_FootContactTransitionTracker):
                 contacts.shape, dtype=torch.float32, device=contacts.device
             )
         self._swing_steps[reset_mask] = 0.0
+        if self.require_alternation:
+            if (
+                self._last_paid_foot is None
+                or self._last_paid_foot.shape[0] != contacts.shape[0]
+            ):
+                self._last_paid_foot = torch.full(
+                    (contacts.shape[0],), -1,
+                    dtype=torch.long, device=contacts.device,
+                )
+            self._last_paid_foot[reset_mask] = -1
 
         heights = _foot_heights(rigid_body_pos, contact_body_ids, ground_heights)
 
@@ -276,18 +294,92 @@ class FeetApexHeightReward(_FootContactTransitionTracker):
         # (ref-speed ~0) so it still pays 0; swaying to unlock costs the anchor
         # pos/ori tracking rewards, so it is self-defeating.
         if self.reward_mode == "lift":
-            gate = None
+            ref_gate = None
+            self_gate = None
             if ref_rigid_body_vel is not None and self.min_ref_speed > 0.0:
                 ref_vel = ref_rigid_body_vel.reshape(emission.shape[0], -1, 3)
                 ref_speed_xy = ref_vel[:, 0, :2].norm(dim=-1)
-                gate = ref_speed_xy > self.min_ref_speed
+                ref_gate = ref_speed_xy > self.min_ref_speed
             if rigid_body_vel is not None and self.min_self_speed > 0.0:
                 self_vel = rigid_body_vel.reshape(emission.shape[0], -1, 3)
                 self_speed_xy = self_vel[:, 0, :2].norm(dim=-1)
                 self_gate = self_speed_xy > self.min_self_speed
-                gate = self_gate if gate is None else (gate | self_gate)
-            if gate is not None:
-                emission = emission * gate.unsqueeze(-1)
+
+            # PLACEMENT-CONDITIONED lift (v5.2, anti double-step): scale the
+            # payout by how well the landing foot PLACES relative to the
+            # reference foot, in the ROOT-RELATIVE frame:
+            #   factor = exp(-||(foot-root)_xy - (ref_foot-ref_root)_xy||^2 / sigma^2)
+            # A stutter/double step lands near the stance foot while the
+            # striding reference foot is half a stride away -> large error ->
+            # ~0 pay; a back-and-forth step lands even farther -> ~0. A clean
+            # step matching the reference stride pays in full. RECOVERY
+            # EXEMPTION: when ONLY the self-speed side unlocked the payment
+            # (shoved robot, static/slow ref), placement is NOT required -- a
+            # recovery foot must land where balance demands, not where the
+            # reference stands. placement_sigma=0 disables (back-compat).
+            placement = None
+            if (
+                self.placement_sigma > 0.0
+                and ref_rigid_body_pos is not None
+            ):
+                pos = rigid_body_pos.reshape(emission.shape[0], -1, 3)
+                ref_pos = ref_rigid_body_pos.reshape(emission.shape[0], -1, 3)
+                foot_rel = pos[:, contact_body_ids, :2] - pos[:, 0:1, :2]
+                ref_foot_rel = (
+                    ref_pos[:, contact_body_ids, :2] - ref_pos[:, 0:1, :2]
+                )
+                perr2 = (foot_rel - ref_foot_rel).square().sum(dim=-1)
+                placement = torch.exp(-perr2 / (self.placement_sigma**2))
+
+            if ref_gate is not None or self_gate is not None:
+                paid = torch.zeros_like(emission)
+                if ref_gate is not None:
+                    # Locomotion path: ref is moving -> placement REQUIRED.
+                    ref_pay = emission * ref_gate.unsqueeze(-1)
+                    if placement is not None:
+                        ref_pay = ref_pay * placement
+                    # ALTERNATION gate (v5.2 anti same-foot double-tap): a
+                    # foot's touchdown pays only if the OTHER foot has landed
+                    # since this foot's last PAID touchdown. Natural gait
+                    # always alternates (walk through sprint); a same-foot
+                    # tap-tap inside one reference stride is double-dipping.
+                    # Simultaneous two-foot landings (jump) both pay and clear
+                    # the state. Recovery path (below) is exempt.
+                    if self.require_alternation and self._last_paid_foot is not None:
+                        n_feet = ref_pay.shape[-1]
+                        foot_idx = torch.arange(
+                            n_feet, device=ref_pay.device
+                        ).unsqueeze(0)
+                        repeat = foot_idx == self._last_paid_foot.unsqueeze(-1)
+                        both_land = touchdown.sum(dim=-1) >= 2
+                        repeat = repeat & ~both_land.unsqueeze(-1)
+                        ref_pay = ref_pay * (~repeat).float()
+                        pays_now = (ref_pay > 0.0) & touchdown
+                        single = pays_now.sum(dim=-1) == 1
+                        new_last = torch.where(
+                            both_land,
+                            torch.full_like(self._last_paid_foot, -1),
+                            self._last_paid_foot,
+                        )
+                        single_idx = pays_now.float().argmax(dim=-1)
+                        new_last = torch.where(single, single_idx, new_last)
+                        self._last_paid_foot = new_last
+                    paid = torch.maximum(paid, ref_pay)
+                if self_gate is not None:
+                    # Recovery path: pay WITHOUT placement ONLY when the ref
+                    # side did NOT unlock (self moving, ref static/slow =
+                    # genuine perturbation recovery). During normal walking
+                    # the robot's own root also moves, so a bare self-gate
+                    # would bypass placement on every stride -- hence & ~ref.
+                    recovery = self_gate
+                    if ref_gate is not None:
+                        recovery = self_gate & ~ref_gate
+                    paid = torch.maximum(
+                        paid, emission * recovery.unsqueeze(-1)
+                    )
+                emission = paid
+            elif placement is not None:
+                emission = emission * placement
 
         self._swing_apex = torch.where(
             touchdown, torch.zeros_like(self._swing_apex), self._swing_apex

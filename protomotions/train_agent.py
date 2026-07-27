@@ -711,6 +711,7 @@ def main():
             ("micro_step_tax", "PM_ANTISHUFFLE_MAX_APEX", _CF, "max_apex_height"),
             ("foot_slip", "PM_FOOT_SLIP_WEIGHT", _SP, "weight"),
             ("feet_apex_height", "PM_STEP_LIFT_MIN_SWING_SEC", _CF, "min_swing_sec"),
+            ("feet_apex_height", "PM_STEP_LIFT_PLACEMENT_SIGMA", _CF, "placement_sigma"),
             ("foot_speed", "PM_FOOT_SPEED_WEIGHT", _SP, "weight"),
             ("foot_speed", "PM_FOOT_SPEED_MAX", _SP, "max_foot_speed"),
             ("foot_speed", "PM_FOOT_SPEED_REF_SCALE", _SP, "ref_speed_scale"),
@@ -736,6 +737,37 @@ def main():
             # override lines were invisible on the gpu3202 gate resume.
             log.warning(
                 f"RESUME override {_comp}.{_key} = {_fval} (was {_old}, from {_var})"
+            )
+        # v5.2 placement gate needs a dynamic_var the pre-v5.2 frozen configs
+        # were pickled WITHOUT: ref_rigid_body_pos. Inject it on resume when
+        # the placement sigma is explicitly enabled, else the kernel silently
+        # never receives ref positions and the gate no-ops (the exact class of
+        # trap the re-apply loop exists to prevent).
+        if (
+            os.environ.get("PM_STEP_LIFT_PLACEMENT_SIGMA")
+            and "feet_apex_height" in _rc
+            and "ref_rigid_body_pos" not in _rc["feet_apex_height"].dynamic_vars
+        ):
+            from protomotions.envs.context_views import EnvContext as _ECtx
+
+            _rc["feet_apex_height"].dynamic_vars["ref_rigid_body_pos"] = (
+                _ECtx.mimic.ref_state.rigid_body_pos
+            )
+            log.warning(
+                "RESUME override feet_apex_height.dynamic_vars += "
+                "ref_rigid_body_pos (v5.2 placement gate wiring)"
+            )
+        _alt = os.environ.get("PM_STEP_LIFT_ALTERNATE")
+        if _alt is not None and "feet_apex_height" in _rc:
+            _cf = _rc["feet_apex_height"].compute_func
+            _newalt = _alt not in ("0", "")
+            _oldalt = getattr(_cf, "require_alternation", None)
+            setattr(_cf, "require_alternation", _newalt)
+            if getattr(_cf, "_last_paid_foot", "MISSING") == "MISSING":
+                setattr(_cf, "_last_paid_foot", None)
+            log.warning(
+                f"RESUME override feet_apex_height.require_alternation = "
+                f"{_newalt} (was {_oldalt}, from PM_STEP_LIFT_ALTERNATE)"
             )
 
         # PM_ARM_{KP,KD,EFFORT}[_SHOULDER|_ELBOW|_WRIST] (env-gated, resume-safe):
