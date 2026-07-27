@@ -37,6 +37,8 @@ does).
 import torch
 from torch import Tensor
 
+from protomotions.utils.rotations import calc_heading_quat_inv, quat_rotate
+
 try:  # pragma: no cover - depends on torch version
     from torch._dynamo import disable as _dynamo_disable
 except Exception:  # pragma: no cover
@@ -170,6 +172,7 @@ class FeetApexHeightReward(_FootContactTransitionTracker):
         control_dt: float = 0.02,
         placement_sigma: float = 0.0,
         require_alternation: bool = False,
+        recovery_pay_scale: float = 0.5,
     ):
         super().__init__()
         if apex_target_height <= 0.0:
@@ -196,6 +199,12 @@ class FeetApexHeightReward(_FootContactTransitionTracker):
         if placement_sigma < 0.0:
             raise ValueError("placement_sigma must be non-negative.")
         self.placement_sigma = placement_sigma
+        if recovery_pay_scale < 0.0:
+            raise ValueError("recovery_pay_scale must be non-negative.")
+        # H2 hardening (adversarial review 2026-07-27): recovery-path payments
+        # (self-gate-only unlock) are discounted by this factor so a policy
+        # cannot fund a full-rate stepping habit through the recovery hatch.
+        self.recovery_pay_scale = recovery_pay_scale
         self.require_alternation = bool(require_alternation)
         self._last_paid_foot = None
         self._swing_apex = None
@@ -212,6 +221,8 @@ class FeetApexHeightReward(_FootContactTransitionTracker):
         ref_rigid_body_vel: Tensor = None,
         rigid_body_vel: Tensor = None,
         ref_rigid_body_pos: Tensor = None,
+        rigid_body_rot: Tensor = None,
+        ref_rigid_body_rot: Tensor = None,
     ) -> Tensor:
         contacts = sim_contacts[:, contact_body_ids].bool()
         touchdown, reset_mask = self._update_transitions(contacts, progress_buf)
@@ -328,6 +339,41 @@ class FeetApexHeightReward(_FootContactTransitionTracker):
                 ref_foot_rel = (
                     ref_pos[:, contact_body_ids, :2] - ref_pos[:, 0:1, :2]
                 )
+                # M1 yaw alignment (adversarial review 2026-07-27): foot_rel /
+                # ref_foot_rel above are root-relative XY offsets expressed in
+                # WORLD axes, so any heading error between policy and reference
+                # roots contaminated the placement comparison (a perfect local
+                # stride under a 90-deg heading error scored ~0). Rotate each
+                # offset into its OWN root's heading frame (policy by inverse
+                # policy root yaw, ref by inverse ref root yaw) before
+                # comparing; quats here are xyzw (w_last=True, matching every
+                # other rewards-module call site). Falls back to the world-
+                # frame comparison when rotations are unavailable (e.g. frozen
+                # pre-M1 configs whose dynamic_vars lack the rot tensors).
+                if rigid_body_rot is not None and ref_rigid_body_rot is not None:
+                    rot = rigid_body_rot.reshape(emission.shape[0], -1, 4)
+                    ref_rot = ref_rigid_body_rot.reshape(
+                        emission.shape[0], -1, 4
+                    )
+                    heading_inv = calc_heading_quat_inv(rot[:, 0], w_last=True)
+                    ref_heading_inv = calc_heading_quat_inv(
+                        ref_rot[:, 0], w_last=True
+                    )
+                    n_feet = foot_rel.shape[1]
+                    zpad = torch.zeros(
+                        foot_rel.shape[0], n_feet, 1,
+                        dtype=foot_rel.dtype, device=foot_rel.device,
+                    )
+                    foot_rel = quat_rotate(
+                        heading_inv.unsqueeze(1).expand(-1, n_feet, -1),
+                        torch.cat([foot_rel, zpad], dim=-1),
+                        w_last=True,
+                    )[..., :2]
+                    ref_foot_rel = quat_rotate(
+                        ref_heading_inv.unsqueeze(1).expand(-1, n_feet, -1),
+                        torch.cat([ref_foot_rel, zpad], dim=-1),
+                        w_last=True,
+                    )[..., :2]
                 perr2 = (foot_rel - ref_foot_rel).square().sum(dim=-1)
                 placement = torch.exp(-perr2 / (self.placement_sigma**2))
 
@@ -371,12 +417,47 @@ class FeetApexHeightReward(_FootContactTransitionTracker):
                     # genuine perturbation recovery). During normal walking
                     # the robot's own root also moves, so a bare self-gate
                     # would bypass placement on every stride -- hence & ~ref.
+                    # H2 hardening (adversarial review 2026-07-27): the
+                    # recovery hatch used to pay FULL rate with NO alternation
+                    # gate, making same-foot double-taps against static refs a
+                    # funded habit. Now: (a) pay is discounted by
+                    # recovery_pay_scale (default 0.5); (b) require_alternation
+                    # applies here too, on the SAME _last_paid_foot machinery,
+                    # and recovery payments UPDATE _last_paid_foot (they
+                    # previously did not, so a recovery step never counted as
+                    # "this foot was paid last"). Placement stays bypassed on
+                    # recovery -- the ref is static there, so ref foot
+                    # placement is meaningless; balance dictates the landing.
                     recovery = self_gate
                     if ref_gate is not None:
                         recovery = self_gate & ~ref_gate
-                    paid = torch.maximum(
-                        paid, emission * recovery.unsqueeze(-1)
+                    rec_pay = emission * recovery.unsqueeze(-1) * float(
+                        getattr(self, "recovery_pay_scale", 0.5)
                     )
+                    if self.require_alternation and self._last_paid_foot is not None:
+                        n_feet = rec_pay.shape[-1]
+                        foot_idx = torch.arange(
+                            n_feet, device=rec_pay.device
+                        ).unsqueeze(0)
+                        repeat = foot_idx == self._last_paid_foot.unsqueeze(-1)
+                        both_land = touchdown.sum(dim=-1) >= 2
+                        repeat = repeat & ~both_land.unsqueeze(-1)
+                        rec_pay = rec_pay * (~repeat).float()
+                        pays_now = (rec_pay > 0.0) & touchdown
+                        single = pays_now.sum(dim=-1) == 1
+                        # Update ONLY recovery envs; locomotion envs were
+                        # already updated by the ref-path block above.
+                        new_last = torch.where(
+                            both_land & recovery,
+                            torch.full_like(self._last_paid_foot, -1),
+                            self._last_paid_foot,
+                        )
+                        single_idx = pays_now.float().argmax(dim=-1)
+                        new_last = torch.where(
+                            single & recovery, single_idx, new_last
+                        )
+                        self._last_paid_foot = new_last
+                    paid = torch.maximum(paid, rec_pay)
                 emission = paid
             elif placement is not None:
                 emission = emission * placement
@@ -514,15 +595,24 @@ class MicroStepTax(_FootContactTransitionTracker):
         self,
         max_step_length: float = 0.10,
         max_apex_height: float = 0.06,
+        min_swing_steps: int = 3,
     ):
         super().__init__()
         if max_step_length < 0.0:
             raise ValueError("max_step_length must be non-negative.")
         if max_apex_height < 0.0:
             raise ValueError("max_apex_height must be non-negative.")
+        if min_swing_steps < 0:
+            raise ValueError("min_swing_steps must be non-negative.")
         self.max_step_length = max_step_length
         self.max_apex_height = max_apex_height
+        # M2 chatter guard (adversarial review 2026-07-27): a "touchdown"
+        # whose preceding swing lasted < min_swing_steps control steps is
+        # contact CHATTER (1-frame contact flicker from the solver), not a
+        # step -- do not tax it.
+        self.min_swing_steps = min_swing_steps
         self._swing_apex = None
+        self._swing_steps = None
         self._last_touchdown_xy = None
 
     @_dynamo_disable
@@ -542,6 +632,13 @@ class MicroStepTax(_FootContactTransitionTracker):
                 contacts.shape, dtype=torch.float32, device=contacts.device
             )
         self._swing_apex[reset_mask] = 0.0
+        # M2 chatter guard state (getattr: unpickled pre-M2 instances lack it).
+        _swing_steps = getattr(self, "_swing_steps", None)
+        if _swing_steps is None or _swing_steps.shape != contacts.shape:
+            _swing_steps = torch.zeros(
+                contacts.shape, dtype=torch.float32, device=contacts.device
+            )
+        _swing_steps[reset_mask] = 0.0
 
         foot_xy = rigid_body_pos[:, contact_body_ids, :2]
         if (
@@ -553,21 +650,28 @@ class MicroStepTax(_FootContactTransitionTracker):
 
         heights = _foot_heights(rigid_body_pos, contact_body_ids, ground_heights)
 
-        # Track swing apex for airborne feet (including the liftoff frame).
+        # Track swing apex + duration for airborne feet (incl. liftoff frame).
         in_air = ~contacts
         self._swing_apex = torch.where(
             in_air, torch.maximum(self._swing_apex, heights), self._swing_apex
         )
+        _swing_steps = torch.where(in_air, _swing_steps + 1.0, _swing_steps)
 
         step_length = torch.norm(foot_xy - self._last_touchdown_xy, dim=-1)
         is_short = step_length < self.max_step_length
         is_low = self._swing_apex < self.max_apex_height
-        tax = (touchdown & is_short & is_low).float()
+        # M2 chatter guard: a touchdown whose preceding swing lasted fewer
+        # than min_swing_steps control steps is contact chatter, not a step.
+        swing_ok = _swing_steps >= float(getattr(self, "min_swing_steps", 3))
+        tax = (touchdown & is_short & is_low & swing_ok).float()
 
-        # Clear the apex accumulator and re-anchor the step measurement at this
-        # touchdown position (only for feet that just landed).
+        # Clear the apex/duration accumulators and re-anchor the step
+        # measurement at this touchdown position (only feet that just landed).
         self._swing_apex = torch.where(
             touchdown, torch.zeros_like(self._swing_apex), self._swing_apex
+        )
+        self._swing_steps = torch.where(
+            touchdown, torch.zeros_like(_swing_steps), _swing_steps
         )
         self._last_touchdown_xy = torch.where(
             touchdown.unsqueeze(-1), foot_xy, self._last_touchdown_xy
@@ -613,16 +717,39 @@ class StepBudgetPenalty(_FootContactTransitionTracker):
 
     __name__ = "step_budget_penalty"
 
-    def __init__(self, min_ref_speed: float = 0.05, max_credits: float = 2.0):
+    def __init__(
+        self,
+        min_ref_speed: float = 0.05,
+        max_credits: float = 2.0,
+        ref_contact_threshold: float = 0.5,
+        min_swing_steps: int = 3,
+    ):
         super().__init__()
         if min_ref_speed < 0.0:
             raise ValueError("min_ref_speed must be non-negative.")
         if max_credits < 1.0:
             raise ValueError("max_credits must be >= 1.")
+        if not (0.0 <= ref_contact_threshold < 1.0):
+            raise ValueError("ref_contact_threshold must be in [0, 1).")
+        if min_swing_steps < 0:
+            raise ValueError("min_swing_steps must be non-negative.")
+        # H1 (adversarial review 2026-07-27): reference contacts are SMOOTHED
+        # floats in [0, 1] (moving-average window 7 + frame blending), so the
+        # old ``.bool()`` (i.e. > 0) dilated ref stance by +/- ~3 frames on
+        # each side -- short reference swings never showed a liftoff ->
+        # touchdown edge, no credits were granted, and every policy step
+        # overdrafted. Threshold at 0.5 recovers the true contact schedule
+        # (mirrors compute_reference_contact_liftoff_penalty).
+        self.ref_contact_threshold = ref_contact_threshold
+        # M2 (adversarial review 2026-07-27): a policy "touchdown" whose
+        # preceding swing lasted < min_swing_steps control steps is contact
+        # chatter, not a step -- it must not spend a budget credit.
+        self.min_swing_steps = min_swing_steps
         self.min_ref_speed = min_ref_speed
         self.max_credits = max_credits
         self._credits = None
         self._prev_ref_contacts = None
+        self._swing_steps = None
 
     @_dynamo_disable
     def __call__(
@@ -642,12 +769,33 @@ class StepBudgetPenalty(_FootContactTransitionTracker):
             )
         self._credits[reset_mask] = 1.0
 
+        # M2 chatter-guard swing counter (getattr: unpickled pre-M2 instances
+        # lack the attribute).
+        _swing_steps = getattr(self, "_swing_steps", None)
+        if _swing_steps is None or _swing_steps.shape != contacts.shape:
+            _swing_steps = torch.zeros(
+                contacts.shape, dtype=torch.float32, device=contacts.device
+            )
+        _swing_steps[reset_mask] = 0.0
+        in_air = ~contacts
+        _swing_steps = torch.where(in_air, _swing_steps + 1.0, _swing_steps)
+        swing_ok = _swing_steps >= float(getattr(self, "min_swing_steps", 3))
+        self._swing_steps = torch.where(
+            touchdown, torch.zeros_like(_swing_steps), _swing_steps
+        )
+
         if ref_rigid_body_contacts is None or ref_rigid_body_vel is None:
             return torch.zeros(
                 contacts.shape[0], device=contacts.device, dtype=torch.float32
             )
 
-        ref_contacts = ref_rigid_body_contacts[:, contact_body_ids].bool()
+        # H1: ref contacts are smoothed floats in [0, 1]; threshold at 0.5
+        # instead of .bool() (> 0), which dilated stance by the smoothing
+        # window and starved credit grants on short reference swings.
+        ref_contacts = (
+            ref_rigid_body_contacts[:, contact_body_ids]
+            > float(getattr(self, "ref_contact_threshold", 0.5))
+        )
         if (
             self._prev_ref_contacts is None
             or self._prev_ref_contacts.shape != ref_contacts.shape
@@ -668,7 +816,9 @@ class StepBudgetPenalty(_FootContactTransitionTracker):
         ref_vel = ref_rigid_body_vel.reshape(contacts.shape[0], -1, 3)
         loco = (ref_vel[:, 0, :2].norm(dim=-1) > self.min_ref_speed).unsqueeze(-1)
 
-        spend = touchdown & loco
+        # M2 chatter guard: a touchdown after a < min_swing_steps "swing" is
+        # solver contact flicker, not a real step -- no spend, no overdraft.
+        spend = touchdown & loco & swing_ok
         has_credit = self._credits >= 1.0
         overdraft = (spend & ~has_credit).float()
         self._credits = torch.where(

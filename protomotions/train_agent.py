@@ -712,6 +712,8 @@ def main():
             ("foot_slip", "PM_FOOT_SLIP_WEIGHT", _SP, "weight"),
             ("feet_apex_height", "PM_STEP_LIFT_MIN_SWING_SEC", _CF, "min_swing_sec"),
             ("feet_apex_height", "PM_STEP_LIFT_PLACEMENT_SIGMA", _CF, "placement_sigma"),
+            ("feet_apex_height", "PM_STEP_APEX_TARGET", _CF, "apex_target_height"),
+            ("feet_apex_height", "PM_STEP_LIFT_RECOVERY_PAY_SCALE", _CF, "recovery_pay_scale"),
             ("foot_speed", "PM_FOOT_SPEED_WEIGHT", _SP, "weight"),
             ("foot_speed", "PM_FOOT_SPEED_MAX", _SP, "max_foot_speed"),
             ("foot_speed", "PM_FOOT_SPEED_REF_SCALE", _SP, "ref_speed_scale"),
@@ -724,7 +726,17 @@ def main():
             ("heading_local_anchor_drift", "PM_HEADING_DRIFT_WEIGHT", _SP, "weight"),
         ):
             _val = os.environ.get(_var)
-            if _val is None or _comp not in _rc:
+            if _val is None:
+                continue
+            if _comp not in _rc:
+                # M4 (2026-07-27): an explicitly-set gate var whose component
+                # is absent from the frozen config used to be dropped
+                # SILENTLY -- loudly flag the no-op instead.
+                log.warning(
+                    f"RESUME override SKIPPED: {_var}={_val} is set but reward "
+                    f"component '{_comp}' is not in the frozen config "
+                    f"(env var has NO effect on this resume)"
+                )
                 continue
             _fval = float(_val)
             if _loc == _SP:
@@ -747,17 +759,30 @@ def main():
         if (
             os.environ.get("PM_STEP_LIFT_PLACEMENT_SIGMA")
             and "feet_apex_height" in _rc
-            and "ref_rigid_body_pos" not in _rc["feet_apex_height"].dynamic_vars
         ):
             from protomotions.envs.context_views import EnvContext as _ECtx
 
-            _rc["feet_apex_height"].dynamic_vars["ref_rigid_body_pos"] = (
-                _ECtx.mimic.ref_state.rigid_body_pos
-            )
-            log.warning(
-                "RESUME override feet_apex_height.dynamic_vars += "
-                "ref_rigid_body_pos (v5.2 placement gate wiring)"
-            )
+            _dv = _rc["feet_apex_height"].dynamic_vars
+            if "ref_rigid_body_pos" not in _dv:
+                _dv["ref_rigid_body_pos"] = _ECtx.mimic.ref_state.rigid_body_pos
+                log.warning(
+                    "RESUME override feet_apex_height.dynamic_vars += "
+                    "ref_rigid_body_pos (v5.2 placement gate wiring)"
+                )
+            # M1 placement yaw alignment (2026-07-27): the kernel now rotates
+            # each side's root-relative foot XY into its own root heading
+            # frame; pre-M1 frozen configs lack the rot tensors (kernel falls
+            # back to the world-frame comparison without them).
+            for _rk, _rv in (
+                ("rigid_body_rot", _ECtx.current.rigid_body_rot),
+                ("ref_rigid_body_rot", _ECtx.mimic.ref_state.rigid_body_rot),
+            ):
+                if _rk not in _dv:
+                    _dv[_rk] = _rv
+                    log.warning(
+                        f"RESUME override feet_apex_height.dynamic_vars += "
+                        f"{_rk} (M1 placement yaw-alignment wiring)"
+                    )
         _alt = os.environ.get("PM_STEP_LIFT_ALTERNATE")
         if _alt is not None and "feet_apex_height" in _rc:
             _cf = _rc["feet_apex_height"].compute_func

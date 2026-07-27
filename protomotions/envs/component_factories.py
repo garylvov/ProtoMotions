@@ -1086,6 +1086,7 @@ def max_feet_height_rew_factory(
     control_dt: float = 0.02,
     placement_sigma: float = 0.0,
     require_alternation: bool = False,
+    recovery_pay_scale: float = 0.5,
     zero_during_grace_period: bool = True,
 ) -> MdpComponent:
     """Factory for the OmniH2O per-step swing-apex reward/penalty (dormant).
@@ -1139,6 +1140,9 @@ def max_feet_height_rew_factory(
             0.25s gate; any real step keeps full pay.
         control_dt: Control timestep in seconds used to convert the swing-step
             counter to seconds for ``min_swing_sec`` (default 0.02).
+        recovery_pay_scale: Multiplier on recovery-path (self-gate-only)
+            lift payments, ``"lift"`` mode only (default 0.5, H2 hardening —
+            the recovery hatch must not fund a full-rate stepping habit).
         zero_during_grace_period: Zero the reward during post-reset grace.
 
     Returns:
@@ -1156,6 +1160,7 @@ def max_feet_height_rew_factory(
             control_dt=control_dt,
             placement_sigma=placement_sigma,
             require_alternation=require_alternation,
+            recovery_pay_scale=recovery_pay_scale,
         ),
         dynamic_vars={
             "sim_contacts": EnvContext.current.rigid_body_contacts,
@@ -1166,6 +1171,10 @@ def max_feet_height_rew_factory(
             "ref_rigid_body_vel": EnvContext.mimic.ref_state.rigid_body_vel,
             "rigid_body_vel": EnvContext.current.rigid_body_vel,
             "ref_rigid_body_pos": EnvContext.mimic.ref_state.rigid_body_pos,
+            # M1 placement yaw alignment: each side's root-relative foot XY is
+            # rotated into its OWN root heading frame before comparison.
+            "rigid_body_rot": EnvContext.current.rigid_body_rot,
+            "ref_rigid_body_rot": EnvContext.mimic.ref_state.rigid_body_rot,
         },
         static_params={
             "weight": weight,
@@ -1391,6 +1400,7 @@ def step_budget_penalty_factory(
     weight: float = 0.0,
     min_ref_speed: float = 0.05,
     max_credits: float = 2.0,
+    ref_contact_threshold: float = 0.5,
     zero_during_grace_period: bool = True,
 ) -> MdpComponent:
     """Factory for the excess-cadence step-budget penalty (v5.3).
@@ -1401,12 +1411,24 @@ def step_budget_penalty_factory(
     merely stop rewarding ("4 fake steps per reference step" = 3 penalties
     per cycle). Applies only while the reference root locomotes; static-ref
     recovery stepping is exempt by construction.
+
+    ``ref_contact_threshold`` (default 0.5): reference contacts are SMOOTHED
+    floats in [0, 1]; credits are granted on ref liftoff->touchdown edges of
+    ``ref_contact > threshold`` (mirrors
+    ``compute_reference_contact_liftoff_penalty``). H1 fix 2026-07-27: the
+    old ``.bool()`` (> 0) dilated ref stance by the smoothing window and
+    starved credit grants on short reference swings.
     """
     from protomotions.envs.rewards import StepBudgetPenalty
 
+    if not (0.0 <= ref_contact_threshold < 1.0):
+        raise ValueError("ref_contact_threshold must be in [0, 1).")
+
     return MdpComponent(
         compute_func=StepBudgetPenalty(
-            min_ref_speed=min_ref_speed, max_credits=max_credits
+            min_ref_speed=min_ref_speed,
+            max_credits=max_credits,
+            ref_contact_threshold=ref_contact_threshold,
         ),
         dynamic_vars={
             "sim_contacts": EnvContext.current.rigid_body_contacts,

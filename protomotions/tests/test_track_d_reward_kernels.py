@@ -267,8 +267,10 @@ def test_apex_lift_ref_or_self_gate_blocks_march_in_place():
 
 def test_apex_lift_self_gate_pays_shoved_robot_under_static_ref():
     """REF-OR-SELF gate: a big high step under a STATIONARY reference but with the
-    robot's OWN root moving 0.5 m/s (shoved / fallen) PAYS the full 1.0 — the
-    fall-RECOVERY escape hatch, gated relative to itself, not the ref traj."""
+    robot's OWN root moving 0.5 m/s (shoved / fallen) PAYS — the fall-RECOVERY
+    escape hatch, gated relative to itself, not the ref traj. H2 hardening
+    (2026-07-27): recovery-path pay is discounted by recovery_pay_scale
+    (default 0.5) so the hatch cannot fund a full-rate stepping habit."""
     rew = FeetApexHeightReward(
         apex_target_height=0.18, reward_mode="lift",
         min_ref_speed=0.05, min_self_speed=0.25,
@@ -277,6 +279,17 @@ def test_apex_lift_self_gate_pays_shoved_robot_under_static_ref():
     rew(_contacts(True), _positions(), GROUND, FOOT_IDS, progress,
         ref_rigid_body_vel=REF_VEL_STATIC, rigid_body_vel=SELF_VEL_SHOVED)
     r, _ = _lift_big_high_step(rew, progress, REF_VEL_STATIC, SELF_VEL_SHOVED)
+    torch.testing.assert_close(r, torch.tensor([0.5, 0.0]))
+
+    # recovery_pay_scale=1.0 restores the pre-H2 full-rate hatch.
+    rew_full = FeetApexHeightReward(
+        apex_target_height=0.18, reward_mode="lift",
+        min_ref_speed=0.05, min_self_speed=0.25, recovery_pay_scale=1.0,
+    )
+    progress = torch.tensor([1, 1])
+    rew_full(_contacts(True), _positions(), GROUND, FOOT_IDS, progress,
+        ref_rigid_body_vel=REF_VEL_STATIC, rigid_body_vel=SELF_VEL_SHOVED)
+    r, _ = _lift_big_high_step(rew_full, progress, REF_VEL_STATIC, SELF_VEL_SHOVED)
     torch.testing.assert_close(r, torch.tensor([1.0, 0.0]))
 
 
@@ -520,6 +533,9 @@ def test_track_d_factories_are_dormant_by_default():
         "progress_buf",
         "ref_rigid_body_vel",
         "rigid_body_vel",
+        "ref_rigid_body_pos",
+        "rigid_body_rot",
+        "ref_rigid_body_rot",
     }
 
     step = step_displacement_rew_factory(
