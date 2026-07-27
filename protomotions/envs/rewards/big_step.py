@@ -505,25 +505,43 @@ def compute_foot_speed_penalty(
     sim_contacts: Tensor,
     rigid_body_vel: Tensor,
     contact_body_ids: Tensor,
-    max_foot_speed: float = 1.5,
+    max_foot_speed: float = 2.5,
+    ref_rigid_body_vel: Tensor = None,
+    ref_speed_scale: float = 0.0,
 ) -> Tensor:
-    """Continuous swing-foot overspeed penalty (anti-machine-gun, v5).
+    """Continuous swing-foot overspeed penalty, REFERENCE-RELATIVE (v5.1).
 
-    For every AIRBORNE foot, emits ``max(0, ||foot_vel|| - max_foot_speed)``
-    (full 3D speed), summed over feet. Weight NEGATIVELY. Stance feet emit 0
-    here — contact-phase foot motion is the foot_slip penalty's job; this term
-    owns the SWING phase, where ultra-high-frequency stepping needs violent
-    foot velocities that a normal swing never reaches. A clean human-speed
-    swing (~1 m/s peak on walking clips) costs nothing at the 1.5 m/s default
-    threshold; a vibration step's snap costs continuously, every control step
-    it is over the limit.
+    For every AIRBORNE foot, penalizes speed above a per-foot, per-step
+    allowance ``max(max_foot_speed, ref_speed_scale * ||ref_foot_vel||)``
+    (full 3D norms), summed over feet. Weight NEGATIVELY. Stance feet emit 0
+    here — contact-phase motion is the foot_slip penalty's job.
 
-    Raw units: m/s of overspeed, summed over airborne feet, per step.
+    WHY reference-relative (measured on the 120-clip LAFAN eval set, feet =
+    lowest-mean-z bodies): median p95 reference foot speed is 2.54 m/s for
+    WALK, 5.34 for RUN, 6.19 for SPRINT (max 11.8) — a fixed human-scale
+    threshold taxes legitimate locomotion wholesale and rebuilds the freeze
+    attractor. The machine-gun exploit instead snaps feet against SLOW or
+    static references, where the allowance collapses to the floor: ref foot
+    ~0 m/s => allowance = ``max_foot_speed`` (floor, default 2.5 — covers
+    recovery steps on static refs); ref sprinting at 8 m/s =>
+    allowance = 1.3*8 = 10.4 => real sprinting is free.
+
+    ``ref_speed_scale=0`` or ``ref_rigid_body_vel=None`` disables the
+    reference term (pure fixed-floor behavior).
+
+    Raw units: m/s of over-allowance speed, summed over airborne feet/step.
     """
     contacts = sim_contacts[:, contact_body_ids].bool()
     vel = rigid_body_vel.reshape(rigid_body_vel.shape[0], -1, 3)[:, contact_body_ids]
     speed = vel.norm(dim=-1)
-    overspeed = (speed - max_foot_speed).clamp(min=0.0)
+    allowance = torch.full_like(speed, max_foot_speed)
+    if ref_rigid_body_vel is not None and ref_speed_scale > 0.0:
+        ref_vel = ref_rigid_body_vel.reshape(rigid_body_vel.shape[0], -1, 3)[
+            :, contact_body_ids
+        ]
+        ref_speed = ref_vel.norm(dim=-1)
+        allowance = torch.maximum(allowance, ref_speed_scale * ref_speed)
+    overspeed = (speed - allowance).clamp(min=0.0)
     return (overspeed * (~contacts).float()).sum(dim=-1)
 
 

@@ -912,6 +912,66 @@ class BaseAgent:
             self.current_epoch += 1
             self.fabric.call("after_train", self)
 
+            # --- TEMP env-gated cross-rank policy-weight hash dump (benchmark
+            # verification for imprint #116: prove ONE cross-GPU DDP model, not
+            # sealed groups). Every rank runs this after >=1 optimizer step; if
+            # all-reduce is real the actor state_dict is byte-identical across
+            # ranks on different physical GPUs. Not part of the pushed launcher;
+            # only fires when PM_WEIGHT_HASH_DUMP=1. Remove after benchmarking. ---
+            if os.environ.get("PM_WEIGHT_HASH_DUMP") == "1" and not getattr(
+                self, "_pm_weight_hash_done", False
+            ):
+                if self.current_epoch >= int(os.environ.get("PM_WEIGHT_HASH_EPOCH", "2")):
+                    try:
+                        import hashlib as _hashlib
+                        import json as _json
+
+                        _h = _hashlib.sha256()
+                        _sd = self.actor_module.state_dict()
+                        for _k in sorted(_sd.keys()):
+                            _t = _sd[_k]
+                            if hasattr(_t, "detach"):
+                                _h.update(_k.encode())
+                                _h.update(
+                                    _t.detach()
+                                    .to(torch.float32)
+                                    .cpu()
+                                    .contiguous()
+                                    .numpy()
+                                    .tobytes()
+                                )
+                        _dev = torch.cuda.current_device()
+                        try:
+                            _uuid = str(torch.cuda.get_device_properties(_dev).uuid)
+                        except Exception:
+                            _uuid = "unknown"
+                        _out = {
+                            "global_rank": int(self.fabric.global_rank),
+                            "world_size": int(self.fabric.world_size),
+                            "local_device": int(_dev),
+                            "gpu_uuid": _uuid,
+                            "epoch": int(self.current_epoch),
+                            "actor_sha256": _h.hexdigest(),
+                        }
+                        _d = os.environ.get(
+                            "PM_WEIGHT_HASH_DIR", "/oscar/scratch/glvov/ddp_bench/hashes"
+                        )
+                        os.makedirs(_d, exist_ok=True)
+                        with open(
+                            os.path.join(_d, f"rank_{self.fabric.global_rank:03d}.json"),
+                            "w",
+                        ) as _f:
+                            _json.dump(_out, _f)
+                        print(
+                            f"[pm_weight_hash] rank={self.fabric.global_rank} "
+                            f"gpu_uuid={_uuid} sha256={_h.hexdigest()[:16]}",
+                            flush=True,
+                        )
+                    except Exception as _e:
+                        print(f"[pm_weight_hash] ERROR: {_e}", flush=True)
+                    self._pm_weight_hash_done = True
+            # --- end temp weight-hash dump ---
+
             # Save epoch-based checkpoint (epoch_xxx.ckpt)
             if (
                 self.config.save_epoch_checkpoint_every is not None

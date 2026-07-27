@@ -1340,7 +1340,8 @@ def foot_slip_penalty_factory(
 
 def foot_speed_penalty_factory(
     weight: float = 0.0,
-    max_foot_speed: float = 1.5,
+    max_foot_speed: float = 2.5,
+    ref_speed_scale: float = 1.3,
     zero_during_grace_period: bool = True,
 ) -> MdpComponent:
     """Factory for the swing-foot overspeed penalty (anti-machine-gun, v5).
@@ -1370,10 +1371,12 @@ def foot_speed_penalty_factory(
             "sim_contacts": EnvContext.current.rigid_body_contacts,
             "rigid_body_vel": EnvContext.current.rigid_body_vel,
             "contact_body_ids": EnvContext.contact_body_ids,
+            "ref_rigid_body_vel": EnvContext.mimic.ref_state.rigid_body_vel,
         },
         static_params={
             "weight": weight,
             "max_foot_speed": max_foot_speed,
+            "ref_speed_scale": ref_speed_scale,
             "zero_during_grace_period": zero_during_grace_period,
         },
     )
