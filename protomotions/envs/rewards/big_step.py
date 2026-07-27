@@ -166,6 +166,8 @@ class FeetApexHeightReward(_FootContactTransitionTracker):
         reward_mode: str = "shortfall",
         min_ref_speed: float = 0.0,
         min_self_speed: float = 0.0,
+        min_swing_sec: float = 0.0,
+        control_dt: float = 0.02,
     ):
         super().__init__()
         if apex_target_height <= 0.0:
@@ -179,11 +181,18 @@ class FeetApexHeightReward(_FootContactTransitionTracker):
             raise ValueError("min_ref_speed must be non-negative.")
         if min_self_speed < 0.0:
             raise ValueError("min_self_speed must be non-negative.")
+        if min_swing_sec < 0.0:
+            raise ValueError("min_swing_sec must be non-negative.")
+        if control_dt <= 0.0:
+            raise ValueError("control_dt must be positive.")
         self.apex_target_height = apex_target_height
         self.reward_mode = reward_mode
         self.min_ref_speed = min_ref_speed
         self.min_self_speed = min_self_speed
+        self.min_swing_sec = min_swing_sec
+        self.control_dt = control_dt
         self._swing_apex = None
+        self._swing_steps = None
 
     @_dynamo_disable
     def __call__(
@@ -204,13 +213,24 @@ class FeetApexHeightReward(_FootContactTransitionTracker):
                 contacts.shape, dtype=torch.float32, device=contacts.device
             )
         self._swing_apex[reset_mask] = 0.0
+        if self._swing_steps is None or self._swing_steps.shape != contacts.shape:
+            self._swing_steps = torch.zeros(
+                contacts.shape, dtype=torch.float32, device=contacts.device
+            )
+        self._swing_steps[reset_mask] = 0.0
 
         heights = _foot_heights(rigid_body_pos, contact_body_ids, ground_heights)
 
-        # Update apex for airborne feet (including the liftoff frame).
+        # Update apex + swing-duration counter for airborne feet (including the
+        # liftoff frame). The counter is the anti-machine-gun clock: a vibration
+        # "swing" of a few control steps never accumulates min_swing_sec of air
+        # time, so in "lift" mode it earns nothing (see below).
         in_air = ~contacts
         self._swing_apex = torch.where(
             in_air, torch.maximum(self._swing_apex, heights), self._swing_apex
+        )
+        self._swing_steps = torch.where(
+            in_air, self._swing_steps + 1.0, self._swing_steps
         )
 
         # Emit once, at touchdown; then clear that apex. "shortfall" pays the
@@ -224,6 +244,16 @@ class FeetApexHeightReward(_FootContactTransitionTracker):
                 / self.apex_target_height,
                 torch.zeros_like(self._swing_apex),
             )
+            # MIN-SWING-DURATION gate (anti-machine-gun, v5): a completed swing
+            # pays ONLY if the foot was airborne >= min_swing_sec. Ultra-high-
+            # frequency stepping (the frequency exploit: lift income scales with
+            # touchdown COUNT, air-time dodges the slip penalty, high mini-steps
+            # dodge the micro-step tax) produces ~0.1s vibration swings that earn
+            # ZERO under a 0.25s gate, while any real step (>=0.25s swing) keeps
+            # full pay. Disabled at 0.0 (default) = byte-identical back-compat.
+            if self.min_swing_sec > 0.0:
+                swing_ok = (self._swing_steps * self.control_dt) >= self.min_swing_sec
+                emission = emission * swing_ok.float()
         else:  # "shortfall"
             emission = torch.where(
                 touchdown,
@@ -261,6 +291,9 @@ class FeetApexHeightReward(_FootContactTransitionTracker):
 
         self._swing_apex = torch.where(
             touchdown, torch.zeros_like(self._swing_apex), self._swing_apex
+        )
+        self._swing_steps = torch.where(
+            touchdown, torch.zeros_like(self._swing_steps), self._swing_steps
         )
 
         return emission.sum(dim=-1)
@@ -468,9 +501,36 @@ def compute_in_the_air_penalty(
     return (~contacts).all(dim=-1).float()
 
 
+def compute_foot_speed_penalty(
+    sim_contacts: Tensor,
+    rigid_body_vel: Tensor,
+    contact_body_ids: Tensor,
+    max_foot_speed: float = 1.5,
+) -> Tensor:
+    """Continuous swing-foot overspeed penalty (anti-machine-gun, v5).
+
+    For every AIRBORNE foot, emits ``max(0, ||foot_vel|| - max_foot_speed)``
+    (full 3D speed), summed over feet. Weight NEGATIVELY. Stance feet emit 0
+    here — contact-phase foot motion is the foot_slip penalty's job; this term
+    owns the SWING phase, where ultra-high-frequency stepping needs violent
+    foot velocities that a normal swing never reaches. A clean human-speed
+    swing (~1 m/s peak on walking clips) costs nothing at the 1.5 m/s default
+    threshold; a vibration step's snap costs continuously, every control step
+    it is over the limit.
+
+    Raw units: m/s of overspeed, summed over airborne feet, per step.
+    """
+    contacts = sim_contacts[:, contact_body_ids].bool()
+    vel = rigid_body_vel.reshape(rigid_body_vel.shape[0], -1, 3)[:, contact_body_ids]
+    speed = vel.norm(dim=-1)
+    overspeed = (speed - max_foot_speed).clamp(min=0.0)
+    return (overspeed * (~contacts).float()).sum(dim=-1)
+
+
 __all__ = [
     "FeetApexHeightReward",
     "StepDisplacementReward",
     "MicroStepTax",
     "compute_in_the_air_penalty",
+    "compute_foot_speed_penalty",
 ]

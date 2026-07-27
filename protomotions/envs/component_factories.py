@@ -1082,6 +1082,8 @@ def max_feet_height_rew_factory(
     reward_mode: str = "shortfall",
     min_ref_speed: float = 0.0,
     min_self_speed: float = 0.0,
+    min_swing_sec: float = 0.0,
+    control_dt: float = 0.02,
     zero_during_grace_period: bool = True,
 ) -> MdpComponent:
     """Factory for the OmniH2O per-step swing-apex reward/penalty (dormant).
@@ -1125,6 +1127,16 @@ def max_feet_height_rew_factory(
             take a big recovery step and still be paid, gated relative to itself.
             An in-place march keeps self-speed ~0 on a static ref so it still
             pays 0. Ignored in ``"shortfall"`` mode.
+        min_swing_sec: Minimum airborne duration (seconds) for a completed
+            swing to earn lift pay, ``"lift"`` mode ONLY (default 0.0 =
+            disabled, byte-identical back-compat). The anti-MACHINE-GUN gate
+            (imprint PR #119 v5): lift income scales with touchdown COUNT, so
+            ultra-high-frequency mini-stepping farms it while dodging the slip
+            penalty (airborne feet can't slip) and the micro-step tax (high
+            apex escapes "low"). Vibration swings (~0.1s) earn ZERO under a
+            0.25s gate; any real step keeps full pay.
+        control_dt: Control timestep in seconds used to convert the swing-step
+            counter to seconds for ``min_swing_sec`` (default 0.02).
         zero_during_grace_period: Zero the reward during post-reset grace.
 
     Returns:
@@ -1138,6 +1150,8 @@ def max_feet_height_rew_factory(
             reward_mode=reward_mode,
             min_ref_speed=min_ref_speed,
             min_self_speed=min_self_speed,
+            min_swing_sec=min_swing_sec,
+            control_dt=control_dt,
         ),
         dynamic_vars={
             "sim_contacts": EnvContext.current.rigid_body_contacts,
@@ -1319,6 +1333,47 @@ def foot_slip_penalty_factory(
         },
         static_params={
             "weight": weight,
+            "zero_during_grace_period": zero_during_grace_period,
+        },
+    )
+
+
+def foot_speed_penalty_factory(
+    weight: float = 0.0,
+    max_foot_speed: float = 1.5,
+    zero_during_grace_period: bool = True,
+) -> MdpComponent:
+    """Factory for the swing-foot overspeed penalty (anti-machine-gun, v5).
+
+    Penalizes AIRBORNE foot speed above ``max_foot_speed`` (full 3D norm),
+    continuously, summed over feet. Weight NEGATIVELY. The swing-phase
+    complement to ``foot_slip_penalty_factory`` (which owns the contact
+    phase): with both active, neither stance dragging nor violent aerial
+    snapping is free, closing the v4 machine-gun exploit where rapid
+    mini-steps farmed per-touchdown lift income while their air time dodged
+    the slip penalty (imprint PR #119 v5). A normal walking swing (~1 m/s
+    peak) is under the default 1.5 m/s threshold and pays nothing.
+
+    Args:
+        weight: Reward weight (default 0.0 = dormant; NEGATIVE to enable).
+        max_foot_speed: Speed threshold in m/s; only the excess is penalized.
+        zero_during_grace_period: Zero the penalty during post-reset grace.
+
+    Returns:
+        MdpComponent configured for the swing-foot overspeed penalty.
+    """
+    from protomotions.envs.rewards import compute_foot_speed_penalty
+
+    return MdpComponent(
+        compute_func=compute_foot_speed_penalty,
+        dynamic_vars={
+            "sim_contacts": EnvContext.current.rigid_body_contacts,
+            "rigid_body_vel": EnvContext.current.rigid_body_vel,
+            "contact_body_ids": EnvContext.contact_body_ids,
+        },
+        static_params={
+            "weight": weight,
+            "max_foot_speed": max_foot_speed,
             "zero_during_grace_period": zero_during_grace_period,
         },
     )
@@ -2382,6 +2437,7 @@ __all__ = [
     "root_heading_rew_factory",
     # Track D big-step reward factories (OmniH2O-style, dormant)
     "max_feet_height_rew_factory",
+    "foot_speed_penalty_factory",
     "step_displacement_rew_factory",
     # HOLD-FIX factories (dormant; env-gated injection via base_env/hold_fix.py)
     "fall_penalty_factory",

@@ -65,6 +65,7 @@ from protomotions.envs.rewards.big_step import (
     StepDisplacementReward,
     MicroStepTax,
     compute_in_the_air_penalty,
+    compute_foot_speed_penalty,
 )
 
 # Task reward kernels
@@ -156,6 +157,7 @@ __all__ = [
     "compute_contact_force_change_rew",
     "compute_foot_contact_force_penalty",
     "compute_foot_slip_penalty",
+    "compute_foot_speed_penalty",
     "compute_fall_penalty",
     # Regularization helper functions
     "joint_limit_violation",
