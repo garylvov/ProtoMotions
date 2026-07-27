@@ -593,6 +593,90 @@ def compute_in_the_air_penalty(
     return (~contacts).all(dim=-1).float()
 
 
+class StepBudgetPenalty(_FootContactTransitionTracker):
+    """Excess-cadence penalty: policy touchdowns beyond the reference's (v5.3).
+
+    Every REFERENCE touchdown grants that foot ONE policy-touchdown credit
+    (bank capped at ``max_credits``). A policy touchdown consumes a credit;
+    landing with an EMPTY bank emits 1.0 (weight NEGATIVELY). "4 fake steps
+    per 1 reference step" = 3 uncredited landings = 3 penalties per cycle —
+    this prices the extra steps themselves, which the v5.2 zero-pay gates do
+    not (unpaid stutter-stepping survives as a free balance habit).
+
+    Applies ONLY while the reference root is locomoting
+    (ref_speed > min_ref_speed): a static reference grants no credits ever,
+    so recovery stepping against static refs must be exempt, and is.
+    Separate tracker instance => its own contact-transition state.
+
+    Raw units: 1.0 per uncredited policy touchdown, summed over feet.
+    """
+
+    __name__ = "step_budget_penalty"
+
+    def __init__(self, min_ref_speed: float = 0.05, max_credits: float = 2.0):
+        super().__init__()
+        if min_ref_speed < 0.0:
+            raise ValueError("min_ref_speed must be non-negative.")
+        if max_credits < 1.0:
+            raise ValueError("max_credits must be >= 1.")
+        self.min_ref_speed = min_ref_speed
+        self.max_credits = max_credits
+        self._credits = None
+        self._prev_ref_contacts = None
+
+    @_dynamo_disable
+    def __call__(
+        self,
+        sim_contacts: Tensor,
+        contact_body_ids: Tensor,
+        progress_buf: Tensor,
+        ref_rigid_body_contacts: Tensor = None,
+        ref_rigid_body_vel: Tensor = None,
+    ) -> Tensor:
+        contacts = sim_contacts[:, contact_body_ids].bool()
+        touchdown, reset_mask = self._update_transitions(contacts, progress_buf)
+
+        if self._credits is None or self._credits.shape != contacts.shape:
+            self._credits = torch.full_like(
+                contacts, 1.0, dtype=torch.float32
+            )
+        self._credits[reset_mask] = 1.0
+
+        if ref_rigid_body_contacts is None or ref_rigid_body_vel is None:
+            return torch.zeros(
+                contacts.shape[0], device=contacts.device, dtype=torch.float32
+            )
+
+        ref_contacts = ref_rigid_body_contacts[:, contact_body_ids].bool()
+        if (
+            self._prev_ref_contacts is None
+            or self._prev_ref_contacts.shape != ref_contacts.shape
+        ):
+            self._prev_ref_contacts = ref_contacts.clone()
+        ref_touchdown = (~self._prev_ref_contacts) & ref_contacts
+        ref_touchdown = ref_touchdown & ~reset_mask.unsqueeze(-1)
+        self._prev_ref_contacts = ref_contacts.clone()
+
+        # Grant credits on reference touchdowns (capped bank).
+        self._credits = torch.where(
+            ref_touchdown,
+            (self._credits + 1.0).clamp(max=self.max_credits),
+            self._credits,
+        )
+
+        # Locomotion gate: budget applies only while the ref root moves.
+        ref_vel = ref_rigid_body_vel.reshape(contacts.shape[0], -1, 3)
+        loco = (ref_vel[:, 0, :2].norm(dim=-1) > self.min_ref_speed).unsqueeze(-1)
+
+        spend = touchdown & loco
+        has_credit = self._credits >= 1.0
+        overdraft = (spend & ~has_credit).float()
+        self._credits = torch.where(
+            spend & has_credit, self._credits - 1.0, self._credits
+        )
+        return overdraft.sum(dim=-1)
+
+
 def compute_foot_speed_penalty(
     sim_contacts: Tensor,
     rigid_body_vel: Tensor,
@@ -639,6 +723,7 @@ def compute_foot_speed_penalty(
 
 __all__ = [
     "FeetApexHeightReward",
+    "StepBudgetPenalty",
     "StepDisplacementReward",
     "MicroStepTax",
     "compute_in_the_air_penalty",

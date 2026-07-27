@@ -1387,6 +1387,41 @@ def foot_speed_penalty_factory(
     )
 
 
+def step_budget_penalty_factory(
+    weight: float = 0.0,
+    min_ref_speed: float = 0.05,
+    max_credits: float = 2.0,
+    zero_during_grace_period: bool = True,
+) -> MdpComponent:
+    """Factory for the excess-cadence step-budget penalty (v5.3).
+
+    Each REFERENCE touchdown grants that foot one policy-touchdown credit
+    (bank capped at max_credits); a policy touchdown with an empty bank emits
+    1.0 (weight NEGATIVELY). Prices extra steps that the v5.2 zero-pay gates
+    merely stop rewarding ("4 fake steps per reference step" = 3 penalties
+    per cycle). Applies only while the reference root locomotes; static-ref
+    recovery stepping is exempt by construction.
+    """
+    from protomotions.envs.rewards import StepBudgetPenalty
+
+    return MdpComponent(
+        compute_func=StepBudgetPenalty(
+            min_ref_speed=min_ref_speed, max_credits=max_credits
+        ),
+        dynamic_vars={
+            "sim_contacts": EnvContext.current.rigid_body_contacts,
+            "contact_body_ids": EnvContext.contact_body_ids,
+            "progress_buf": EnvContext.progress_buf,
+            "ref_rigid_body_contacts": EnvContext.mimic.ref_state.rigid_body_contacts,
+            "ref_rigid_body_vel": EnvContext.mimic.ref_state.rigid_body_vel,
+        },
+        static_params={
+            "weight": weight,
+            "zero_during_grace_period": zero_during_grace_period,
+        },
+    )
+
+
 def contact_force_change_rew_factory(
     weight: float = -1e-5,
     min_value: Optional[float] = -0.5,
@@ -2446,6 +2481,7 @@ __all__ = [
     # Track D big-step reward factories (OmniH2O-style, dormant)
     "max_feet_height_rew_factory",
     "foot_speed_penalty_factory",
+    "step_budget_penalty_factory",
     "step_displacement_rew_factory",
     # HOLD-FIX factories (dormant; env-gated injection via base_env/hold_fix.py)
     "fall_penalty_factory",
