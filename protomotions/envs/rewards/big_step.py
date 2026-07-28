@@ -721,7 +721,22 @@ class StepBudgetPenalty(_FootContactTransitionTracker):
     so recovery stepping against static refs must be exempt, and is.
     Separate tracker instance => its own contact-transition state.
 
-    Raw units: 1.0 per uncredited policy touchdown, summed over feet.
+    PROGRESSIVE OVERDRAFT PRICING (v5.4, 2026-07-28): a flat 1.0-per-
+    overdraft price did not bend the machine-gun cadence (MuJoCo steps_ratio
+    2.17 after 630 epochs; the policy pays the flat fee and taps anyway --
+    balance-funded). Overdrafts are now priced by a per-ENV streak counter:
+    the raw emitted per overdraft EVENT is ``(1 + streak)`` -- the FIRST
+    opportunistic overdraft in a while stays cheap (1x, protecting
+    push-recovery SR), the next 2x, then 3x..., with the streak capped at
+    ``streak_cap`` (default 3 => max multiplier 4x). Any step in which at
+    least one overdraft fires in an env bumps that env's streak by 1
+    (env-level, foot-agnostic); ``streak_decay_steps`` control steps
+    (default 25 = 0.5 s at 50 Hz) with NO overdraft fully reset the streak
+    to 0 (simple reset, not gradual). With the stock -2.5 weight a
+    sustained tap habit costs -2.5, -5, -7.5, -10, -10, ... per event.
+
+    Raw units: ``(1 + streak)`` per uncredited policy touchdown, summed
+    over feet.
     """
 
     __name__ = "step_budget_penalty"
@@ -732,6 +747,8 @@ class StepBudgetPenalty(_FootContactTransitionTracker):
         max_credits: float = 2.0,
         ref_contact_threshold: float = 0.5,
         min_swing_steps: int = 3,
+        streak_cap: int = 3,
+        streak_decay_steps: int = 25,
     ):
         super().__init__()
         if min_ref_speed < 0.0:
@@ -754,11 +771,22 @@ class StepBudgetPenalty(_FootContactTransitionTracker):
         # preceding swing lasted < min_swing_steps control steps is contact
         # chatter, not a step -- it must not spend a budget credit.
         self.min_swing_steps = min_swing_steps
+        if streak_cap < 0:
+            raise ValueError("streak_cap must be non-negative.")
+        if streak_decay_steps < 1:
+            raise ValueError("streak_decay_steps must be >= 1.")
+        # v5.4 progressive overdraft pricing knobs (see class docstring).
+        # RESUME RULE: unpickled pre-v5.4 instances lack these attrs -- every
+        # access in __call__ goes through getattr(self, ..., default).
+        self.streak_cap = streak_cap
+        self.streak_decay_steps = streak_decay_steps
         self.min_ref_speed = min_ref_speed
         self.max_credits = max_credits
         self._credits = None
         self._prev_ref_contacts = None
         self._swing_steps = None
+        self._overdraft_streak = None
+        self._steps_since_overdraft = None
 
     @_dynamo_disable
     def __call__(
@@ -792,6 +820,25 @@ class StepBudgetPenalty(_FootContactTransitionTracker):
         self._swing_steps = torch.where(
             touchdown, torch.zeros_like(_swing_steps), _swing_steps
         )
+
+        # v5.4 progressive-pricing state (per ENV, foot-agnostic). getattr +
+        # lazy init: unpickled pre-v5.4 instances have NEITHER the knob attrs
+        # NOR these tensors (RESUME RULE -- mirrors the _swing_steps pattern).
+        num_envs = contacts.shape[0]
+        _streak = getattr(self, "_overdraft_streak", None)
+        if _streak is None or _streak.shape[0] != num_envs:
+            _streak = torch.zeros(
+                num_envs, dtype=torch.float32, device=contacts.device
+            )
+        _since = getattr(self, "_steps_since_overdraft", None)
+        if _since is None or _since.shape[0] != num_envs:
+            _since = torch.zeros(
+                num_envs, dtype=torch.float32, device=contacts.device
+            )
+        _streak = torch.where(reset_mask, torch.zeros_like(_streak), _streak)
+        _since = torch.where(reset_mask, torch.zeros_like(_since), _since)
+        self._overdraft_streak = _streak
+        self._steps_since_overdraft = _since
 
         if ref_rigid_body_contacts is None or ref_rigid_body_vel is None:
             return torch.zeros(
@@ -833,7 +880,33 @@ class StepBudgetPenalty(_FootContactTransitionTracker):
         self._credits = torch.where(
             spend & has_credit, self._credits - 1.0, self._credits
         )
-        return overdraft.sum(dim=-1)
+
+        # v5.4 PROGRESSIVE OVERDRAFT PRICING. Exact per-call sequence:
+        #   1) DECAY: envs with >= streak_decay_steps overdraft-free control
+        #      steps behind them have their streak reset to 0 BEFORE pricing,
+        #      so the first overdraft after a quiet spell is 1x again.
+        #   2) PRICE: every overdraft event in an env this step costs
+        #      (1 + streak) raw (streak read AFTER decay, BEFORE the bump).
+        #   3) BUMP: any env with >= 1 overdraft this step gets streak += 1,
+        #      clamped to streak_cap, and its quiet counter reset to 0; quiet
+        #      envs instead get quiet counter += 1.
+        streak_cap = float(getattr(self, "streak_cap", 3))
+        decay_steps = float(getattr(self, "streak_decay_steps", 25))
+        _streak = self._overdraft_streak
+        _since = self._steps_since_overdraft
+        _streak = torch.where(
+            _since >= decay_steps, torch.zeros_like(_streak), _streak
+        )
+        events = overdraft.sum(dim=-1)
+        penalty = events * (1.0 + _streak)
+        any_overdraft = events > 0.0
+        self._overdraft_streak = torch.where(
+            any_overdraft, (_streak + 1.0).clamp(max=streak_cap), _streak
+        )
+        self._steps_since_overdraft = torch.where(
+            any_overdraft, torch.zeros_like(_since), _since + 1.0
+        )
+        return penalty
 
 
 def compute_foot_speed_penalty(

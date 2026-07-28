@@ -711,6 +711,9 @@ def main():
             ("micro_step_tax", "PM_ANTISHUFFLE_MAX_APEX", _CF, "max_apex_height"),
             ("micro_step_tax", "PM_MICRO_TAX_MIN_SWING_STEPS", _CF, "min_swing_steps"),
             ("step_budget", "PM_STEP_BUDGET_MIN_SWING_STEPS", _CF, "min_swing_steps"),
+            ("step_budget", "PM_STEP_BUDGET_MAX_CREDITS", _CF, "max_credits"),
+            ("step_budget", "PM_STEP_BUDGET_STREAK_CAP", _CF, "streak_cap"),
+            ("step_budget", "PM_STEP_BUDGET_STREAK_DECAY_STEPS", _CF, "streak_decay_steps"),
             ("foot_slip", "PM_FOOT_SLIP_WEIGHT", _SP, "weight"),
             ("feet_apex_height", "PM_STEP_LIFT_MIN_SWING_SEC", _CF, "min_swing_sec"),
             ("feet_apex_height", "PM_STEP_LIFT_PLACEMENT_SIGMA", _CF, "placement_sigma"),
@@ -740,12 +743,17 @@ def main():
                     f"(env var has NO effect on this resume)"
                 )
                 continue
-            # min_swing_steps is an INT attribute on the compute_func (control-
-            # step count, not a continuous weight/sigma) -- the family is
-            # otherwise all-float, so cast explicitly here rather than leaving
-            # a float on an int-typed attr (>= comparisons still "work" but
-            # the stored/logged value would misleadingly show e.g. 2.0).
-            _fval = int(float(_val)) if _key == "min_swing_steps" else float(_val)
+            # min_swing_steps / streak_cap / streak_decay_steps are INT
+            # attributes on the compute_func (control-step / event counts,
+            # not continuous weights/sigmas) -- the family is otherwise
+            # all-float, so cast explicitly here rather than leaving a float
+            # on an int-typed attr (>= comparisons still "work" but the
+            # stored/logged value would misleadingly show e.g. 2.0).
+            _fval = (
+                int(float(_val))
+                if _key in ("min_swing_steps", "streak_cap", "streak_decay_steps")
+                else float(_val)
+            )
             if _loc == _SP:
                 _old = _rc[_comp].static_params.get(_key)
                 _rc[_comp].static_params[_key] = _fval

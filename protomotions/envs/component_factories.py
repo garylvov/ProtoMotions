@@ -1408,6 +1408,8 @@ def step_budget_penalty_factory(
     max_credits: float = 2.0,
     ref_contact_threshold: float = 0.5,
     min_swing_steps: int = 3,
+    streak_cap: int = 3,
+    streak_decay_steps: int = 25,
     zero_during_grace_period: bool = True,
 ) -> MdpComponent:
     """Factory for the excess-cadence step-budget penalty (v5.3).
@@ -1431,6 +1433,14 @@ def step_budget_penalty_factory(
     solver-chatter touchdown never drains a real-step credit. Do not lower
     this to match MicroStepTax's min_swing_steps=2 re-arm; the two guards
     protect different things (bank vs. tax) and were deliberately split.
+
+    ``streak_cap`` / ``streak_decay_steps`` (v5.4 PROGRESSIVE OVERDRAFT
+    PRICING, 2026-07-28): each overdraft event emits ``(1 + streak)`` raw
+    instead of a flat 1.0 -- the first overdraft after a quiet spell stays
+    1x (protects push-recovery), a sustained tap habit escalates 2x, 3x, up
+    to ``1 + streak_cap`` (default 4x). ``streak_decay_steps`` overdraft-free
+    control steps (default 25 = 0.5 s at 50 Hz) fully reset an env's streak.
+    Env knobs: PM_STEP_BUDGET_STREAK_CAP / PM_STEP_BUDGET_STREAK_DECAY_STEPS.
     """
     from protomotions.envs.rewards import StepBudgetPenalty
 
@@ -1443,6 +1453,8 @@ def step_budget_penalty_factory(
             max_credits=max_credits,
             ref_contact_threshold=ref_contact_threshold,
             min_swing_steps=min_swing_steps,
+            streak_cap=streak_cap,
+            streak_decay_steps=streak_decay_steps,
         ),
         dynamic_vars={
             "sim_contacts": EnvContext.current.rigid_body_contacts,
