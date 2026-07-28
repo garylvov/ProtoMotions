@@ -595,7 +595,7 @@ class MicroStepTax(_FootContactTransitionTracker):
         self,
         max_step_length: float = 0.10,
         max_apex_height: float = 0.06,
-        min_swing_steps: int = 3,
+        min_swing_steps: int = 2,
     ):
         super().__init__()
         if max_step_length < 0.0:
@@ -606,10 +606,19 @@ class MicroStepTax(_FootContactTransitionTracker):
             raise ValueError("min_swing_steps must be non-negative.")
         self.max_step_length = max_step_length
         self.max_apex_height = max_apex_height
-        # M2 chatter guard (adversarial review 2026-07-27): a "touchdown"
-        # whose preceding swing lasted < min_swing_steps control steps is
-        # contact CHATTER (1-frame contact flicker from the solver), not a
-        # step -- do not tax it.
+        # M3 re-arm (2026-07-27): TB showed the M2 guard (min_swing_steps=3,
+        # shared with StepBudgetPenalty) being exploited as a free-tap lane --
+        # the policy inserts ultra-short-swing micro-taps that clear a
+        # 3-control-step swing floor (0.06s @ 20ms dt) neither spending budget
+        # NOR incurring tax. The counter increments once per airborne frame
+        # INCLUDING the liftoff frame itself, so a true 1-frame solver-chatter
+        # flicker (lift off this frame, land next frame) reads _swing_steps
+        # == 1 at touchdown; anything that actually clears the ground for 2+
+        # frames is a real (if tiny) step, not chatter. Lowering the tax-only
+        # guard to 2 exempts ONLY that single-frame chatter case and taxes
+        # every 2+-frame micro-tap again, while the credit-bank guard on
+        # StepBudgetPenalty stays at 3 (unchanged -- it protects the bank,
+        # not the tax).
         self.min_swing_steps = min_swing_steps
         self._swing_apex = None
         self._swing_steps = None

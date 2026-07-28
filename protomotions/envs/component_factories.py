@@ -1272,6 +1272,7 @@ def micro_step_tax_factory(
     weight: float = 0.0,
     max_step_length: float = 0.10,
     max_apex_height: float = 0.06,
+    min_swing_steps: int = 2,
     zero_during_grace_period: bool = True,
 ) -> MdpComponent:
     """Factory for the MicroStepTax anti-shuffle kernel (dormant by default).
@@ -1291,6 +1292,10 @@ def micro_step_tax_factory(
             at or above this is never taxed regardless of apex.
         max_apex_height: Low-step threshold in meters (default 0.06). A step at
             or above this apex is never taxed regardless of length.
+        min_swing_steps: M3 chatter guard (default 2) -- a touchdown whose
+            preceding swing lasted fewer than this many control steps is
+            exempt (true solver chatter). Kept LOW so real micro-taps (2+
+            frame swings) stay taxable; see big_step.MicroStepTax docstring.
         zero_during_grace_period: Zero the tax during post-reset grace.
 
     Returns:
@@ -1302,6 +1307,7 @@ def micro_step_tax_factory(
         compute_func=MicroStepTax(
             max_step_length=max_step_length,
             max_apex_height=max_apex_height,
+            min_swing_steps=min_swing_steps,
         ),
         dynamic_vars={
             "sim_contacts": EnvContext.current.rigid_body_contacts,
@@ -1401,6 +1407,7 @@ def step_budget_penalty_factory(
     min_ref_speed: float = 0.05,
     max_credits: float = 2.0,
     ref_contact_threshold: float = 0.5,
+    min_swing_steps: int = 3,
     zero_during_grace_period: bool = True,
 ) -> MdpComponent:
     """Factory for the excess-cadence step-budget penalty (v5.3).
@@ -1418,6 +1425,12 @@ def step_budget_penalty_factory(
     ``compute_reference_contact_liftoff_penalty``). H1 fix 2026-07-27: the
     old ``.bool()`` (> 0) dilated ref stance by the smoothing window and
     starved credit grants on short reference swings.
+
+    ``min_swing_steps`` (default 3, UNCHANGED from the M2 chatter guard):
+    this is the credit-BANK guard, not a tax -- it stays at 3 so a true
+    solver-chatter touchdown never drains a real-step credit. Do not lower
+    this to match MicroStepTax's min_swing_steps=2 re-arm; the two guards
+    protect different things (bank vs. tax) and were deliberately split.
     """
     from protomotions.envs.rewards import StepBudgetPenalty
 
@@ -1429,6 +1442,7 @@ def step_budget_penalty_factory(
             min_ref_speed=min_ref_speed,
             max_credits=max_credits,
             ref_contact_threshold=ref_contact_threshold,
+            min_swing_steps=min_swing_steps,
         ),
         dynamic_vars={
             "sim_contacts": EnvContext.current.rigid_body_contacts,
