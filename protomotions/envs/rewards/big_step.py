@@ -671,7 +671,7 @@ class MicroStepTax(_FootContactTransitionTracker):
         is_low = self._swing_apex < self.max_apex_height
         # M2 chatter guard: a touchdown whose preceding swing lasted fewer
         # than min_swing_steps control steps is contact chatter, not a step.
-        swing_ok = _swing_steps >= float(getattr(self, "min_swing_steps", 3))
+        swing_ok = _swing_steps >= float(getattr(self, "min_swing_steps", 2))
         tax = (touchdown & is_short & is_low & swing_ok).float()
 
         # Clear the apex/duration accumulators and re-anchor the step
