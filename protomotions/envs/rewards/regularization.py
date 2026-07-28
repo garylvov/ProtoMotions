@@ -365,13 +365,34 @@ def compute_foot_slip_penalty(
     sim_contacts: Tensor,
     rigid_body_vel: Tensor,
     contact_body_ids: Tensor,
+    ang_vel_scale: float = 0.0,
+    z_vel_scale: float = 0.0,
+    rigid_body_ang_vel: Tensor = None,
 ) -> Tensor:
-    """Foot-slip (drag) penalty: horizontal speed of feet while in contact.
+    """Foot-slip (drag) penalty: motion of feet while in contact.
 
     Classic slip term: a foot that is touching the ground should not be
     translating. Emits, summed over the configured foot bodies, the horizontal
     (xy) speed of each foot that is CURRENTLY IN CONTACT. Apply a small NEGATIVE
     weight in the factory.
+
+    STANCE-FOOT STILLNESS EXTENSION (heel-pop pricing, 2026-07-28): MuJoCo
+    videos show pseudo-steps where the HEEL lifts while the toe stays in
+    contact — foot pitch oscillation + vertical motion with contact never
+    breaking, so no touchdown event ever fires and every touchdown-keyed
+    kernel (lift / budget / tax) is blind to it. While a foot is in contact,
+    this kernel now ALSO adds, per foot, to the xy slip magnitude:
+
+    - ``ang_vel_scale * ||foot angular velocity||`` (prices the pitch rock),
+    - ``z_vel_scale * |foot vertical (z) linear velocity|`` (prices the bob).
+
+    RESUME RULE: BOTH scales default to 0.0 here, so a frozen/unpickled
+    config whose static_params lack the new keys is byte-identical to the
+    old xy-only kernel; behavior changes ONLY via the explicit env knobs
+    (PM_FOOT_SLIP_ANG_SCALE / PM_FOOT_SLIP_ZVEL_SCALE re-applied into
+    static_params). ``rigid_body_ang_vel`` is likewise optional: pre-fix
+    frozen configs were pickled without the dynamic_var and simply skip the
+    angular term.
 
     The two hard constraints are satisfied by construction:
 
@@ -382,20 +403,38 @@ def compute_foot_slip_penalty(
       zero contact mask, so it is NOT penalized no matter how fast it moves --
       big fast swings are free; only contact-AND-moving (a drag) is taxed.
 
-    Stateless. Raw units: sum over contact feet of xy speed (m/s).
+    Stateless. Raw units: sum over contact feet of xy speed (m/s) plus the
+    scaled angular-speed (rad/s) and |z-speed| (m/s) terms. No clamp exists
+    on the base slip term, so the extended sum is likewise unclamped.
 
     Args:
         sim_contacts: Simulated contact flags [num_envs, num_bodies].
         rigid_body_vel: Per-body linear velocities [num_envs, num_bodies, 3].
         contact_body_ids: Indices of the foot bodies to penalize [num_feet].
+        ang_vel_scale: Scale on in-contact foot angular-velocity magnitude
+            (default 0.0 = off, resume-safe; launcher active value 0.1).
+        z_vel_scale: Scale on in-contact foot |z linear velocity|
+            (default 0.0 = off, resume-safe; launcher active value 1.0).
+        rigid_body_ang_vel: Per-body angular velocities
+            [num_envs, num_bodies, 3] (optional; required for the angular term).
 
     Returns:
-        Sum over in-contact feet of horizontal foot speed [num_envs].
+        Sum over in-contact feet of the combined stance-motion magnitude
+        [num_envs].
     """
     contacts = sim_contacts[:, contact_body_ids].bool()
     foot_vel_xy = rigid_body_vel[:, contact_body_ids, :2]
     speed_xy = torch.norm(foot_vel_xy, dim=-1)
-    return (speed_xy * contacts.float()).sum(dim=-1)
+    slip = speed_xy
+    if z_vel_scale > 0.0:
+        foot_vel_z = rigid_body_vel[:, contact_body_ids, 2]
+        slip = slip + z_vel_scale * foot_vel_z.abs()
+    if ang_vel_scale > 0.0 and rigid_body_ang_vel is not None:
+        foot_ang_vel = rigid_body_ang_vel.reshape(
+            rigid_body_ang_vel.shape[0], -1, 3
+        )[:, contact_body_ids]
+        slip = slip + ang_vel_scale * foot_ang_vel.norm(dim=-1)
+    return (slip * contacts.float()).sum(dim=-1)
 
 
 def compute_fall_penalty(

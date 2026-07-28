@@ -715,6 +715,8 @@ def main():
             ("step_budget", "PM_STEP_BUDGET_STREAK_CAP", _CF, "streak_cap"),
             ("step_budget", "PM_STEP_BUDGET_STREAK_DECAY_STEPS", _CF, "streak_decay_steps"),
             ("foot_slip", "PM_FOOT_SLIP_WEIGHT", _SP, "weight"),
+            ("foot_slip", "PM_FOOT_SLIP_ANG_SCALE", _SP, "ang_vel_scale"),
+            ("foot_slip", "PM_FOOT_SLIP_ZVEL_SCALE", _SP, "z_vel_scale"),
             ("feet_apex_height", "PM_STEP_LIFT_MIN_SWING_SEC", _CF, "min_swing_sec"),
             ("feet_apex_height", "PM_STEP_LIFT_PLACEMENT_SIGMA", _CF, "placement_sigma"),
             ("feet_apex_height", "PM_STEP_APEX_TARGET", _CF, "apex_target_height"),
@@ -798,6 +800,24 @@ def main():
                         f"RESUME override feet_apex_height.dynamic_vars += "
                         f"{_rk} (M1 placement yaw-alignment wiring)"
                     )
+        # Heel-pop pricing (2026-07-28) needs a dynamic_var pre-fix frozen
+        # configs were pickled WITHOUT: rigid_body_ang_vel. Inject it on
+        # resume when the ang-scale knob is explicitly enabled, else the
+        # kernel never receives foot angular velocities and the angular term
+        # silently no-ops (same trap class as the placement-gate wiring).
+        if (
+            os.environ.get("PM_FOOT_SLIP_ANG_SCALE")
+            and "foot_slip" in _rc
+        ):
+            from protomotions.envs.context_views import EnvContext as _ECtx2
+
+            _dv = _rc["foot_slip"].dynamic_vars
+            if "rigid_body_ang_vel" not in _dv:
+                _dv["rigid_body_ang_vel"] = _ECtx2.current.rigid_body_ang_vel
+                log.warning(
+                    "RESUME override foot_slip.dynamic_vars += "
+                    "rigid_body_ang_vel (heel-pop stance-stillness wiring)"
+                )
         _alt = os.environ.get("PM_STEP_LIFT_ALTERNATE")
         if _alt is not None and "feet_apex_height" in _rc:
             _cf = _rc["feet_apex_height"].compute_func
@@ -809,6 +829,23 @@ def main():
             log.warning(
                 f"RESUME override feet_apex_height.require_alternation = "
                 f"{_newalt} (was {_oldalt}, from PM_STEP_LIFT_ALTERNATE)"
+            )
+        # v5.5 same-foot-repeat forced overdraft (bool cast mirrors the
+        # PM_STEP_LIFT_ALTERNATE pattern above). Also seed the lazily-created
+        # state attrs to None on unpickled pre-v5.5 instances so __call__'s
+        # getattr path starts clean.
+        _balt = os.environ.get("PM_STEP_BUDGET_ALTERNATE")
+        if _balt is not None and "step_budget" in _rc:
+            _cf = _rc["step_budget"].compute_func
+            _newbalt = _balt not in ("0", "")
+            _oldbalt = getattr(_cf, "require_alternation_budget", None)
+            setattr(_cf, "require_alternation_budget", _newbalt)
+            for _attr in ("_last_counted_foot", "_ref_last_td_foot", "_ref_repeat"):
+                if getattr(_cf, _attr, "MISSING") == "MISSING":
+                    setattr(_cf, _attr, None)
+            log.warning(
+                f"RESUME override step_budget.require_alternation_budget = "
+                f"{_newbalt} (was {_oldbalt}, from PM_STEP_BUDGET_ALTERNATE)"
             )
 
         # PM_ARM_{KP,KD,EFFORT}[_SHOULDER|_ELBOW|_WRIST] (env-gated, resume-safe):

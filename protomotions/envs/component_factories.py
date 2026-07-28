@@ -1325,9 +1325,11 @@ def micro_step_tax_factory(
 
 def foot_slip_penalty_factory(
     weight: float = 0.0,
+    ang_vel_scale: float = 0.1,
+    z_vel_scale: float = 1.0,
     zero_during_grace_period: bool = True,
 ) -> MdpComponent:
-    """Factory for the foot-slip (drag) penalty (dormant by default).
+    """Factory for the foot-slip (drag + stance-stillness) penalty (dormant by default).
 
     Penalizes the horizontal speed of feet that are currently in contact
     (contact AND moving = a drag). Summed over the configured foot bodies; apply
@@ -1335,8 +1337,19 @@ def foot_slip_penalty_factory(
     nothing; an airborne swing foot is not penalized regardless of speed -- see
     ``compute_foot_slip_penalty``. Stateless. Default ``weight=0.0`` = dormant.
 
+    HEEL-POP PRICING (2026-07-28): while in contact, a foot's angular-velocity
+    magnitude (x ``ang_vel_scale``) and |z linear velocity| (x ``z_vel_scale``)
+    are added to the slip magnitude -- prices the toe-pivot heel-pop
+    pseudo-step that never breaks contact and is invisible to every
+    touchdown-keyed kernel. Factory defaults are the ACTIVE values (0.1 / 1.0);
+    the KERNEL defaults are 0.0 so frozen pre-fix configs (whose static_params
+    lack the keys) stay byte-identical on resume until
+    PM_FOOT_SLIP_ANG_SCALE / PM_FOOT_SLIP_ZVEL_SCALE are re-applied.
+
     Args:
         weight: Reward weight (default 0.0 = dormant; NEGATIVE to enable).
+        ang_vel_scale: In-contact foot angular-speed price (default 0.1).
+        z_vel_scale: In-contact foot |z velocity| price (default 1.0).
         zero_during_grace_period: Zero the penalty during post-reset grace.
 
     Returns:
@@ -1349,10 +1362,13 @@ def foot_slip_penalty_factory(
         dynamic_vars={
             "sim_contacts": EnvContext.current.rigid_body_contacts,
             "rigid_body_vel": EnvContext.current.rigid_body_vel,
+            "rigid_body_ang_vel": EnvContext.current.rigid_body_ang_vel,
             "contact_body_ids": EnvContext.contact_body_ids,
         },
         static_params={
             "weight": weight,
+            "ang_vel_scale": ang_vel_scale,
+            "z_vel_scale": z_vel_scale,
             "zero_during_grace_period": zero_during_grace_period,
         },
     )
@@ -1410,6 +1426,7 @@ def step_budget_penalty_factory(
     min_swing_steps: int = 3,
     streak_cap: int = 3,
     streak_decay_steps: int = 25,
+    require_alternation_budget: bool = False,
     zero_during_grace_period: bool = True,
 ) -> MdpComponent:
     """Factory for the excess-cadence step-budget penalty (v5.3).
@@ -1441,6 +1458,14 @@ def step_budget_penalty_factory(
     to ``1 + streak_cap`` (default 4x). ``streak_decay_steps`` overdraft-free
     control steps (default 25 = 0.5 s at 50 Hz) fully reset an env's streak.
     Env knobs: PM_STEP_BUDGET_STREAK_CAP / PM_STEP_BUDGET_STREAK_DECAY_STEPS.
+
+    ``require_alternation_budget`` (v5.5 SAME-FOOT REPEAT = FORCED OVERDRAFT,
+    2026-07-28, default False = resume-safe): a counted touchdown that repeats
+    the env's last counted-touchdown foot bypasses the credit bank -- priced
+    as an overdraft regardless of credits (no credit consumed) and fed into
+    the v5.4 streak. Both-feet landings and ref-repeating (one-legged hop)
+    references are exempt. Prices MuJoCo's same_foot_repeat_rate 0.147
+    directly. Env knob: PM_STEP_BUDGET_ALTERNATE=1.
     """
     from protomotions.envs.rewards import StepBudgetPenalty
 
@@ -1455,6 +1480,7 @@ def step_budget_penalty_factory(
             min_swing_steps=min_swing_steps,
             streak_cap=streak_cap,
             streak_decay_steps=streak_decay_steps,
+            require_alternation_budget=require_alternation_budget,
         ),
         dynamic_vars={
             "sim_contacts": EnvContext.current.rigid_body_contacts,

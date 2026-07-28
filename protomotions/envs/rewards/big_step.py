@@ -735,6 +735,22 @@ class StepBudgetPenalty(_FootContactTransitionTracker):
     to 0 (simple reset, not gradual). With the stock -2.5 weight a
     sustained tap habit costs -2.5, -5, -7.5, -10, -10, ... per event.
 
+    SAME-FOOT REPEAT = FORCED OVERDRAFT (v5.5, 2026-07-28, gated by
+    ``require_alternation_budget``): MuJoCo eval shows same_foot_repeat_rate
+    0.147 — the policy re-lands the SAME foot inside the credit budget and
+    the bank happily funds it. With the flag on, a counted touchdown
+    (passing the swing_ok chatter guard + loco gate) whose foot equals the
+    env's LAST counted-touchdown foot is a forced overdraft: it BYPASSES the
+    credit bank (priced as an overdraft regardless of credits, does NOT
+    consume a credit) and feeds the v5.4 streak bump like any other
+    overdraft. Exemptions: simultaneous both-feet landings (jump), and
+    touchdowns while the REFERENCE's own most recent touchdown was itself a
+    same-foot repeat (mirrors the ref-side exemption idea of the
+    FeetApexHeightReward alternation gate — if the ref hops on one foot, so
+    may the policy). RESUME RULE: default False + getattr in ``__call__``,
+    so unpickled pre-v5.5 instances are byte-identical until
+    PM_STEP_BUDGET_ALTERNATE=1 is re-applied.
+
     Raw units: ``(1 + streak)`` per uncredited policy touchdown, summed
     over feet.
     """
@@ -749,6 +765,7 @@ class StepBudgetPenalty(_FootContactTransitionTracker):
         min_swing_steps: int = 3,
         streak_cap: int = 3,
         streak_decay_steps: int = 25,
+        require_alternation_budget: bool = False,
     ):
         super().__init__()
         if min_ref_speed < 0.0:
@@ -780,6 +797,9 @@ class StepBudgetPenalty(_FootContactTransitionTracker):
         # access in __call__ goes through getattr(self, ..., default).
         self.streak_cap = streak_cap
         self.streak_decay_steps = streak_decay_steps
+        # v5.5 same-foot-repeat forced overdraft (RESUME RULE: getattr'd in
+        # __call__, default False -- unpickled pre-v5.5 instances unchanged).
+        self.require_alternation_budget = bool(require_alternation_budget)
         self.min_ref_speed = min_ref_speed
         self.max_credits = max_credits
         self._credits = None
@@ -787,6 +807,9 @@ class StepBudgetPenalty(_FootContactTransitionTracker):
         self._swing_steps = None
         self._overdraft_streak = None
         self._steps_since_overdraft = None
+        self._last_counted_foot = None
+        self._ref_last_td_foot = None
+        self._ref_repeat = None
 
     @_dynamo_disable
     def __call__(
@@ -875,11 +898,95 @@ class StepBudgetPenalty(_FootContactTransitionTracker):
         # M2 chatter guard: a touchdown after a < min_swing_steps "swing" is
         # solver contact flicker, not a real step -- no spend, no overdraft.
         spend = touchdown & loco & swing_ok
+
+        # v5.5 SAME-FOOT REPEAT = FORCED OVERDRAFT (getattr + lazy state:
+        # RESUME RULE -- unpickled pre-v5.5 instances lack both the flag and
+        # the tensors; flag-off path is byte-identical to v5.4).
+        forced = None
+        if bool(getattr(self, "require_alternation_budget", False)):
+            n_feet = contacts.shape[1]
+            _last_foot = getattr(self, "_last_counted_foot", None)
+            if _last_foot is None or _last_foot.shape[0] != num_envs:
+                _last_foot = torch.full(
+                    (num_envs,), -1, dtype=torch.long, device=contacts.device
+                )
+            _last_foot = torch.where(
+                reset_mask, torch.full_like(_last_foot, -1), _last_foot
+            )
+            # REF-side repeat tracking: if the reference's own most recent
+            # touchdown repeated a foot (one-legged hop), the policy repeating
+            # is exempt (mirrors the ref-exemption idea of the apex-lift
+            # alternation gate). State persists until the next ref touchdown.
+            _ref_last = getattr(self, "_ref_last_td_foot", None)
+            if _ref_last is None or _ref_last.shape[0] != num_envs:
+                _ref_last = torch.full(
+                    (num_envs,), -1, dtype=torch.long, device=contacts.device
+                )
+            _ref_last = torch.where(
+                reset_mask, torch.full_like(_ref_last, -1), _ref_last
+            )
+            _ref_rep = getattr(self, "_ref_repeat", None)
+            if _ref_rep is None or _ref_rep.shape[0] != num_envs:
+                _ref_rep = torch.zeros(
+                    num_envs, dtype=torch.bool, device=contacts.device
+                )
+            _ref_rep = _ref_rep & ~reset_mask
+            ref_events = ref_touchdown.sum(dim=-1)
+            ref_single = ref_events == 1
+            ref_both = ref_events >= 2
+            ref_idx = ref_touchdown.float().argmax(dim=-1)
+            _ref_rep = torch.where(
+                ref_single, (ref_idx == _ref_last) & (_ref_last >= 0), _ref_rep
+            )
+            _ref_rep = torch.where(
+                ref_both, torch.zeros_like(_ref_rep), _ref_rep
+            )
+            _ref_last = torch.where(ref_single, ref_idx, _ref_last)
+            _ref_last = torch.where(
+                ref_both, torch.full_like(_ref_last, -1), _ref_last
+            )
+            self._ref_last_td_foot = _ref_last
+            self._ref_repeat = _ref_rep
+
+            # A counted touchdown on the SAME foot as the env's last counted
+            # touchdown = forced overdraft. Both-feet landings (jump) and
+            # ref-repeating envs are exempt.
+            foot_idx = torch.arange(
+                n_feet, device=contacts.device
+            ).unsqueeze(0)
+            repeat = (foot_idx == _last_foot.unsqueeze(-1)) & spend
+            both_land = spend.sum(dim=-1) >= 2
+            repeat = repeat & ~both_land.unsqueeze(-1)
+            repeat = repeat & ~_ref_rep.unsqueeze(-1)
+            forced = repeat
+
+            # Update last-counted-foot from THIS step's counted touchdowns
+            # (AFTER the repeat comparison): single landing -> that foot;
+            # both-feet landing -> -1 (mirrors FeetApexHeightReward).
+            counted = spend.sum(dim=-1)
+            single = counted == 1
+            new_last = torch.where(
+                both_land, torch.full_like(_last_foot, -1), _last_foot
+            )
+            single_idx = spend.float().argmax(dim=-1)
+            new_last = torch.where(single, single_idx, new_last)
+            self._last_counted_foot = new_last
+
         has_credit = self._credits >= 1.0
-        overdraft = (spend & ~has_credit).float()
-        self._credits = torch.where(
-            spend & has_credit, self._credits - 1.0, self._credits
-        )
+        if forced is not None:
+            # Forced repeats BYPASS the bank: overdraft regardless of credits,
+            # and no credit is consumed for them.
+            overdraft = ((spend & ~has_credit) | forced).float()
+            self._credits = torch.where(
+                spend & has_credit & ~forced,
+                self._credits - 1.0,
+                self._credits,
+            )
+        else:
+            overdraft = (spend & ~has_credit).float()
+            self._credits = torch.where(
+                spend & has_credit, self._credits - 1.0, self._credits
+            )
 
         # v5.4 PROGRESSIVE OVERDRAFT PRICING. Exact per-call sequence:
         #   1) DECAY: envs with >= streak_decay_steps overdraft-free control
