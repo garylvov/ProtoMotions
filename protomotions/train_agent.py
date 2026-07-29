@@ -725,6 +725,8 @@ def main():
             ("foot_speed", "PM_FOOT_SPEED_MAX", _SP, "max_foot_speed"),
             ("foot_speed", "PM_FOOT_SPEED_REF_SCALE", _SP, "ref_speed_scale"),
             ("fall_penalty", "PM_FALL_PENALTY_WEIGHT", _SP, "weight"),
+            ("drift_penalty", "PM_DRIFT_PENALTY_WEIGHT", _SP, "weight"),
+            ("drift_penalty", "PM_DRIFT_PENALTY_THRESHOLD", _SP, "drift_threshold"),
             ("step_budget", "PM_STEP_BUDGET_WEIGHT", _SP, "weight"),
             ("dof_pos_track", "PM_DOF_POS_TRACK_WEIGHT", _SP, "weight"),
             ("dof_pos_track", "PM_DOF_POS_TRACK_SIGMA", _SP, "sigma"),

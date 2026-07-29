@@ -1604,6 +1604,44 @@ def fall_penalty_factory(
     )
 
 
+def drift_penalty_factory(
+    weight: float = -2.0,
+    drift_threshold: float = 0.35,
+    zero_during_grace_period: bool = True,
+) -> MdpComponent:
+    """Factory for the explicit anchor-drift penalty (twin of ``fall_penalty_factory``).
+
+    Applies a negative reward on the SAME error computation as the anchor
+    position drift termination (WORLD-frame anchor/root position error vs
+    reference > ``drift_threshold``). Bindings mirror
+    ``anchor_pos_error_term_factory``. Continuous-while-beyond and stateless,
+    like the fall penalty: without it, the bare 0.4 m drift termination is
+    blunted by bootstrap-on-episode-end and the policy hovers cheaply in the
+    0.2-0.4 m drift band.
+
+    Args:
+        weight: Reward weight (negative penalty applied while drifted).
+        drift_threshold: Max anchor position error (m) before the penalty
+            engages (default 0.35, just inside the 0.4 m termination).
+        zero_during_grace_period: Zero the penalty during the post-reset grace period.
+    """
+    from protomotions.envs.rewards import compute_drift_penalty
+
+    return MdpComponent(
+        compute_func=compute_drift_penalty,
+        dynamic_vars={
+            "current_anchor_pos": EnvContext.current.anchor_pos,
+            "ref_rigid_body_pos": EnvContext.mimic.ref_state.rigid_body_pos,
+            "anchor_idx": EnvContext.mimic.anchor_idx,
+        },
+        static_params={
+            "weight": weight,
+            "drift_threshold": drift_threshold,
+            "zero_during_grace_period": zero_during_grace_period,
+        },
+    )
+
+
 def hold_balance_bonus_factory(
     weight: float = 0.0,
     left_foot_body_ids: "Tensor" = None,
@@ -2559,6 +2597,7 @@ __all__ = [
     "step_displacement_rew_factory",
     # HOLD-FIX factories (dormant; env-gated injection via base_env/hold_fix.py)
     "fall_penalty_factory",
+    "drift_penalty_factory",
     "hold_balance_bonus_factory",
     "wrist_dir_rew_factory",
     "root_gain_rew_factory",

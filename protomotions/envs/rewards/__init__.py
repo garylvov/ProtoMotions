@@ -91,6 +91,7 @@ from protomotions.envs.rewards.regularization import (
     compute_foot_contact_force_penalty,
     compute_foot_slip_penalty,
     compute_fall_penalty,
+    compute_drift_penalty,
     # Helper functions
     joint_limit_violation,
     contact_mismatch_sum,
@@ -161,6 +162,7 @@ __all__ = [
     "compute_foot_speed_penalty",
     "StepBudgetPenalty",
     "compute_fall_penalty",
+    "compute_drift_penalty",
     # Regularization helper functions
     "joint_limit_violation",
     "contact_mismatch_sum",

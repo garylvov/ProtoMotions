@@ -506,6 +506,41 @@ def compute_fall_penalty(
     return (height_error > height_threshold).float()
 
 
+def compute_drift_penalty(
+    current_anchor_pos: Tensor,
+    ref_rigid_body_pos: Tensor,
+    anchor_idx: int,
+    drift_threshold: float = 0.35,
+) -> Tensor:
+    """Explicit anchor-drift penalty (anchor-drift twin of ``compute_fall_penalty``).
+
+    Returns 1.0 for envs whose WORLD-frame anchor (root) position error vs the
+    reference exceeds ``drift_threshold`` -- the SAME error computation used by
+    the anchor-position drift termination (``compute_anchor_pos_error_term``)
+    -- else 0.0. Continuous-while-beyond and stateless, mirroring
+    ``compute_fall_penalty``. Apply a NEGATIVE weight in the factory. Makes
+    hovering in the drift band below the 0.4 m termination explicitly costly
+    (previously only implicitly penalized via termination + zeroed bootstrap).
+
+    NOTE: ``drift_threshold`` is deliberately NOT named ``threshold`` (reserved
+    reward-metadata key that would be stripped before the kernel call).
+
+    Args:
+        current_anchor_pos: Current anchor position [num_envs, 3].
+        ref_rigid_body_pos: Reference body positions [num_envs, num_bodies, 3].
+        anchor_idx: Index of the anchor body.
+        drift_threshold: Max allowed anchor position error (m) before the
+            penalty engages.
+
+    Returns:
+        Float drift indicator [num_envs] (1.0 drifted beyond threshold,
+        0.0 otherwise).
+    """
+    ref_anchor_pos = ref_rigid_body_pos[:, anchor_idx, :]
+    distance = (current_anchor_pos - ref_anchor_pos).pow(2).sum(-1).sqrt()
+    return (distance > drift_threshold).float()
+
+
 # =============================================================================
 # Helper Functions (used by kernels or for advanced use cases)
 # =============================================================================
