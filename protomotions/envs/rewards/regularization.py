@@ -206,22 +206,57 @@ def compute_soft_pos_limit_rew(
     dof_pos: Tensor,
     dof_limits_lower: Tensor,
     dof_limits_upper: Tensor,
+    soft_margin_frac: float = 0.0,
+    proximity_scale: float = 0.1,
 ) -> Tensor:
     """Soft joint position limit penalty.
-    
+
     Penalizes when joints approach or exceed limits.
-    
+
+    Despite the historical name, the base term only charges for EXCEEDING a
+    limit -- a joint parked exactly AT its limit pays zero. When
+    ``soft_margin_frac > 0`` an additional soft-margin PROXIMITY term charges
+    joints inside a band of width ``soft_margin_frac * (upper - lower)`` next
+    to each limit: linear ramp from 0 at the band edge to 1 at the limit,
+    clamped at 1 beyond it (continuous), scaled by ``proximity_scale`` so a
+    joint AT its limit costs like a ``proximity_scale``-radian violation.
+
+    RESUME RULE (stateless kernel): ``soft_margin_frac`` defaults to 0.0 so
+    frozen configs pickled WITHOUT the key are byte-identical on resume; the
+    proximity term only activates via explicit env override
+    (PM_DOF_LIMIT_MARGIN / PM_DOF_LIMIT_PROX_SCALE).
+
     Args:
         dof_pos: Joint positions [num_envs, num_dofs].
         dof_limits_lower: Lower joint limits [num_dofs].
         dof_limits_upper: Upper joint limits [num_dofs].
-    
+        soft_margin_frac: Fraction of each joint's range forming the soft
+            band at each limit. 0.0 (default) disables the proximity term.
+        proximity_scale: Scale on the proximity term (at-limit cost in
+            equivalent radians of violation). Ignored when
+            ``soft_margin_frac == 0``.
+
     Returns:
         Penalty tensor [num_envs].
     """
     out_of_limits = -(dof_pos - dof_limits_lower).clip(max=0.0)
     out_of_limits += (dof_pos - dof_limits_upper).clip(min=0.0)
-    return torch.sum(out_of_limits, dim=1)
+    penalty = torch.sum(out_of_limits, dim=1)
+    if soft_margin_frac > 0.0:
+        joint_range = dof_limits_upper - dof_limits_lower
+        margin = soft_margin_frac * joint_range
+        # Fixed joints (upper == lower) have margin 0 -> mask out (div0 guard).
+        movable = margin > 0.0
+        safe_margin = torch.where(movable, margin, torch.ones_like(margin))
+        dist_lower = dof_pos - dof_limits_lower
+        dist_upper = dof_limits_upper - dof_pos
+        prox_lower = ((margin - dist_lower) / safe_margin).clamp(min=0.0, max=1.0)
+        prox_upper = ((margin - dist_upper) / safe_margin).clamp(min=0.0, max=1.0)
+        proximity = torch.where(
+            movable, prox_lower + prox_upper, torch.zeros_like(prox_lower)
+        )
+        penalty = penalty + proximity_scale * torch.sum(proximity, dim=1)
+    return penalty
 
 
 def compute_contact_match_rew(

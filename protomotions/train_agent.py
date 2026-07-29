@@ -731,6 +731,12 @@ def main():
             ("global_anchor_pos", "PM_GLOBAL_POS_WEIGHT", _SP, "weight"),
             ("global_anchor_pos", "PM_GLOBAL_POS_SIGMA", _SP, "sigma"),
             ("heading_local_anchor_drift", "PM_HEADING_DRIFT_WEIGHT", _SP, "weight"),
+            # DOF-limit soft-margin proximity (2026-07-29, knees-at-full-
+            # extension fix): frozen configs were pickled WITHOUT these keys;
+            # the kernel defaults (soft_margin_frac=0.0) keep them byte-
+            # identical, so the term ONLY activates via this re-apply row.
+            ("limits_dof_pos", "PM_DOF_LIMIT_MARGIN", _SP, "soft_margin_frac"),
+            ("limits_dof_pos", "PM_DOF_LIMIT_PROX_SCALE", _SP, "proximity_scale"),
         ):
             _val = os.environ.get(_var)
             if _val is None:
