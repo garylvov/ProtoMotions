@@ -142,6 +142,140 @@ class MockContext:
 
 
 # ---------------------------------------------------------------------------
+# Arm-gain override resolution (PM_ARM_*)
+# ---------------------------------------------------------------------------
+#
+# WHY THIS EXISTS
+# ---------------
+# Training resumes can hot-swap arm PD gains / effort limits in memory via
+# PM_ARM_{KP,KD,EFFORT[_SHOULDER|_ELBOW|_WRIST]} env vars (see the resume path
+# in protomotions/train_agent.py, "RESUME override arm ..."). That mutation is
+# IN-MEMORY ONLY: resolved_configs*.pt on disk keeps the ORIGINAL launch gains.
+# This exporter reads the frozen pickle, so without the logic below every
+# post-hot-swap export writes a unified_pipeline.yaml whose `control` section
+# carries the stale pre-swap gains — downstream MuJoCo evals then run the wrong
+# PD controller (e.g. canonical_teacher_20260729_v54: arms trained with
+# KP=40/KD=2.0 + effort 120/30 since ep3130, but the ep4000 yaml said
+# KP=19.739/KD=1.257).
+#
+# WHAT IT DOES
+# ------------
+# Replicates train_agent.py's resume hot-swap on the baked per-DOF
+# control_info: for each arm joint group, if an override value is found, set
+# stiffness / damping / effort_limit before the yaml gain lists are built.
+#
+# Override sources, in priority order (first hit per key wins):
+#   1. Real process env vars (identical names/semantics to train_agent.py and
+#      robot_configs/h1_2.py: per-group PM_ARM_EFFORT_WRIST beats uniform
+#      PM_ARM_EFFORT, etc.).
+#   2. File named by $PM_ARM_OVERRIDES_FILE (KEY=VALUE lines, # comments ok).
+#   3. `pm_arm_overrides.env` sitting next to the checkpoint.
+#   4. Trend-loop fallback: the eval loop exports from a snapshot dir named
+#      `snap_<run>_ep<N>` that contains only a copied ckpt+config, so also try
+#      `<ProtoMotions>/results/<run>/pm_arm_overrides.env`. This lets a marker
+#      file dropped once in the training results dir correct every future
+#      export from the already-running trend loop (which has no PM_ARM_* env).
+#
+# Complete no-op when no source yields any PM_ARM_* key (pre-swap runs).
+#
+# DELIBERATELY NOT TOUCHED: env_config.action_config. Its tensors
+# (pd_action_offset / action_scale / stiffness / damping fed to bm_pd_action)
+# are frozen from the ORIGINAL launch during resume training too — the policy
+# trained against the stale action mapping, so the exported ONNX must keep it.
+# Only the yaml `control`/`default_joint_*` sections (what the deployment-side
+# PD controller uses) reflect the hot-swapped gains.
+
+_ARM_GROUP_PATTERNS = {
+    # Mirrors _arm_groups in train_agent.py's resume hot-swap.
+    "SHOULDER": r".*_shoulder_(pitch|roll|yaw)_joint$",
+    "ELBOW": r".*_elbow_joint$",
+    "WRIST": r".*_wrist_(roll|pitch|yaw)_joint$",
+}
+
+
+def _read_env_file(path) -> dict:
+    """Parse a simple KEY=VALUE env-dump file; returns {} if unreadable."""
+    out = {}
+    try:
+        for line in Path(path).read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            out[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return out
+
+
+def _resolve_arm_overrides(checkpoint_dir: Path) -> dict:
+    """Merge PM_ARM_* keys from all sources (env > file tiers, see above)."""
+    import os
+    import re
+
+    merged: dict = {}
+    # Lowest priority first; later updates overwrite earlier ones.
+    # Tier 4: trend-loop snapshot dir -> original training results dir.
+    m = re.match(r"^snap_(.+)_ep\d+$", checkpoint_dir.name)
+    if m:
+        results_dir = Path(__file__).resolve().parent.parent / "results" / m.group(1)
+        merged.update(_read_env_file(results_dir / "pm_arm_overrides.env"))
+    # Tier 3: marker file next to the checkpoint (training results dir itself).
+    merged.update(_read_env_file(checkpoint_dir / "pm_arm_overrides.env"))
+    # Tier 2: explicitly named file.
+    if os.environ.get("PM_ARM_OVERRIDES_FILE"):
+        merged.update(_read_env_file(os.environ["PM_ARM_OVERRIDES_FILE"]))
+    # Tier 1: real environment (only PM_ARM_* keys).
+    for k, v in os.environ.items():
+        if k.startswith("PM_ARM_"):
+            merged[k] = v
+    return {k: v for k, v in merged.items() if k.startswith("PM_ARM_") and v}
+
+
+def _apply_arm_control_overrides(robot_config, checkpoint_dir: Path) -> None:
+    """Apply PM_ARM_* overrides to the baked per-DOF control_info in place.
+
+    train_agent.py mutates the regex-keyed override_control_info and then
+    rebuilds control_info from the MJCF; here we already hold the fully baked
+    per-joint-name control_info from the pickle, so mutating the matching
+    entries directly is equivalent and avoids re-parsing the MJCF.
+    """
+    import re
+
+    ov = _resolve_arm_overrides(checkpoint_dir)
+    if not ov:
+        return  # no overrides anywhere -> exact legacy behavior
+
+    ctrl = getattr(robot_config, "control", None)
+    ci = getattr(ctrl, "control_info", None)
+    if not ci:
+        log.warning("PM_ARM overrides present but no baked control_info; skipped")
+        return
+
+    for joint_name, entry in ci.items():
+        for grp, pat in _ARM_GROUP_PATTERNS.items():
+            if not re.match(pat, joint_name):
+                continue
+            for field, base in (
+                ("stiffness", "PM_ARM_KP"),
+                ("damping", "PM_ARM_KD"),
+                ("effort_limit", "PM_ARM_EFFORT"),
+            ):
+                # Per-group override beats the uniform one (same rule as
+                # train_agent.py / h1_2.py).
+                val = ov.get(f"{base}_{grp}") or ov.get(base)
+                if not val:
+                    continue
+                old = getattr(entry, field, None)
+                setattr(entry, field, float(val))
+                if float(val) != old:
+                    log.warning(
+                        f"EXPORT arm-gain override {joint_name}.{field}: "
+                        f"{old} -> {float(val)} (from {base}[_{grp}])"
+                    )
+
+
+# ---------------------------------------------------------------------------
 # Main export logic
 # ---------------------------------------------------------------------------
 
@@ -203,6 +337,12 @@ def export_tracker(
     env_config      = resolved["env"]
     agent_config    = resolved["agent"]
     simulator_config = resolved.get("simulator")
+
+    # Re-apply any in-memory arm-gain hot-swap the training resume performed
+    # (PM_ARM_* env vars / pm_arm_overrides.env marker file) BEFORE the yaml
+    # gain lists below are read from control_info. No-op when nothing is set.
+    # See the block comment above _apply_arm_control_overrides for rationale.
+    _apply_arm_control_overrides(robot_config, checkpoint_path.parent)
 
     # ------------------------------------------------------------------
     # 2. Auto-detect actor obs keys from agent config
@@ -483,14 +623,22 @@ def export_tracker(
         float(robot_config.control.control_info[j].damping) for j in joint_names
     ]
 
-    # Effort limits (if available)
+    # Effort limits (if available). NOTE: baked ControlInfo entries name the
+    # field `effort_limit` (pose_lib.ControlInfo); the old `.effort`-only read
+    # always raised AttributeError, which is why every previous yaml carried
+    # `effort_limits: null`. Try both spellings per joint.
     effort_limits = None
     try:
+        _ci = robot_config.control.control_info
         effort_limits = [
-            float(robot_config.control.control_info[j].effort)
+            float(
+                getattr(_ci[j], "effort", None)
+                if getattr(_ci[j], "effort", None) is not None
+                else _ci[j].effort_limit
+            )
             for j in joint_names
         ]
-    except (AttributeError, KeyError):
+    except (AttributeError, KeyError, TypeError):
         pass
 
     mjcf_path = robot_config.asset.asset_file_name
