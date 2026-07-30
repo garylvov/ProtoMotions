@@ -877,7 +877,7 @@ def main():
                         _old = getattr(_oci[_pat], _field, None)
                         setattr(_oci[_pat], _field, float(_val))
                         _arm_touched = True
-                        log.info(
+                        log.warning(
                             f"RESUME override arm {_pat}.{_field}: {_old} -> {float(_val)}"
                         )
         # The pickle also carries the BAKED per-DOF control_info built at the
@@ -892,7 +892,7 @@ def main():
             if hasattr(_ctrl, "control_info"):
                 delattr(_ctrl, "control_info")
             _ctrl.initialize_control_info(robot_config.asset)
-            log.info("RESUME override arm: rebuilt control_info from MJCF + overrides")
+            log.warning("RESUME override arm: rebuilt control_info from MJCF + overrides")
 
         args.checkpoint = checkpoint_path
         experiment_module = (
