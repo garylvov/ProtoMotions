@@ -879,7 +879,12 @@ class MotionLib:
         return self._goal_state_time_cache[motion_ids]
 
     def get_motion_state(
-        self, motion_ids, motion_times, joint_3d_format="exp_map", mirror_flags=None
+        self,
+        motion_ids,
+        motion_times,
+        joint_3d_format="exp_map",
+        mirror_flags=None,
+        reverse_flags=None,
     ) -> RobotState:
         """Sample interpolated reference state.
 
@@ -889,7 +894,27 @@ class MotionLib:
         reflection is linear, so mirror-after-blend == blend-of-mirrors, and
         doing it once post-blend is cheaper. ``None`` (the default) is a total
         no-op, so ``PM_MIRROR_PROB=0`` stays byte-identical.
+
+        reverse_flags: optional bool tensor aligned 1:1 with ``motion_ids`` rows.
+        Selected rows are served TIME-REVERSED (components/motion_reverse.py):
+        the query time is remapped ``t -> L - t`` BEFORE frame-blend (so poses,
+        contacts and every future/history lookup automatically walk the original
+        clip backwards) and all velocity fields are negated AFTER blending.
+        ``None`` (the default) is a total no-op, so PM_REVERSE_PROB unset stays
+        byte-identical. Independent of mirror_flags -- a row can be both
+        mirrored and reversed (the two transforms commute).
         """
+        # Online time-reversal augmentation (ref-side), part 1: remap the query
+        # time onto the reversed timeline. Done before frame-blend so the
+        # existing clip(0, L) bound handles out-of-range future lookups (they
+        # hold at the original first frame == the reversed clip's last frame).
+        if reverse_flags is not None:
+            from protomotions.components.motion_reverse import reverse_motion_times
+
+            motion_times = reverse_motion_times(
+                motion_times, self.motion_lengths[motion_ids], reverse_flags
+            )
+
         frame_idx0, frame_idx1, blend = self._calc_frame_blend_from_id_and_time(
             motion_ids, motion_times
         )
@@ -965,6 +990,18 @@ class MotionLib:
             from protomotions.components.motion_mirror import mirror_robot_state
 
             mirror_robot_state(motion_state_0, mirror_flags, self._mirror_maps)
+
+        # Online time-reversal augmentation (ref-side), part 2: negate the
+        # velocity fields on reversed rows (poses/contacts were already handled
+        # by the time remap above). Full negation commutes with the mirror's
+        # sign-flips + L/R permutation, so mirror-then-reverse == reverse-then-
+        # mirror; order here is arbitrary. No-op unless flags supplied.
+        if reverse_flags is not None:
+            from protomotions.components.motion_reverse import (
+                reverse_robot_state_velocities,
+            )
+
+            reverse_robot_state_velocities(motion_state_0, reverse_flags)
 
         return motion_state_0
 

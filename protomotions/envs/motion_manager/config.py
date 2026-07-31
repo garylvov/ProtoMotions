@@ -70,6 +70,23 @@ class MotionManagerConfig:
         },
     )
 
+    reverse_prob: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "Online time-reversal augmentation: per-episode Bernoulli "
+                "probability of serving the sampled reference motion played "
+                "backwards (components/motion_reverse.py) -- walking forward "
+                "becomes walking backward, pick-up becomes put-down. 0.0 "
+                "disables (byte-identical). Independent coin from mirror_prob. "
+                "The PM_REVERSE_PROB env var overrides this at runtime "
+                "(resume-safe)."
+            ),
+            "min": 0.0,
+            "max": 1.0,
+        },
+    )
+
 
 @dataclass
 class MimicMotionManagerConfig(MotionManagerConfig):

@@ -841,10 +841,16 @@ class BaseEnv:
             if (_mm is not None and getattr(_mm, "mirror_prob", 0.0) > 0.0)
             else None
         )
+        _reverse_flags = (
+            _mm.reverse_flags[env_ids]
+            if (_mm is not None and getattr(_mm, "reverse_prob", 0.0) > 0.0)
+            else None
+        )
         ref_state = self.motion_lib.get_motion_state(
             self.motion_manager.motion_ids[env_ids],
             self.motion_manager.motion_times[env_ids],
             mirror_flags=_mirror_flags,
+            reverse_flags=_reverse_flags,
         )
 
         self.respawn_root_offset[env_ids, :2] = (
@@ -1725,17 +1731,26 @@ class BaseEnv:
             Tuple of (reset_state, object_reset_state)
         """
 
-        # Mirror the RSI init pose for envs whose fresh per-episode coin came up
-        # mirrored (flags set in sample_motions, called just before this). Aligned
-        # to env_ids == ref_env_ids. None when PM_MIRROR_PROB=0.
+        # Mirror/reverse the RSI init pose for envs whose fresh per-episode coins
+        # came up mirrored/reversed (flags set in sample_motions, called just
+        # before this). Aligned to env_ids == ref_env_ids. None when the
+        # respective prob is 0.
         _mm = self.motion_manager
         _mirror_flags = (
             _mm.mirror_flags[env_ids]
             if (_mm is not None and getattr(_mm, "mirror_prob", 0.0) > 0.0)
             else None
         )
+        _reverse_flags = (
+            _mm.reverse_flags[env_ids]
+            if (_mm is not None and getattr(_mm, "reverse_prob", 0.0) > 0.0)
+            else None
+        )
         ref_state = self.motion_lib.get_motion_state(
-            motion_ids, motion_times, mirror_flags=_mirror_flags
+            motion_ids,
+            motion_times,
+            mirror_flags=_mirror_flags,
+            reverse_flags=_reverse_flags,
         )
         new_states = ResetState.from_robot_state(ref_state)
 
@@ -2013,9 +2028,24 @@ class BaseEnv:
             else:
                 flat_mirror_flags = None
 
+            # Same for the per-episode time-reversal coin: broadcast per-env
+            # flags across buffer_size. The fetch-level time remap then walks
+            # the ORIGINAL clip forwards for this historical window (playback
+            # past == reversed clip's past). None when prob=0.
+            if _mm is not None and getattr(_mm, "reverse_prob", 0.0) > 0.0:
+                _rflags = _mm.reverse_flags[ref_env_ids]
+                flat_reverse_flags = (
+                    _rflags.unsqueeze(1).expand(-1, buffer_size).reshape(-1)
+                )
+            else:
+                flat_reverse_flags = None
+
             # Query motion library
             historical_state = self.motion_lib.get_motion_state(
-                flat_motion_ids, flat_motion_times, mirror_flags=flat_mirror_flags
+                flat_motion_ids,
+                flat_motion_times,
+                mirror_flags=flat_mirror_flags,
+                reverse_flags=flat_reverse_flags,
             )
 
             # Motion library data is recorded on flat terrain (height = 0)

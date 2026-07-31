@@ -121,6 +121,40 @@ class MotionManager:
                 f"(PM_MIRROR_PROB={self.mirror_prob})"
             )
 
+        # -- Online time-reversal augmentation (ref-side) ----------------------
+        # PM_REVERSE_PROB (env-gated, resume-safe, modeled exactly on
+        # PM_MIRROR_PROB above): per-episode Bernoulli prob of serving the
+        # sampled REFERENCE motion time-reversed (see
+        # components/motion_reverse.py) -- walking forward becomes walking
+        # backward, pick-up becomes put-down (uniform across the corpus; the
+        # reversed-manipulation case is considered a feature). Read LIVE from
+        # os.environ so a resume rebuilds the manager and picks up a
+        # newly-exported prob (no frozen-config problem; identical resume
+        # behavior to mirror). Default unset/0.0 == OFF == byte-identical (the
+        # per-env flags stay all-False and every reverse call site passes
+        # None). Config field ``reverse_prob`` provides a non-env default; the
+        # env var wins when set. Independent coin from mirror: a clip can be
+        # both mirrored and reversed.
+        _env_rprob = os.environ.get("PM_REVERSE_PROB")
+        if _env_rprob is not None:
+            self.reverse_prob = float(_env_rprob)
+        else:
+            self.reverse_prob = float(getattr(self.config, "reverse_prob", 0.0) or 0.0)
+        assert 0.0 <= self.reverse_prob <= 1.0, (
+            f"PM_REVERSE_PROB must be in [0,1], got {self.reverse_prob}"
+        )
+        # Per-env reverse flag; persists for the whole episode (only overwritten
+        # at that env's next sample_motions), so every ref access for the
+        # episode (current + future frames) sees a consistent time direction.
+        self.reverse_flags = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        if self.reverse_prob > 0.0:
+            print(
+                f"Motion Manager: ONLINE TIME-REVERSAL augmentation ENABLED "
+                f"(PM_REVERSE_PROB={self.reverse_prob})"
+            )
+
         # Sampling vectors
         self.init_start_probs = (
             torch.ones(num_envs, dtype=torch.float, device=device)
@@ -592,6 +626,15 @@ class MotionManager:
                 (len(env_ids),), self.mirror_prob, device=self.device
             )
             self.mirror_flags[env_ids] = torch.bernoulli(probs).bool()
+
+        # Independent per-episode time-reversal coin (default OFF -> stays
+        # all-False -> no behavioral change). Independent draw from mirror: a
+        # clip can be both mirrored and reversed.
+        if self.reverse_prob > 0.0:
+            rprobs = torch.full(
+                (len(env_ids),), self.reverse_prob, device=self.device
+            )
+            self.reverse_flags[env_ids] = torch.bernoulli(rprobs).bool()
 
     def update_sampling_weights(self, weights: torch.Tensor):
         k = min(50, weights.shape[0])

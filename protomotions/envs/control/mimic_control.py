@@ -110,10 +110,20 @@ class MimicControl(ControlComponent):
         # env sees a fully consistent mirrored reference this step.
         _mm = self.env.motion_manager
         mirror_flags = _mm.mirror_flags if _mm.mirror_prob > 0.0 else None
+        # Same pattern for the per-episode time-reversal coin (None when
+        # PM_REVERSE_PROB unset -> byte-identical fast path). The SAME per-env
+        # flags key both the current ref (rewards) and the future window (obs),
+        # so a reversed env sees a fully consistent reversed timeline this step.
+        reverse_flags = (
+            _mm.reverse_flags if getattr(_mm, "reverse_prob", 0.0) > 0.0 else None
+        )
 
         # Get single-step reference state at current time (for rewards)
         ref_state = self.env.motion_lib.get_motion_state(
-            motion_ids, motion_times, mirror_flags=mirror_flags
+            motion_ids,
+            motion_times,
+            mirror_flags=mirror_flags,
+            reverse_flags=reverse_flags,
         )
         
         # Apply terrain height correction to reference state
@@ -170,10 +180,22 @@ class MimicControl(ControlComponent):
             if mirror_flags is not None
             else None
         )
+        # Same per-env reverse flags across the future window: the fetch-level
+        # time remap turns playback time t + k*dt into original time
+        # L - t - k*dt, so the future obs correctly walk the original clip
+        # BACKWARDS for reversed envs.
+        flat_reverse_flags = (
+            reverse_flags.unsqueeze(-1).expand(num_envs, future_steps).reshape(-1)
+            if reverse_flags is not None
+            else None
+        )
 
         # Query motion lib for all future steps
         future_state = self.env.motion_lib.get_motion_state(
-            flat_motion_ids, flat_future_times, mirror_flags=flat_mirror_flags
+            flat_motion_ids,
+            flat_future_times,
+            mirror_flags=flat_mirror_flags,
+            reverse_flags=flat_reverse_flags,
         )
         
         # Reshape to [envs, future_steps, ...] and apply terrain correction
@@ -278,10 +300,14 @@ class MimicControl(ControlComponent):
         # Mirror the markers to match the (possibly mirrored) served reference.
         _mm = self.env.motion_manager
         _mflags = _mm.mirror_flags if _mm.mirror_prob > 0.0 else None
+        _rflags = (
+            _mm.reverse_flags if getattr(_mm, "reverse_prob", 0.0) > 0.0 else None
+        )
         ref_state = self.env.motion_lib.get_motion_state(
             self.env.motion_manager.motion_ids,
             self.env.motion_manager.motion_times,
             mirror_flags=_mflags,
+            reverse_flags=_rflags,
         )
         
         target_pos = ref_state.rigid_body_pos.clone()
