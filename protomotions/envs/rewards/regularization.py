@@ -132,6 +132,43 @@ def compute_action_smoothness_logmeanexp(
     )
 
 
+def compute_action_smoothness_lme_graced(
+    current_processed_action: Tensor,
+    previous_processed_action: Tensor,
+    perturbation_grace_mask: Tensor = None,
+    beta: float = 3.0,
+) -> Tensor:
+    """Grace-windowed Log-Mean-Exp action smoothness (v5.4 arm-flail tax).
+
+    ``compute_action_smoothness_logmeanexp`` (soft L_infinity over the
+    per-joint action delta -- prices the single most violent joint, i.e. the
+    arm-flail axis the mean-flavored ``action_rate`` term dilutes across 27
+    DOFs) combined with the Track-D perturbation grace window of
+    ``compute_action_smoothness_graced``: the penalty is ZEROED for envs whose
+    ``perturbation_grace_mask`` is True (post-push window / persistent-force
+    ramp-in), so a decisive push/wrench recovery swing is untaxed exactly when
+    it is needed. With no grace source configured (mask None) it reduces to
+    the stock LME penalty.
+
+    Args:
+        current_processed_action: Current processed action [num_envs, dim].
+        previous_processed_action: Previous processed action [num_envs, dim].
+        perturbation_grace_mask: Bool [num_envs] or None (no grace).
+        beta: LME temperature (higher = closer to max).
+
+    Returns:
+        Smoothness penalty tensor [num_envs] (zeroed where graced).
+    """
+    result = delta_logmeanexp(
+        current_processed_action,
+        previous_processed_action,
+        beta=beta,
+    )
+    if perturbation_grace_mask is not None:
+        result = result * (~perturbation_grace_mask.bool()).float()
+    return result
+
+
 def compute_dof_acc_penalty(
     current_dof_vel: Tensor,
     historical_dof_vel: Tensor,
@@ -263,23 +300,51 @@ def compute_contact_match_rew(
     sim_contacts: Tensor,
     ref_contacts: Tensor,
     contact_body_ids: Tensor,
+    ref_contact_threshold: float = 0.5,
+    match_reward: bool = False,
 ) -> Tensor:
     """Contact matching reward using foot contact bodies.
-    
-    Penalizes mismatch between simulated and reference foot contacts.
-    Uses contact_body_ids (typically foot bodies).
-    
+
+    Compares simulated foot contact state against the reference contact
+    schedule per body in ``contact_body_ids`` (typically foot bodies).
+
+    v5.4 swing-timing update: reference contacts may be SMOOTHED floats in
+    [0, 1] (``ref_contact_smooth_window`` > 1); they are binarized at
+    ``ref_contact_threshold`` before comparison (the StepBudgetPenalty /
+    liftoff-penalty lesson — raw |sim − 0.43| half-charges every smoothed
+    swing edge). For hard 0/1 reference labels the default threshold of 0.5
+    is byte-identical to the legacy behavior.
+
+    Two output modes:
+
+    - ``match_reward=False`` (default, legacy/NVlabs): returns the MISMATCH
+      count ``sum_f |sim_f − ref_bin_f|`` in [0, num_feet]; weight NEGATIVELY.
+    - ``match_reward=True`` (v5.4): returns the MATCH count
+      ``num_feet − mismatch`` in [0, num_feet]; weight POSITIVELY. Max reward
+      when policy contacts equal the (binarized) reference everywhere; a foot
+      planted while the reference is airborne (the early-landing gap-filler
+      double-step) forfeits that foot's match unit.
+
     Args:
         sim_contacts: Simulated contact flags [num_envs, num_bodies].
-        ref_contacts: Reference contact flags [num_envs, num_bodies].
+        ref_contacts: Reference contact labels [num_envs, num_bodies];
+            bool/0-1 or smoothed floats in [0, 1].
         contact_body_ids: Indices of bodies to track contacts for [num_contact_bodies].
-    
+        ref_contact_threshold: Reference contact value at/above which the
+            reference foot counts as in stance.
+        match_reward: If True return match count (reward, weight > 0), else
+            mismatch count (penalty, weight < 0).
+
     Returns:
-        Contact mismatch penalty tensor [num_envs].
+        Contact match/mismatch tensor [num_envs].
     """
-    sim_contacts_subset = sim_contacts[:, contact_body_ids]
-    ref_contacts_subset = ref_contacts[:, contact_body_ids]
-    return torch.abs(sim_contacts_subset.float() - ref_contacts_subset.float()).sum(dim=1)
+    sim_contacts_subset = sim_contacts[:, contact_body_ids].float()
+    ref_contacts_subset = ref_contacts[:, contact_body_ids].float()
+    ref_bin = (ref_contacts_subset >= ref_contact_threshold).float()
+    mismatch = torch.abs(sim_contacts_subset - ref_bin).sum(dim=1)
+    if match_reward:
+        return float(contact_body_ids.numel()) - mismatch
+    return mismatch
 
 
 def compute_reference_contact_liftoff_penalty(
@@ -631,6 +696,7 @@ __all__ = [
     # Main reward kernels
     "compute_action_smoothness",
     "compute_action_smoothness_logmeanexp",
+    "compute_action_smoothness_lme_graced",
     "compute_dof_acc_penalty",
     "compute_dof_vel_penalty",
     "compute_pow_rew",

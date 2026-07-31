@@ -601,6 +601,164 @@ def graced_action_smoothness_factory(weight: float = -0.02) -> MdpComponent:
     )
 
 
+def graced_action_smoothness_lme_factory(
+    weight: float = -0.1,
+    beta: float = 3.0,
+) -> MdpComponent:
+    """Factory for the grace-windowed Log-Mean-Exp action smoothness penalty.
+
+    v5.4 arm-flail tax: soft-L_infinity (LME) over the per-joint action delta
+    prices the single most violent joint -- the flailing arm axis the
+    mean-flavored ``action_rate`` term dilutes across all DOFs -- while the
+    Track-D perturbation grace window (post-push / persistent-force ramp-in,
+    fed by ``EnvContext.perturbation_grace_mask`` from the simulator's
+    perturbation schedulers) zeroes it during recovery so a decisive
+    push/wrench recovery swing is never taxed. With no grace source configured
+    the mask is None and this is the stock LME penalty.
+
+    Args:
+        weight: Reward weight (typically negative).
+        beta: LME temperature (higher = closer to max-joint).
+
+    Returns:
+        MdpComponent configured for the graced LME action smoothness penalty.
+    """
+    from protomotions.envs.rewards import compute_action_smoothness_lme_graced
+
+    return MdpComponent(
+        compute_func=compute_action_smoothness_lme_graced,
+        dynamic_vars={
+            "current_processed_action": EnvContext.current_processed_action,
+            "previous_processed_action": EnvContext.previous_processed_action,
+            "perturbation_grace_mask": EnvContext.perturbation_grace_mask,
+        },
+        static_params={"weight": weight, "beta": beta},
+    )
+
+
+def resume_inject_reward_components(
+    reward_components,
+    env=None,
+    log_fn=print,
+) -> bool:
+    """v5.4 resume-time COMPONENT INJECTION for env-gated reward components.
+
+    Reward components are env-side: adding one changes no observation or
+    network shape, so a RESUME can safely accept a NEW component -- but the
+    resume path loads the reward config frozen from ``resolved_configs.pt``,
+    where a component added to the experiment file after the original launch
+    simply does not exist. The re-apply family in ``train_agent.py`` can only
+    patch components that are already present. This helper closes the gap: for
+    each injectable spec whose weight env var is set (non-empty), it either
+
+    - INJECTS the component via its factory when absent from the frozen
+      config (loud ``RESUME INJECT`` line), or
+    - patches ``weight`` (and ``ref_contact_threshold`` where applicable) when
+      a previous injection already froze it in (loud ``RESUME override``
+      line), so weight ladders ride later resumes too.
+
+    Injectable specs (v5.4 dormant-activation, swing-timing/contact channel):
+
+    - ``contact_match``    <- PM_CONTACT_MATCH_WEIGHT
+                              (+ PM_CONTACT_MATCH_REF_THRESHOLD, default 0.5;
+                              injected in match_reward=True mode: pays for
+                              matching the ref foot-contact schedule, prices
+                              the early-landing gap-filler double-step)
+    - ``liftoff_penalty``  <- PM_LIFTOFF_PENALTY_WEIGHT
+                              (+ PM_LIFTOFF_REF_THRESHOLD, default 0.5;
+                              ref-gated unnecessary-liftoff event penalty)
+    - ``action_smooth_lme`` <- PM_ACTION_SMOOTH_LME_WEIGHT
+                              (graced LME arm-flail tax; grace mask zeroes it
+                              during push/wrench recovery)
+
+    NOTE: hold_balance / root_gain are NOT here by design -- the HOLD-FIX
+    boot path (``setup_hold_fix_components``) already reads
+    HOLD_BALANCE_BONUS / ROOT_GAIN_REWARD live from the environment at env
+    construction, which is rebuilt on every resume.
+
+    Mutates ``reward_components`` in place. Pure config-level function so it
+    is unit-testable without a simulator.
+
+    Args:
+        reward_components: The (frozen) reward components dict to mutate.
+        env: Environment mapping (defaults to ``os.environ``).
+        log_fn: Sink for the loud proof lines (``log.warning`` on resume).
+
+    Returns:
+        True if anything was injected or patched.
+    """
+    import os
+
+    if env is None:
+        env = os.environ
+
+    def _build_contact_match(weight, env):
+        return contact_match_rew_factory(
+            weight=weight,
+            ref_contact_threshold=float(
+                env.get("PM_CONTACT_MATCH_REF_THRESHOLD") or 0.5
+            ),
+            match_reward=True,
+        )
+
+    def _build_liftoff(weight, env):
+        return reference_contact_liftoff_penalty_factory(
+            weight=weight,
+            ref_contact_threshold=float(
+                env.get("PM_LIFTOFF_REF_THRESHOLD") or 0.5
+            ),
+        )
+
+    def _build_action_smooth_lme(weight, env):
+        return graced_action_smoothness_lme_factory(weight=weight)
+
+    specs = (
+        ("contact_match", "PM_CONTACT_MATCH_WEIGHT",
+         "PM_CONTACT_MATCH_REF_THRESHOLD", _build_contact_match),
+        ("liftoff_penalty", "PM_LIFTOFF_PENALTY_WEIGHT",
+         "PM_LIFTOFF_REF_THRESHOLD", _build_liftoff),
+        ("action_smooth_lme", "PM_ACTION_SMOOTH_LME_WEIGHT",
+         None, _build_action_smooth_lme),
+    )
+
+    changed = False
+    for name, weight_var, thresh_var, builder in specs:
+        weight_val = env.get(weight_var)
+        if not weight_val:
+            continue
+        weight = float(weight_val)
+        if name in reward_components:
+            sp = reward_components[name].static_params
+            old_weight = sp.get("weight")
+            if old_weight != weight:
+                sp["weight"] = weight
+                changed = True
+                log_fn(
+                    f"RESUME override {name}.weight = {weight} "
+                    f"(was {old_weight}, from {weight_var}; already present, "
+                    f"patched not injected)"
+                )
+            thresh_val = env.get(thresh_var) if thresh_var else None
+            if thresh_val and sp.get("ref_contact_threshold") != float(thresh_val):
+                old_t = sp.get("ref_contact_threshold")
+                sp["ref_contact_threshold"] = float(thresh_val)
+                changed = True
+                log_fn(
+                    f"RESUME override {name}.ref_contact_threshold = "
+                    f"{float(thresh_val)} (was {old_t}, from {thresh_var})"
+                )
+            continue
+        component = builder(weight, env)
+        reward_components[name] = component
+        changed = True
+        log_fn(
+            f"RESUME INJECT component {name} weight={weight} "
+            f"params={component.static_params} (was absent; "
+            f"v5.4 dormant-activation, from {weight_var})"
+        )
+    return changed
+
+
 def gt_rew_factory(weight: float = 0.5, coefficient: float = -100.0) -> MdpComponent:
     """Factory for position tracking reward.
 
@@ -1004,17 +1162,35 @@ def dof_vel_penalty_factory(weight: float = -1e-4) -> MdpComponent:
 def contact_match_rew_factory(
     weight: float = -0.1,
     zero_during_grace_period: bool = True,
+    ref_contact_threshold: float = 0.5,
+    match_reward: bool = False,
 ) -> MdpComponent:
     """Factory for contact matching reward.
 
+    v5.4: reference contacts are binarized at ``ref_contact_threshold``
+    before comparison (smoothed ref contact floats from
+    ``ref_contact_smooth_window`` would otherwise half-charge every swing
+    edge; byte-identical for hard 0/1 labels at the default 0.5).
+    ``match_reward=True`` flips the output to a POSITIVE match count
+    (num_feet - mismatch; weight positively) -- see
+    ``compute_contact_match_rew``.
+
     Args:
-        weight: Reward weight (typically negative).
+        weight: Reward weight (negative for the legacy mismatch penalty,
+            positive with ``match_reward=True``).
         zero_during_grace_period: If True, zero reward during grace period.
+        ref_contact_threshold: Reference contact value at/above which the
+            reference foot counts as in stance (binarization threshold).
+        match_reward: If True emit match count (reward) instead of mismatch
+            count (penalty).
 
     Returns:
         MdpComponent configured for contact matching.
     """
     from protomotions.envs.rewards import compute_contact_match_rew
+
+    if not (0.0 <= ref_contact_threshold < 1.0):
+        raise ValueError("ref_contact_threshold must be in [0, 1).")
 
     return MdpComponent(
         compute_func=compute_contact_match_rew,
@@ -1026,6 +1202,8 @@ def contact_match_rew_factory(
         static_params={
             "weight": weight,
             "zero_during_grace_period": zero_during_grace_period,
+            "ref_contact_threshold": ref_contact_threshold,
+            "match_reward": match_reward,
         },
     )
 
@@ -2609,6 +2787,8 @@ __all__ = [
     "dof_vel_penalty_factory",
     "contact_match_rew_factory",
     "reference_contact_liftoff_penalty_factory",
+    "graced_action_smoothness_lme_factory",
+    "resume_inject_reward_components",
     "contact_force_change_rew_factory",
     "target_reward_factory",
     "steering_reward_factory",

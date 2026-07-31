@@ -894,6 +894,23 @@ def main():
             _ctrl.initialize_control_info(robot_config.asset)
             log.warning("RESUME override arm: rebuilt control_info from MJCF + overrides")
 
+        # v5.4 COMPONENT INJECTION (env-gated, resume-safe): reward components
+        # are env-side -- adding one changes no obs/network shape -- but the
+        # re-apply family above can only PATCH components already present in
+        # the frozen config. Inject the dormant contact-channel /
+        # swing-timing components (contact_match, liftoff_penalty,
+        # action_smooth_lme) when their PM_* weight vars are set and the
+        # component is absent. hold_balance / root_gain need no row here: the
+        # HOLD-FIX boot path reads HOLD_BALANCE_BONUS / ROOT_GAIN_REWARD live
+        # at env construction, which is rebuilt on every resume.
+        from protomotions.envs.component_factories import (
+            resume_inject_reward_components,
+        )
+
+        if resume_inject_reward_components(_rc, log_fn=log.warning):
+            # _rc may be a fresh dict when the frozen config had None.
+            env_config.reward_components = _rc
+
         args.checkpoint = checkpoint_path
         experiment_module = (
             None  # Intentionally skip loading - frozen config from pickle

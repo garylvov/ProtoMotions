@@ -554,3 +554,102 @@ def test_dof_pos_track_reward_pins_joint_space_posture():
         -((current[:, idx] - ref[:, idx]).pow(2).mean(dim=-1)) / (sigma ** 2)
     )
     assert torch.allclose(rew_sub, expected_sub)
+
+
+def test_contact_match_threshold_and_match_reward_modes():
+    """v5.4 contact_match: smoothed-ref binarization + match-reward mode."""
+    feet = torch.tensor([0, 1])
+
+    # --- Smoothed ref floats binarize at ref_contact_threshold (H1 lesson:
+    # raw |sim - 0.43| would half-charge every smoothed swing edge).
+    sim = torch.tensor([[1.0, 1.0], [1.0, 1.0], [1.0, 1.0]])
+    ref_smoothed = torch.tensor(
+        [[0.14, 0.43], [0.71, 0.43], [0.71, 0.94]]
+    )
+    mismatch = regularization.compute_contact_match_rew(
+        sim, ref_smoothed, contact_body_ids=feet, ref_contact_threshold=0.5
+    )
+    # 0.14 -> 0, 0.43 -> 0, 0.71 -> 1, 0.94 -> 1 after binarization.
+    assert torch.allclose(mismatch, torch.tensor([2.0, 1.0, 0.0]))
+
+    # --- match_reward=True: max reward when policy contacts == (binarized)
+    # ref contacts everywhere; a foot planted while the ref is airborne (the
+    # early-landing gap-filler double-step) forfeits that foot's match unit.
+    match = regularization.compute_contact_match_rew(
+        sim, ref_smoothed, contact_body_ids=feet,
+        ref_contact_threshold=0.5, match_reward=True,
+    )
+    assert torch.allclose(match, torch.tensor([0.0, 1.0, 2.0]))
+    # Perfect match => max reward == num feet.
+    perfect = regularization.compute_contact_match_rew(
+        torch.tensor([[1.0, 0.0]]), torch.tensor([[0.9, 0.1]]),
+        contact_body_ids=feet, match_reward=True,
+    )
+    assert torch.allclose(perfect, torch.tensor([2.0]))
+    # Early landing (policy foot down, ref airborne) scores strictly less.
+    early_landing = regularization.compute_contact_match_rew(
+        torch.tensor([[1.0, 1.0]]), torch.tensor([[0.9, 0.1]]),
+        contact_body_ids=feet, match_reward=True,
+    )
+    assert early_landing.item() < perfect.item()
+    assert torch.allclose(early_landing, torch.tensor([1.0]))
+
+    # --- Legacy back-compat: hard bool refs at default threshold 0.5 are
+    # byte-identical to the pre-v5.4 kernel.
+    sim_b = torch.tensor([[True, False, True], [False, True, False]])
+    ref_b = torch.tensor([[True, True, False], [True, True, False]])
+    assert torch.allclose(
+        regularization.compute_contact_match_rew(
+            sim_b, ref_b, contact_body_ids=torch.tensor([1, 2])
+        ),
+        torch.tensor([2.0, 0.0]),
+    )
+
+
+def test_action_smoothness_lme_graced_matches_lme_and_respects_grace():
+    """v5.4 arm-flail tax: LME kernel + perturbation grace zeroing."""
+    prev = torch.zeros(3, 4)
+    cur = torch.tensor(
+        [
+            [0.0, 0.0, 0.0, 0.0],   # no motion
+            [0.1, 0.1, 0.1, 0.1],   # gentle uniform motion
+            [0.0, 0.0, 0.0, 2.0],   # single-joint flail
+        ]
+    )
+    ungraced = regularization.compute_action_smoothness_lme_graced(cur, prev)
+    # No grace mask => identical to the stock LME kernel.
+    assert torch.allclose(
+        ungraced,
+        regularization.compute_action_smoothness_logmeanexp(cur, prev),
+    )
+    # Single-joint flail (env 2) out-prices the same total |delta| spread
+    # uniformly (env 1) -- the soft-max flavor the mean-flavored action_rate
+    # term lacks.
+    assert ungraced[2] > ungraced[1] > ungraced[0]
+
+    # Grace mask zeroes exactly the graced envs (push/wrench recovery).
+    grace = torch.tensor([False, True, True])
+    graced = regularization.compute_action_smoothness_lme_graced(
+        cur, prev, perturbation_grace_mask=grace
+    )
+    assert torch.allclose(graced[0], ungraced[0])
+    assert graced[1] == 0.0 and graced[2] == 0.0
+
+
+def test_reference_contact_liftoff_penalty_fires_only_on_unnecessary_liftoffs():
+    """Liftoff penalty: ref-planted liftoff pays, ref-matched swing is free."""
+    feet = torch.tensor([0, 1])
+    # Previous step: both feet in contact for all envs.
+    prev = torch.ones(3, 1, 2)
+    # Current sim: env 0 keeps both planted; env 1 lifts foot 0 while the ref
+    # keeps it planted (UNNECESSARY); env 2 lifts foot 0 with the ref in
+    # swing (ref-matched liftoff).
+    sim = torch.tensor([[1.0, 1.0], [0.0, 1.0], [0.0, 1.0]])
+    ref = torch.tensor([[1.0, 1.0], [1.0, 1.0], [0.1, 1.0]])
+    pen = regularization.compute_reference_contact_liftoff_penalty(
+        sim, ref, contact_body_ids=feet,
+        historical_body_contacts=prev, ref_contact_threshold=0.5,
+    )
+    assert pen[0] == 0.0          # no liftoff at all
+    assert pen[1] > 0.0           # unnecessary liftoff pays
+    assert pen[2] == 0.0          # ref-matched liftoff is free

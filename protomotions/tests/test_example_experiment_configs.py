@@ -88,6 +88,10 @@ def test_mimic_fsq_basic_config_factories_and_inference_overrides():
     assert env_cfg.reward_components["contact_match_rew"].static_params == {
         "weight": -0.1,
         "zero_during_grace_period": True,
+        # v5.4: threshold binarization is byte-identical for hard 0/1 ref
+        # labels at 0.5; match_reward=False keeps the legacy mismatch penalty.
+        "ref_contact_threshold": 0.5,
+        "match_reward": False,
     }
 
     assert agent_cfg.batch_size == 32

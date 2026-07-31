@@ -416,3 +416,76 @@ def test_termination_and_metric_factories_bind_metadata_and_wrappers():
         ),
         torch.tensor([False, True]),
     )
+
+
+def test_resume_inject_reward_components_v54_dormant_activation():
+    """v5.4 resume-time COMPONENT INJECTION: contact channel + arm-flail tax."""
+    # --- env unset => frozen dict byte-identical, no proof lines.
+    frozen = {}
+    lines = []
+    changed = factories.resume_inject_reward_components(
+        frozen, env={}, log_fn=lines.append
+    )
+    assert changed is False and frozen == {} and lines == []
+
+    # --- all three weight vars set, components absent => injected with the
+    # right factories, weights, thresholds, and dynamic_vars.
+    frozen = {"some_existing": factories.pow_rew_factory(weight=-1e-4)}
+    lines = []
+    env = {
+        "PM_CONTACT_MATCH_WEIGHT": "0.1",
+        "PM_CONTACT_MATCH_REF_THRESHOLD": "0.6",
+        "PM_LIFTOFF_PENALTY_WEIGHT": "-0.5",
+        "PM_ACTION_SMOOTH_LME_WEIGHT": "-0.1",
+    }
+    changed = factories.resume_inject_reward_components(
+        frozen, env=env, log_fn=lines.append
+    )
+    assert changed is True
+    assert set(frozen) == {
+        "some_existing", "contact_match", "liftoff_penalty", "action_smooth_lme"
+    }
+
+    cm = frozen["contact_match"]
+    assert _params(cm)["weight"] == 0.1
+    assert _params(cm)["ref_contact_threshold"] == 0.6
+    assert _params(cm)["match_reward"] is True
+    assert _bindings(cm)["sim_contacts"] == "current.rigid_body_contacts"
+    assert _bindings(cm)["ref_contacts"] == "mimic.ref_state.rigid_body_contacts"
+    assert _bindings(cm)["contact_body_ids"] == "contact_body_ids"
+
+    lo = frozen["liftoff_penalty"]
+    assert _params(lo)["weight"] == -0.5
+    assert _params(lo)["ref_contact_threshold"] == 0.5  # default when var unset
+    assert _params(lo)["min_value"] == -0.2  # factory income clamp intact
+    assert _bindings(lo)["historical_body_contacts"] == "historical.body_contacts"
+
+    lme = frozen["action_smooth_lme"]
+    assert _params(lme)["weight"] == -0.1
+    assert _bindings(lme)["perturbation_grace_mask"] == "perturbation_grace_mask"
+    assert _bindings(lme)["current_processed_action"] == "current_processed_action"
+
+    inject_lines = [l for l in lines if l.startswith("RESUME INJECT component ")]
+    assert len(inject_lines) == 3
+    assert any(
+        l.startswith("RESUME INJECT component contact_match weight=0.1")
+        for l in inject_lines
+    )
+
+    # --- second resume with the components now frozen in: patch, don't
+    # re-inject; unchanged values are silent.
+    lines2 = []
+    changed = factories.resume_inject_reward_components(
+        frozen, env=dict(env, PM_CONTACT_MATCH_WEIGHT="0.2"), log_fn=lines2.append
+    )
+    assert changed is True
+    assert _params(frozen["contact_match"])["weight"] == 0.2
+    assert [l for l in lines2 if "RESUME INJECT" in l] == []
+    assert any("RESUME override contact_match.weight = 0.2" in l for l in lines2)
+
+    # --- empty-string weight var counts as unset.
+    frozen2 = {}
+    changed = factories.resume_inject_reward_components(
+        frozen2, env={"PM_CONTACT_MATCH_WEIGHT": ""}, log_fn=lambda _l: None
+    )
+    assert changed is False and frozen2 == {}
