@@ -939,7 +939,10 @@ class BaseAgent:
                         import json as _json
 
                         _h = _hashlib.sha256()
-                        _sd = self.actor_module.state_dict()
+                        _mod = getattr(self, "actor_module", None)
+                        if _mod is None:
+                            _mod = self.model  # supervised agents: hash the whole student
+                        _sd = _mod.state_dict()
                         for _k in sorted(_sd.keys()):
                             _t = _sd[_k]
                             if hasattr(_t, "detach"):
