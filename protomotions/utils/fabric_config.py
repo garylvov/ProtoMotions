@@ -142,7 +142,15 @@ def _default_ddp_strategy() -> fabric.strategies.DDPStrategy:
                 broadcast_buffers=broadcast_buffers,
             )
         # s == 1: plain cross-GPU (one rank per GPU) -> NCCL default below.
+    # PM_FORCE_GLOO=1: node-scoped escape hatch for hosts whose NCCL kernels
+    # IMA at the first collective even standalone (gpu3205 2026-08-01: raw
+    # 2-rank dist.broadcast dies with Xid 13 / "illegal memory access" under
+    # every transport knob, while gloo on the same CUDA tensors passes).
+    # Gradient all-reduce over gloo is slower but correct; keep NCCL default
+    # everywhere else.
+    backend = "gloo" if os.environ.get("PM_FORCE_GLOO") == "1" else None
     return fabric.strategies.DDPStrategy(
+        process_group_backend=backend,
         timeout=timedelta(seconds=timeout_sec),
         find_unused_parameters=find_unused,
         static_graph=static_graph,

@@ -8,6 +8,8 @@ an expert policy, and optimizes a configured supervision loss. Algorithms such
 as MaskedMimic are experiment/model configurations of this generic loop.
 """
 
+import os
+
 import torch
 from torch import Tensor
 from tensordict import TensorDict
@@ -103,10 +105,16 @@ class SupervisedAgent(BaseAgent):
                 dummy_expert_obs_td = self._build_expert_obs_td(
                     dummy_obs_td, expert_actor_in_keys
                 )
+                if os.environ.get("PM_MM_DEBUG_SYNC") == "1":
+                    torch.cuda.synchronize(self.device)
+                    log.info("[mm-debug-sync] pre expert materialize OK")
                 self._materialize_frozen_external_expert(
                     expert_actor,
                     dummy_expert_obs_td,
                 )
+                if os.environ.get("PM_MM_DEBUG_SYNC") == "1":
+                    torch.cuda.synchronize(self.device)
+                    log.info("[mm-debug-sync] expert materialize OK")
 
             # Load weights before any distributed wrapper changes module keys.
             pre_trained_expert = torch.load(
@@ -120,6 +128,10 @@ class SupervisedAgent(BaseAgent):
             )
             for param in expert_model.parameters():
                 param.requires_grad = False
+            if os.environ.get("PM_MM_DEBUG_SYNC") == "1":
+                torch.cuda.synchronize(self.device)
+                devs = {str(t.device) for t in expert_model.state_dict().values() if hasattr(t, "device")}
+                log.info(f"[mm-debug-sync] expert weights loaded OK; expert tensor devices={devs}")
 
             # Keep the external expert as a plain frozen module. The trainable
             # student is wrapped by create_optimizers(); the expert only labels

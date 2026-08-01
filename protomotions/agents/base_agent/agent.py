@@ -234,6 +234,11 @@ class BaseAgent:
             dummy_obs_td = self.obs_dict_to_tensordict(dummy_obs)
             self._materialize_lazy_modules(dummy_obs_td)
 
+        if os.environ.get("PM_MM_DEBUG_SYNC") == "1":
+            torch.cuda.synchronize(self.device)
+            devs = {str(t.device) for t in self.model.state_dict().values() if hasattr(t, "device")}
+            log.info(f"[mm-debug-sync] student materialize OK; student tensor devices={devs}")
+
         self.fabric.call("on_model_init_end")
 
         self.fabric.call("on_optimizer_init_start")
@@ -349,7 +354,14 @@ class BaseAgent:
 
     def _setup_model_optimizer(self, module, optimizer):
         """Prepare a model/optimizer pair through Lightning Fabric."""
-        return self.fabric.setup(module, optimizer)
+        if os.environ.get("PM_MM_DEBUG_SYNC") == "1":
+            torch.cuda.synchronize(self.device)
+            log.info("[mm-debug-sync] pre fabric.setup OK")
+        wrapped = self.fabric.setup(module, optimizer)
+        if os.environ.get("PM_MM_DEBUG_SYNC") == "1":
+            torch.cuda.synchronize(self.device)
+            log.info("[mm-debug-sync] post fabric.setup OK")
+        return wrapped
 
     def _step_optimizer(self, loss, model, optimizer, model_name: str) -> Dict:
         """Backpropagate one loss, clip gradients, and step one optimizer."""
