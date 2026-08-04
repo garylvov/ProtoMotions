@@ -490,6 +490,15 @@ class SupervisedAgent(BaseAgent):
             extra_loss = extra_loss + action_rate_weight * action_rate_loss
             log_dict["supervised/action_rate_loss"] = action_rate_loss.detach()
 
+        # v5.4 LME port: soft-L_inf over per-joint |delta action| — student-side
+        # twin of the teacher's action_smooth_lme arm-flail tax. Keep the weight
+        # SMALL: the BC (distillation) loss must dominate.
+        lme_weight = getattr(self.config, "action_lme_weight", 0.0)
+        if lme_weight > 0:
+            lme_loss = self._calculate_action_lme_loss(batch_dict, actions)
+            extra_loss = extra_loss + lme_weight * lme_loss
+            log_dict["supervised/action_lme_loss"] = lme_loss.detach()
+
         # Track C: action-delta matching against the expert (velocity gain).
         delta_weight = getattr(self.config, "expert_action_delta_weight", 0.0)
         if delta_weight > 0:
@@ -567,6 +576,26 @@ class SupervisedAgent(BaseAgent):
         """
         previous_actions = self._previous_actions_from_batch(batch_td, actions)
         return (actions - previous_actions.detach()).pow(2).mean()
+
+    def _calculate_action_lme_loss(self, batch_td, actions: Tensor) -> Tensor:
+        """Log-Mean-Exp (soft L_infinity) over per-joint |action delta|.
+
+        Student port of the teacher's v5.4 ``action_smooth_lme`` reward: prices
+        the single most violent joint (the arm-flail/chatter axis) that the
+        mean-flavored action_rate term dilutes across all DOFs. No perturbation
+        grace window here — supervised batches carry no perturbation schedule.
+        lme = (1/beta) * log(mean(exp(beta * |delta|))) per sample, meaned.
+        """
+        import math as _math
+
+        previous_actions = self._previous_actions_from_batch(batch_td, actions)
+        beta = float(getattr(self.config, "action_lme_beta", 3.0))
+        delta = (actions - previous_actions.detach()).abs()
+        return (
+            (torch.logsumexp(beta * delta, dim=-1) - _math.log(delta.shape[-1]))
+            .div(beta)
+            .mean()
+        )
 
     def _calculate_l2c2_loss(self, batch_td: TensorDict) -> Tensor:
         """L2C2 Lipschitz-ratio regularizer ported from the PPO actor path."""
