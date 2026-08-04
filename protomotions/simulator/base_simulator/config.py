@@ -374,6 +374,63 @@ class MassScaleDomainRandomizationConfig:
                 raise ValueError(f"{name} must satisfy 0 < min <= max, got {rng}.")
 
 
+# PER-GROUP GAIN-DR (2026-08-04, marionette upper body): default joint-group
+# regex patterns for the Unitree H1-2 27-DOF actuated set. Used when per-group
+# stiffness/damping ranges are configured and ``group_dof_patterns`` is left
+# unset. Every DR'd DOF must fall in EXACTLY ONE group (validated loudly at
+# sample time) -- the union below is exhaustive for H1-2's DR'd dof list:
+#   12 leg joints + 1 waist joint + 14 arm joints = 27.
+H1_2_GAIN_DR_GROUP_PATTERNS: Dict[str, List[str]] = {
+    "legs": [
+        ".*_hip_(yaw|pitch|roll)_joint",
+        ".*_knee_joint",
+        ".*_ankle_(pitch|roll)_joint",
+    ],
+    "waist": ["torso_joint"],
+    "arms": [
+        ".*_shoulder_(pitch|roll|yaw)_joint",
+        ".*_elbow_joint",
+        ".*_wrist_(roll|pitch|yaw)_joint",
+    ],
+}
+
+
+def resolve_gain_dr_groups(
+    dof_names: List[str], group_patterns: Dict[str, List[str]]
+) -> Dict[str, List[int]]:
+    """Partition ``dof_names`` into joint groups by regex, COLUMN-indexed.
+
+    Returns ``{group_name: [column, ...]}`` where ``column`` indexes into the
+    given ``dof_names`` list (i.e. into the GAIN-DR sample matrices' second
+    axis), not into the robot's full DOF ordering.
+
+    Fails LOUD (``ValueError``) if any DOF matches zero groups or more than
+    one group -- a silent mis-partition would quietly train the wrong limb at
+    the wrong stiffness, which is exactly the failure this feature exists to
+    avoid.
+    """
+    columns: Dict[str, List[int]] = {group: [] for group in group_patterns}
+    hits: Dict[str, List[str]] = {}
+    for column, name in enumerate(dof_names):
+        matched = [
+            group
+            for group, patterns in group_patterns.items()
+            if any(re.fullmatch(pattern, name) for pattern in patterns)
+        ]
+        hits[name] = matched
+        if len(matched) == 1:
+            columns[matched[0]].append(column)
+    unmatched = [name for name, m in hits.items() if not m]
+    doubled = {name: m for name, m in hits.items() if len(m) > 1}
+    if unmatched or doubled:
+        raise ValueError(
+            "GAIN-DR per-group partition is not exhaustive/disjoint over the "
+            f"randomized DOFs. unmatched={unmatched} double_matched={doubled} "
+            f"groups={ {g: p for g, p in group_patterns.items()} }"
+        )
+    return columns
+
+
 @dataclass
 class ActuatorGainDomainRandomizationConfig:
     """Configuration for per-DOF actuator PD-gain domain randomization (GAIN-DR).
@@ -427,6 +484,82 @@ class ActuatorGainDomainRandomizationConfig:
     dof_indices: Optional[List[int]] = field(
         default=None, metadata={"help": "DOF indices to randomize."}
     )
+    group_dof_patterns: Optional[Dict[str, List[str]]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "PER-GROUP GAIN-DR (2026-08-04): {group_name: [regex, ...]} "
+                "partition of the randomized DOFs into joint groups (e.g. "
+                "legs / waist / arms). None + any group range set = use "
+                "H1_2_GAIN_DR_GROUP_PATTERNS. Every randomized DOF must match "
+                "exactly one group (unmatched or double-matched = loud "
+                "ValueError at sample time)."
+            )
+        },
+    )
+    group_stiffness_scale_ranges: Optional[Dict[str, Tuple[float, float]]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Per-group stiffness scale ranges {group_name: (min, max)}; "
+                "groups omitted here fall back to stiffness_scale_range. "
+                "None = OFF = uniform stiffness_scale_range everywhere "
+                "(byte-identical to the pre-2026-08-04 behavior)."
+            )
+        },
+    )
+    group_damping_scale_ranges: Optional[Dict[str, Tuple[float, float]]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Per-group damping scale ranges {group_name: (min, max)}; "
+                "groups omitted fall back to damping_scale_range. Ignored "
+                "when constant_damping_ratio=True."
+            )
+        },
+    )
+    group_effort_limit_scale_ranges: Optional[Dict[str, Tuple[float, float]]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Per-group EFFORT-LIMIT scale ranges {group_name: (min, max)}; "
+                "groups omitted fall back to effort_limit_scale_range, or to "
+                "the no-op (1.0, 1.0) when that is None. Setting this turns "
+                "the effort axis ON (KINESTHETIC TEACHING 2026-08-04: capping "
+                "arm torque bounds how hard the robot can fight a human hand "
+                "regardless of kp). None = OFF."
+            )
+        },
+    )
+    constant_damping_ratio: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "When True, DERIVE each DOF's damping scale as "
+                "sqrt(stiffness_scale) instead of sampling it independently, "
+                "which holds the damping ratio zeta = d / (2*sqrt(k*m)) "
+                "constant under the stiffness scaling (k -> s*k, "
+                "d -> sqrt(s)*d). Default False = today's behavior (damping "
+                "sampled independently from its own range, so a uniform "
+                "scale s also drops zeta by sqrt(s) -- the confound the "
+                "weak-gain eval sweep hit)."
+            )
+        },
+    )
+    env_gain_scale_group: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Which group's geometric-mean stiffness scale becomes the "
+                "per-env aggregate 'env_gain_scale' consumed by the "
+                "MARIONETTE perturbation coupling. None = AUTO: the 'legs' "
+                "group when per-group ranges are active (balance authority "
+                "lives in the legs), else all randomized DOFs (today's "
+                "behavior). 'all' forces the all-DOF geometric mean; any "
+                "other value must name a configured group."
+            )
+        },
+    )
 
     def __post_init__(self):
         if self.dof_names is None and self.dof_indices is None:
@@ -443,6 +576,39 @@ class ActuatorGainDomainRandomizationConfig:
             lo, hi = rng
             if not (0.0 < lo <= hi):
                 raise ValueError(f"{name} must satisfy 0 < min <= max, got {rng}.")
+        for fld in (
+            "group_stiffness_scale_ranges",
+            "group_damping_scale_ranges",
+            "group_effort_limit_scale_ranges",
+        ):
+            groups = getattr(self, fld)
+            if not groups:
+                continue
+            for group, rng in groups.items():
+                lo, hi = rng
+                if not (0.0 < lo <= hi):
+                    raise ValueError(
+                        f"{fld}['{group}'] must satisfy 0 < min <= max, got {rng}."
+                    )
+        known = set((self.group_dof_patterns or H1_2_GAIN_DR_GROUP_PATTERNS).keys())
+        for fld in (
+            "group_stiffness_scale_ranges",
+            "group_damping_scale_ranges",
+            "group_effort_limit_scale_ranges",
+        ):
+            for group in (getattr(self, fld) or {}):
+                if group not in known:
+                    raise ValueError(
+                        f"{fld} names unknown group '{group}'; configured "
+                        f"groups are {sorted(known)}."
+                    )
+        if self.env_gain_scale_group not in (None, "all") and (
+            self.env_gain_scale_group not in known
+        ):
+            raise ValueError(
+                f"env_gain_scale_group='{self.env_gain_scale_group}' is neither "
+                f"'all' nor one of the configured groups {sorted(known)}."
+            )
 
 
 @dataclass

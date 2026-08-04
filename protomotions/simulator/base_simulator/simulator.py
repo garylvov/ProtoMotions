@@ -51,6 +51,8 @@ from protomotions.simulator.base_simulator.config import (
     CenterOfMassDomainRandomizationConfig,
     ProjectileConfig,
     get_matching_indices,
+    H1_2_GAIN_DR_GROUP_PATTERNS,
+    resolve_gain_dr_groups,
 )
 from protomotions.robot_configs.base import ControlType, RobotConfig
 from protomotions.simulator.base_simulator.record import RecordingMixin
@@ -2395,6 +2397,12 @@ class Simulator(RecordingMixin, ABC):
         [num_envs, num_matching_dofs] effort-limit scale. Backend apply paths
         compose these multiplicatively on the nominal (config) gains. Logs
         ``[gain-dr]`` sample statistics for dump-verify.
+
+        PER-GROUP (2026-08-04): each of the three axes (stiffness / damping /
+        effort limit) also accepts per-joint-group bands
+        (``group_*_scale_ranges``) resolved through ``group_dof_patterns``.
+        ``constant_damping_ratio`` derives damping from stiffness instead of
+        sampling it. All default OFF = byte-identical to the prior behavior.
         """
         dof_indices = get_matching_indices(
             self.robot_config.kinematic_info.dof_names,
@@ -2402,26 +2410,88 @@ class Simulator(RecordingMixin, ABC):
             domain_randomization.dof_indices,
         )
         num_matching_dofs = len(dof_indices)
-
-        s_lo, s_hi = domain_randomization.stiffness_scale_range
-        stiffness_scales = (
-            torch.rand(self.num_envs, num_matching_dofs) * (s_hi - s_lo) + s_lo
-        )
-        d_lo, d_hi = domain_randomization.damping_scale_range
-        damping_scales = (
-            torch.rand(self.num_envs, num_matching_dofs) * (d_hi - d_lo) + d_lo
-        )
-
-        effort_limit_scales = None
-        if domain_randomization.effort_limit_scale_range is not None:
-            e_lo, e_hi = domain_randomization.effort_limit_scale_range
-            effort_limit_scales = (
-                torch.rand(self.num_envs, num_matching_dofs) * (e_hi - e_lo) + e_lo
-            )
-
-        dof_names = [
+        dof_names_matched = [
             self.robot_config.kinematic_info.dof_names[i] for i in dof_indices
         ]
+
+        # PER-GROUP GAIN-DR (2026-08-04): resolve the joint-group partition and
+        # build per-COLUMN (per-DOF) lo/hi vectors. When no per-group range is
+        # configured these vectors are constant and the sampling expression
+        # below is arithmetically identical to the pre-2026-08-04 scalar form
+        # (same single torch.rand draw, same RNG consumption) -- so an unset
+        # config resumes byte-identically (fork Rule-10).
+        group_stiffness = domain_randomization.group_stiffness_scale_ranges or {}
+        group_damping = domain_randomization.group_damping_scale_ranges or {}
+        group_effort = (
+            getattr(domain_randomization, "group_effort_limit_scale_ranges", None)
+            or {}
+        )
+        constant_zeta = bool(
+            getattr(domain_randomization, "constant_damping_ratio", False)
+        )
+        per_group_active = (
+            bool(group_stiffness) or bool(group_damping) or bool(group_effort)
+        )
+        group_columns: Dict[str, List[int]] = {}
+        if per_group_active:
+            group_patterns = (
+                domain_randomization.group_dof_patterns
+                or H1_2_GAIN_DR_GROUP_PATTERNS
+            )
+            group_columns = resolve_gain_dr_groups(dof_names_matched, group_patterns)
+            print(
+                "[gain-dr] per-group partition: "
+                + " ".join(
+                    f"{group}({len(cols)})="
+                    + str([dof_names_matched[c] for c in cols])
+                    for group, cols in group_columns.items()
+                )
+            )
+
+        s_lo, s_hi = domain_randomization.stiffness_scale_range
+        d_lo, d_hi = domain_randomization.damping_scale_range
+
+        def _sample(default_lo, default_hi, overrides):
+            """Uniform sample honoring per-group bounds.
+
+            With no overrides this is the LITERAL pre-2026-08-04 scalar
+            expression (python-float bounds), not a vectorized equivalent —
+            float32 rounds ``u * (hi_vec - lo_vec)`` differently from
+            ``u * (hi - lo)`` in the last ulp, and Rule-10 wants byte-identity,
+            not near-equality, when the feature is off.
+            """
+            u = torch.rand(self.num_envs, num_matching_dofs)
+            if not overrides:
+                return u * (default_hi - default_lo) + default_lo
+            lo = torch.full((num_matching_dofs,), float(default_lo))
+            hi = torch.full((num_matching_dofs,), float(default_hi))
+            for group, (g_lo, g_hi) in overrides.items():
+                cols = group_columns.get(group, [])
+                if not cols:
+                    continue
+                lo[cols] = float(g_lo)
+                hi[cols] = float(g_hi)
+            return u * (hi - lo) + lo
+
+        stiffness_scales = _sample(s_lo, s_hi, group_stiffness)
+        if constant_zeta:
+            # CONSTANT DAMPING RATIO: zeta = d / (2*sqrt(k*m)); scaling k by s
+            # and d by sqrt(s) leaves zeta unchanged. Derived, NOT sampled --
+            # so no independent damping draw is consumed in this mode.
+            damping_scales = torch.sqrt(stiffness_scales)
+        else:
+            damping_scales = _sample(d_lo, d_hi, group_damping)
+
+        # EFFORT-LIMIT axis (KINESTHETIC TEACHING 2026-08-04): long-existing
+        # field, first wired to env knobs today. A per-group range turns the
+        # axis on even when the global range is None, with (1.0, 1.0) as the
+        # implicit no-op base so unmentioned groups keep nominal limits.
+        effort_limit_scales = None
+        if domain_randomization.effort_limit_scale_range is not None or group_effort:
+            e_lo, e_hi = domain_randomization.effort_limit_scale_range or (1.0, 1.0)
+            effort_limit_scales = _sample(e_lo, e_hi, group_effort)
+
+        dof_names = dof_names_matched
         print(
             f"[gain-dr] enabled: dofs={dof_names} "
             f"stiffness_range=({s_lo}, {s_hi}) sampled mean/min/max="
@@ -2439,13 +2509,75 @@ class Simulator(RecordingMixin, ABC):
             )
         )
 
+        if per_group_active:
+            print(
+                "[gain-dr] per-group sampled bands: "
+                + " ".join(
+                    f"{group}: stiffness="
+                    f"{tuple(group_stiffness.get(group, (s_lo, s_hi)))} "
+                    f"damping="
+                    f"{tuple(group_damping.get(group, (d_lo, d_hi)))} "
+                    f"sampled_k_mean={stiffness_scales[:, cols].mean().item():.4f} "
+                    f"sampled_d_mean={damping_scales[:, cols].mean().item():.4f}"
+                    + (
+                        ""
+                        if effort_limit_scales is None
+                        else (
+                            f" effort="
+                            f"{tuple(group_effort.get(group, (e_lo, e_hi)))} "
+                            f"sampled_e_mean="
+                            f"{effort_limit_scales[:, cols].mean().item():.4f}"
+                        )
+                    )
+                    for group, cols in group_columns.items()
+                    if cols
+                )
+                + f" constant_damping_ratio={constant_zeta}"
+            )
+
         # MARIONETTE coupling (2026-08-04): per-env aggregate gain scale
-        # g_e = geometric mean of the sampled stiffness scales across the
-        # randomized DOFs. Consumed by _perturb_gain_multiplier() to scale
-        # push/wrench perturbations DOWN on soft-plant (low-gain) envs.
-        # Pure extra dict key — backend apply paths read only the four keys
-        # above, so this is byte-identical for every existing consumer.
-        env_gain_scale = torch.exp(torch.log(stiffness_scales).mean(dim=1))
+        # g_e = geometric mean of the sampled stiffness scales. Consumed by
+        # _perturb_gain_multiplier() to scale push/wrench perturbations DOWN
+        # on soft-plant (low-gain) envs. Pure extra dict key — backend apply
+        # paths read only the four keys above, so this is byte-identical for
+        # every existing consumer.
+        #
+        # SOURCE (2026-08-04, per-group era): the multiplier is a statement
+        # about BALANCE AUTHORITY -- how hard the plant can push back against
+        # a shove. With stiff legs and a floppy upper body the all-DOF mean no
+        # longer measures that, so an env with nominal legs would get its
+        # pushes discounted merely because its arms are compliant, teaching
+        # under-perturbed balance. AUTO (env_gain_scale_group=None) therefore
+        # keys off the 'legs' group whenever per-group ranges are active and
+        # falls back to the all-DOF mean otherwise = today's behavior exactly.
+        scale_source = domain_randomization.env_gain_scale_group
+        if scale_source is None:
+            scale_source = (
+                "legs"
+                if (per_group_active and group_columns.get("legs"))
+                else "all"
+            )
+        if scale_source == "all":
+            scale_columns = list(range(num_matching_dofs))
+        else:
+            scale_columns = group_columns.get(scale_source, [])
+            if not scale_columns:
+                raise ValueError(
+                    f"env_gain_scale_group='{scale_source}' selects no "
+                    f"randomized DOFs (resolved groups: "
+                    f"{ {g: len(c) for g, c in group_columns.items()} })."
+                )
+        env_gain_scale = torch.exp(
+            torch.log(stiffness_scales[:, scale_columns]).mean(dim=1)
+        )
+        if per_group_active:
+            print(
+                f"[gain-dr] env_gain_scale source='{scale_source}' over "
+                f"{len(scale_columns)}/{num_matching_dofs} dofs; mean/min/max="
+                f"{env_gain_scale.mean().item():.4f}/"
+                f"{env_gain_scale.min().item():.4f}/"
+                f"{env_gain_scale.max().item():.4f}"
+            )
 
         return {
             "dof_indices": dof_indices,
@@ -2453,6 +2585,8 @@ class Simulator(RecordingMixin, ABC):
             "damping_scales": damping_scales,
             "effort_limit_scales": effort_limit_scales,
             "env_gain_scale": env_gain_scale,
+            "group_columns": group_columns,
+            "env_gain_scale_source": scale_source,
         }
 
     def _process_object_asset_domain_randomization(
