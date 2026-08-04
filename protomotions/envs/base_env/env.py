@@ -1146,6 +1146,11 @@ class BaseEnv:
         # not HOLD-FIX is on.
         self._log_global_wrist_pos_extras(self._current_context)
 
+        # Held-reference joint-quiet observability in rad/s (no-op unless the
+        # hold_joint_quiet reward component is registered). Same reason it sits
+        # outside _log_hold_fix_extras as the stat above.
+        self._log_hold_joint_quiet_extras(self._current_context)
+
         # FALL-PENALTY visibility (2026-07-10 convene follow-up): the per-env
         # raw_r mean dilutes rare falls to 0.000 at TB precision; log the raw
         # firing COUNT per step across the batch so the tag is visibly alive.
@@ -1655,6 +1660,61 @@ class BaseEnv:
         distance = (current - reference).pow(2).sum(dim=-1).sqrt()
         self.extras["global_wrist_pos/err_m"] = distance.mean(dim=-1)
         self.extras["global_wrist_pos/err_max_m"] = distance.max(dim=-1).values
+
+    def _log_hold_joint_quiet_extras(self, ctx):
+        """Held-reference joint velocity in rad/s -- the FIX A go/no-go stat.
+
+        The ``hold_joint_quiet`` reward is a bounded [0, 1] Gaussian-in-velocity,
+        so its own value is a poor progress read (and it is multiplied by the
+        hold mask, so a step with no holds reads 0 for the same reason a step
+        with a perfectly noisy hold does). These stats separate the three
+        things a reviewer actually needs:
+
+        - ``hold_joint_quiet/still_frac``   how much hold time exists at all;
+        - ``hold_joint_quiet/dof_vel_rms``  rms joint speed over the scored DOF
+          set, ALL envs -- the un-gated baseline;
+        - ``hold_joint_quiet/hold_dof_vel_rms`` the same rms restricted to envs
+          the stillness tracker classifies as HELD. This is the number the fix
+          must drive down: measured 0.06-0.15 rad/s (all-DOF, v55/v56 pause
+          windows). It is a hold-count-weighted batch scalar broadcast to
+          [num_envs] so the agent's mean-over-envs aggregator returns it
+          unchanged; it reads 0.0 when no env is in a hold, which
+          ``still_frac`` disambiguates.
+
+        Written ONLY when the reward component is registered, so unset configs
+        emit no new keys (Rule 10). Values are Tensors (a python float is
+        silently dropped by the agent's extras aggregator) and avoid the
+        ``raw/`` prefix (which the aggregator skips). Both TB surfaces
+        enumerate ``extras`` dynamically, so no hardcoded stat list needs a new
+        entry for these to appear.
+        """
+        component = (self.config.reward_components or {}).get("hold_joint_quiet")
+        if component is None:
+            return
+        dof_vel = getattr(getattr(ctx, "current", None), "dof_vel", None)
+        if dof_vel is None:
+            return
+        from protomotions.envs.base_env.hold_fix import select_hold_quiet_dofs
+
+        dof_vel = select_hold_quiet_dofs(
+            dof_vel, component.static_params.get("dof_indices")
+        )
+        mean_sq = (dof_vel * dof_vel).mean(dim=-1)
+        self.extras["hold_joint_quiet/dof_vel_rms"] = mean_sq.sqrt()
+
+        still = getattr(ctx, "reference_still_mask", None)
+        if still is None:
+            still = torch.zeros_like(mean_sq)
+        else:
+            still = still.to(mean_sq.dtype)
+        self.extras["hold_joint_quiet/still_frac"] = still
+        denom = still.sum()
+        hold_rms = (
+            ((mean_sq * still).sum() / denom).sqrt()
+            if denom > 0
+            else torch.zeros((), dtype=mean_sq.dtype, device=mean_sq.device)
+        )
+        self.extras["hold_joint_quiet/hold_dof_vel_rms"] = hold_rms.expand_as(mean_sq)
 
     def _log_delay_dr_extras(self):
         """DELAY-DR conviction instrumentation (per delay-bin outcome stats).

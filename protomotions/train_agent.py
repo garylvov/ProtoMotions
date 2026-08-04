@@ -779,6 +779,17 @@ def main():
             # retune an already-registered one.
             ("static_hold_vel", "PM_STATIC_HOLD_VEL_WEIGHT", _SP, "weight"),
             ("static_hold_vel", "PM_STATIC_HOLD_VEL_REF_GATE", _SP, "ref_speed_gate"),
+            # HELD-REFERENCE JOINT-QUIET (FIX A, 2026-08-04 pause forensics):
+            # exp(-vel_scale * mean_j dof_vel^2) gated on the HOLD-FIX
+            # reference_still_mask. Prices the ~1.19 Hz whole-body postural
+            # limit cycle that every existing term is blind to (tracking
+            # Gaussians are flat below ~3 cm; the one-step action taxes see
+            # deltas ~7x smaller than the amplitude at 1.2 Hz). These rows
+            # RETUNE an already-registered component; a resume that is
+            # ACTIVATING it for the first time is served by the injection pass
+            # below (RESUME_INJECTABLE_COMPONENTS), which reads the same knobs.
+            ("hold_joint_quiet", "PM_HOLD_JOINT_QUIET_WEIGHT", _SP, "weight"),
+            ("hold_joint_quiet", "PM_HOLD_JOINT_QUIET_VEL_SCALE", _SP, "vel_scale"),
             # DOF-limit soft-margin proximity (2026-07-29, knees-at-full-
             # extension fix): frozen configs were pickled WITHOUT these keys;
             # the kernel defaults (soft_margin_frac=0.0) keep them byte-
@@ -793,11 +804,29 @@ def main():
                 # M4 (2026-07-27): an explicitly-set gate var whose component
                 # is absent from the frozen config used to be dropped
                 # SILENTLY -- loudly flag the no-op instead.
-                log.warning(
-                    f"RESUME override SKIPPED: {_var}={_val} is set but reward "
-                    f"component '{_comp}' is not in the frozen config "
-                    f"(env var has NO effect on this resume)"
+                # 2026-08-04: distinguish a genuine no-op from a component the
+                # LATER injection pass is about to create. Claiming "NO effect"
+                # for an injectable component's knobs on its first activating
+                # resume would be a lie in the resume log, which is the only
+                # artifact anyone reads to confirm what the reward became.
+                from protomotions.envs.component_factories import (
+                    RESUME_INJECTABLE_COMPONENTS as _INJECTABLE,
                 )
+
+                if _comp in _INJECTABLE:
+                    log.warning(
+                        f"RESUME override DEFERRED: {_var}={_val} is set and "
+                        f"reward component '{_comp}' is absent from the frozen "
+                        f"config -- the RESUME INJECT pass below will create it "
+                        f"from the same env knobs (watch for 'RESUME INJECT "
+                        f"component {_comp}')"
+                    )
+                else:
+                    log.warning(
+                        f"RESUME override SKIPPED: {_var}={_val} is set but reward "
+                        f"component '{_comp}' is not in the frozen config "
+                        f"(env var has NO effect on this resume)"
+                    )
                 continue
             # min_swing_steps / streak_cap / streak_decay_steps are INT
             # attributes on the compute_func (control-step / event counts,
@@ -989,7 +1018,17 @@ def main():
             resume_inject_reward_components,
         )
 
-        if resume_inject_reward_components(_rc, log_fn=log.warning):
+        # dof_names comes from the FROZEN robot config so a resume can resolve
+        # a PM_HOLD_JOINT_QUIET_JOINTS subset against the same DOF ordering the
+        # run was built with. Absent/empty => a requested subset is a hard
+        # error inside the builder, never a silent all-DOF fallback.
+        if resume_inject_reward_components(
+            _rc,
+            log_fn=log.warning,
+            dof_names=getattr(
+                getattr(robot_config, "kinematic_info", None), "dof_names", None
+            ),
+        ):
             # _rc may be a fresh dict when the frozen config had None.
             env_config.reward_components = _rc
 

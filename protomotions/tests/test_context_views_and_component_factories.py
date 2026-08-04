@@ -807,3 +807,460 @@ def test_global_wrist_pos_stat_writer_emits_metres_only_when_registered():
         env2, SimpleNamespace(current=ctx.current, mimic=None)
     )
     assert env2.extras == {}
+
+
+# =============================================================================
+# HOLD JOINT QUIET -- FIX A of the 2026-08-04 pause forensics
+# =============================================================================
+
+#: The H1-2 DOF ordering, abbreviated to the shape the resolver cares about.
+_H1_2_DOF_NAMES = [
+    "left_hip_yaw_joint", "left_hip_pitch_joint", "left_hip_roll_joint",
+    "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint",
+    "right_hip_yaw_joint", "right_hip_pitch_joint", "right_hip_roll_joint",
+    "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint",
+    "torso_joint",
+    "left_shoulder_pitch_joint", "left_shoulder_roll_joint",
+    "left_shoulder_yaw_joint", "left_elbow_joint",
+    "left_wrist_roll_joint", "left_wrist_pitch_joint", "left_wrist_yaw_joint",
+    "right_shoulder_pitch_joint", "right_shoulder_roll_joint",
+    "right_shoulder_yaw_joint", "right_elbow_joint",
+    "right_wrist_roll_joint", "right_wrist_pitch_joint",
+    "right_wrist_yaw_joint",
+]
+
+
+def test_hold_joint_quiet_factory_binds_the_hold_balance_gate_and_validates():
+    """FIX A must be gated EXACTLY like hold_balance, and reject bad knobs.
+
+    The whole safety argument for the term ("bounded [0,1], zero outside holds,
+    no actuation term, cannot pay for rigidity") rests on the bindings, so they
+    are asserted rather than assumed.
+    """
+    from protomotions.envs.base_env.hold_fix import compute_hold_joint_quiet
+
+    comp = factories.hold_joint_quiet_factory(weight=0.25)
+    assert comp.compute_func is compute_hold_joint_quiet
+
+    # Same gate as hold_balance: reference_still_mask + grace zeroing.
+    balance = factories.hold_balance_bonus_factory(
+        weight=0.25,
+        left_foot_body_ids=torch.tensor([0]),
+        right_foot_body_ids=torch.tensor([1]),
+    )
+    assert (
+        _bindings(comp)["reference_still_mask"]
+        == _bindings(balance)["reference_still_mask"]
+        == "reference_still_mask"
+    )
+    assert _params(comp)["zero_during_grace_period"] is True
+    assert _params(balance)["zero_during_grace_period"] is True
+
+    # It reads JOINT VELOCITY -- the observable the limit cycle lives in --
+    # and nothing action-shaped (no actions => it cannot pay for rigidity).
+    assert _bindings(comp)["dof_vel"] == "current.dof_vel"
+    assert set(_bindings(comp)) == {"reference_still_mask", "dof_vel"}
+
+    # RULE 10: an all-DOF component carries NO dof_indices key at all.
+    assert "dof_indices" not in _params(comp)
+    assert _params(comp)["weight"] == 0.25
+    assert _params(comp)["vel_scale"] == 25.0
+
+    # A subset records the key, and a plain list is normalized to Long so the
+    # kernel and the stat writer never see two different shapes.
+    for spec in (torch.tensor([3, 9]), [3, 9], (3, 9)):
+        sub = factories.hold_joint_quiet_factory(weight=0.25, dof_indices=spec)
+        idx = _params(sub)["dof_indices"]
+        assert isinstance(idx, torch.Tensor) and idx.dtype == torch.long
+        assert torch.equal(idx, torch.tensor([3, 9]))
+
+    # Validation: weight >= 0, vel_scale > 0, both at BUILD time.
+    for kwargs, needle in (
+        ({"weight": -0.1}, "weight must be >= 0"),
+        ({"weight": 0.25, "vel_scale": 0.0}, "vel_scale must be > 0"),
+        ({"weight": 0.25, "vel_scale": -25.0}, "vel_scale must be > 0"),
+    ):
+        try:
+            factories.hold_joint_quiet_factory(**kwargs)
+        except ValueError as exc:
+            assert needle in str(exc)
+        else:
+            raise AssertionError(f"expected ValueError for {kwargs}")
+
+
+def test_hold_joint_quiet_kernel_math_gate_and_subset():
+    """Kernel value vs hand-computed expectation, at the MEASURED magnitudes."""
+    import math
+
+    from protomotions.envs.base_env.hold_fix import compute_hold_joint_quiet
+
+    # env0 held, env1 moving; 4 DOFs.
+    dof_vel = torch.tensor(
+        [[0.1, 0.2, 0.3, 0.4], [1.0, 1.0, 1.0, 1.0]], dtype=torch.float32
+    )
+    still = torch.tensor([True, False])
+
+    got = compute_hold_joint_quiet(still, dof_vel, vel_scale=25.0)
+    mean_sq = (0.01 + 0.04 + 0.09 + 0.16) / 4.0  # 0.075
+    assert math.isclose(float(got[0]), math.exp(-25.0 * mean_sq), rel_tol=1e-6)
+    # GATE: a moving reference earns exactly zero, never a partial payout.
+    assert float(got[1]) == 0.0
+
+    # Zero reference velocity in a hold pays the full bounded maximum of 1.
+    quiet = compute_hold_joint_quiet(still, torch.zeros(2, 4), vel_scale=25.0)
+    assert torch.allclose(quiet, torch.tensor([1.0, 0.0]))
+
+    # No mask source => zeros (same convention as compute_hold_balance_bonus).
+    assert torch.equal(
+        compute_hold_joint_quiet(None, dof_vel), torch.zeros(2)
+    )
+
+    # SUBSET: scoring only DOFs 0,1 changes the mean-square accordingly.
+    sub = compute_hold_joint_quiet(
+        still, dof_vel, dof_indices=torch.tensor([0, 1]), vel_scale=25.0
+    )
+    assert math.isclose(
+        float(sub[0]), math.exp(-25.0 * (0.01 + 0.04) / 2.0), rel_tol=1e-6
+    )
+
+    # SIZING GUARD (the numbers the default c=25 was chosen against). Measured
+    # pause-window rms joint speed, all-DOF (knee-extrapolated): 0.118 rad/s
+    # (v55) and 0.145 (v56) mean, 0.064 / 0.070 median. c=25 must leave a LIVE
+    # gradient there -- between 5% and 50% of the term -- not the 1e-5 dead
+    # zone every existing term sits in.
+    for rms in (0.064, 0.070, 0.118, 0.145):
+        v = torch.full((1, 27), rms)
+        value = float(compute_hold_joint_quiet(torch.tensor([True]), v, vel_scale=25.0))
+        assert 0.50 < value < 0.95, (rms, value)
+    # ... while an arms-only set at the SAME c=25 costs only ~5.6% (measured
+    # arms rms 0.048 rad/s), i.e. 3-5x weaker -- which is why a narrower joint
+    # set must raise c, and why the all-DOF default is the recommended one.
+    arms_only = float(
+        compute_hold_joint_quiet(
+            torch.tensor([True]), torch.full((1, 14), 0.048), vel_scale=25.0
+        )
+    )
+    assert 0.93 < arms_only < 0.96
+    assert (
+        float(
+            compute_hold_joint_quiet(
+                torch.tensor([True]), torch.full((1, 14), 0.048), vel_scale=150.0
+            )
+        )
+        < 0.75
+    )
+
+
+def test_hold_quiet_joint_set_resolution_and_loud_failure():
+    """Joint-set resolution: groups, names, ordering, and hard unknown-token."""
+    from protomotions.envs.base_env import hold_fix
+
+    # RULE 10: "all"/unset => None (no dof_indices key downstream), not arange.
+    for spec in (None, "", "   ", "all", "ALL"):
+        indices, names = hold_fix.resolve_hold_quiet_dof_indices(
+            _H1_2_DOF_NAMES, spec
+        )
+        assert indices is None
+        assert names == _H1_2_DOF_NAMES
+
+    # Group tokens resolve to the H1-2 partition the gain-DR table uses.
+    legs, leg_names = hold_fix.resolve_hold_quiet_dof_indices(
+        _H1_2_DOF_NAMES, "legs"
+    )
+    assert len(leg_names) == 12 and all("hip" in n or "knee" in n or "ankle" in n
+                                        for n in leg_names)
+    assert torch.equal(legs, torch.arange(12))
+
+    arms, arm_names = hold_fix.resolve_hold_quiet_dof_indices(
+        _H1_2_DOF_NAMES, "arms"
+    )
+    assert len(arm_names) == 14
+    wrists, wrist_names = hold_fix.resolve_hold_quiet_dof_indices(
+        _H1_2_DOF_NAMES, "wrists"
+    )
+    assert len(wrist_names) == 6
+    # 'wrists' is a strict subset of 'arms' -- the reason this table is
+    # separate from the strict-partition gain-DR one.
+    assert set(wrist_names) < set(arm_names)
+
+    # Mixed groups + exact names, deduplicated and returned in DOF order.
+    mixed, mixed_names = hold_fix.resolve_hold_quiet_dof_indices(
+        _H1_2_DOF_NAMES, "arms,wrists,torso_joint"
+    )
+    assert mixed_names == [_H1_2_DOF_NAMES[12]] + arm_names
+    assert torch.equal(mixed, torch.tensor(sorted(mixed.tolist())))
+    assert len(set(mixed.tolist())) == len(mixed)
+
+    # LOUD failure on an unknown token, listing what IS valid.
+    try:
+        hold_fix.resolve_hold_quiet_dof_indices(_H1_2_DOF_NAMES, "leggs")
+    except ValueError as exc:
+        assert "leggs" in str(exc) and "left_knee_joint" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for an unknown joint token")
+
+    # A typo'd exact DOF name is equally loud (never silently dropped).
+    try:
+        hold_fix.resolve_hold_quiet_dof_indices(
+            _H1_2_DOF_NAMES, "legs,left_knee_joynt"
+        )
+    except ValueError as exc:
+        assert "left_knee_joynt" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for a misspelled DOF name")
+
+    # 'all' mixed with other tokens is ambiguous => hard error.
+    try:
+        hold_fix.resolve_hold_quiet_dof_indices(_H1_2_DOF_NAMES, "all,arms")
+    except ValueError as exc:
+        assert "'all' must be used alone" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for 'all' mixed with tokens")
+
+    # A group that matches NO dof on this robot is a hard error, not an empty
+    # (and therefore silently NaN-producing) index set.
+    try:
+        hold_fix.resolve_hold_quiet_dof_indices(["a_joint", "b_joint"], "wrists")
+    except ValueError as exc:
+        assert "matched NO DOF" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for a group matching no DOF")
+
+
+def test_hold_joint_quiet_stat_writer_emits_rad_per_s_only_when_registered():
+    """READER/WRITER: the go/no-go stat must be a Tensor, non-``raw/``, gated."""
+    import math
+
+    from protomotions.envs.base_env.env import BaseEnv
+
+    dof_vel = torch.tensor(
+        [[0.1, 0.2, 0.3, 0.4], [1.0, 1.0, 1.0, 1.0]], dtype=torch.float32
+    )
+    ctx = SimpleNamespace(
+        current=SimpleNamespace(dof_vel=dof_vel),
+        reference_still_mask=torch.tensor([True, False]),
+    )
+
+    # --- component ABSENT => no keys at all (Rule 10).
+    quiet = SimpleNamespace(config=SimpleNamespace(reward_components={}), extras={})
+    BaseEnv._log_hold_joint_quiet_extras(quiet, ctx)
+    assert quiet.extras == {}
+
+    # --- registered => three Tensor stats, none under raw/.
+    comp = factories.hold_joint_quiet_factory(weight=0.25)
+    env = SimpleNamespace(
+        config=SimpleNamespace(reward_components={"hold_joint_quiet": comp}),
+        extras={},
+    )
+    BaseEnv._log_hold_joint_quiet_extras(env, ctx)
+    assert set(env.extras) == {
+        "hold_joint_quiet/dof_vel_rms",
+        "hold_joint_quiet/still_frac",
+        "hold_joint_quiet/hold_dof_vel_rms",
+    }
+    for key, value in env.extras.items():
+        assert isinstance(value, torch.Tensor), f"{key} must be a Tensor"
+        assert not key.startswith("raw/"), f"{key} would be skipped by the agent"
+        assert value.shape == (2,)
+
+    assert math.isclose(
+        float(env.extras["hold_joint_quiet/dof_vel_rms"][0]),
+        math.sqrt(0.075),
+        rel_tol=1e-6,
+    )
+    # Only env0 is held, so the hold-restricted rms is env0's rms exactly, and
+    # it is broadcast so the agent's mean-over-envs returns it unchanged.
+    assert torch.allclose(
+        env.extras["hold_joint_quiet/hold_dof_vel_rms"],
+        torch.full((2,), math.sqrt(0.075)),
+        atol=1e-6,
+    )
+    assert torch.allclose(
+        env.extras["hold_joint_quiet/still_frac"], torch.tensor([1.0, 0.0])
+    )
+
+    # --- no env is in a hold => hold rms 0.0, disambiguated by still_frac 0.
+    env2 = SimpleNamespace(
+        config=SimpleNamespace(reward_components={"hold_joint_quiet": comp}),
+        extras={},
+    )
+    BaseEnv._log_hold_joint_quiet_extras(
+        env2,
+        SimpleNamespace(
+            current=SimpleNamespace(dof_vel=dof_vel),
+            reference_still_mask=torch.tensor([False, False]),
+        ),
+    )
+    assert float(env2.extras["hold_joint_quiet/hold_dof_vel_rms"][0]) == 0.0
+    assert float(env2.extras["hold_joint_quiet/still_frac"].sum()) == 0.0
+
+    # --- a SUBSET component reports the rms over its own joint set only.
+    sub_comp = factories.hold_joint_quiet_factory(
+        weight=0.25, dof_indices=torch.tensor([0, 1])
+    )
+    env3 = SimpleNamespace(
+        config=SimpleNamespace(reward_components={"hold_joint_quiet": sub_comp}),
+        extras={},
+    )
+    BaseEnv._log_hold_joint_quiet_extras(env3, ctx)
+    assert math.isclose(
+        float(env3.extras["hold_joint_quiet/dof_vel_rms"][0]),
+        math.sqrt((0.01 + 0.04) / 2.0),
+        rel_tol=1e-6,
+    )
+
+
+def test_resume_inject_hold_joint_quiet_is_byte_identical_when_unset():
+    """RULE 10 on the resume path: the knob unset changes NOTHING."""
+    frozen = {"some_existing": factories.pow_rew_factory(weight=-1e-4)}
+    before = dict(frozen["some_existing"].static_params)
+    lines = []
+
+    # Neither the weight knob nor its companions may do anything on their own.
+    for env in (
+        {},
+        {"PM_HOLD_JOINT_QUIET_WEIGHT": ""},
+        {"PM_HOLD_JOINT_QUIET_VEL_SCALE": "150"},
+        {"PM_HOLD_JOINT_QUIET_JOINTS": "arms"},
+    ):
+        assert (
+            factories.resume_inject_reward_components(
+                frozen, env=env, log_fn=lines.append
+            )
+            is False
+        )
+    assert set(frozen) == {"some_existing"}
+    assert frozen["some_existing"].static_params == before
+    assert lines == []
+
+
+def test_resume_inject_hold_joint_quiet_activates_patches_and_fails_loud():
+    """First resume INJECTS; later resumes PATCH; a subset needs dof_names."""
+    # --- absent + weight set => injected with the gate bindings intact.
+    frozen = {}
+    lines = []
+    assert factories.resume_inject_reward_components(
+        frozen,
+        env={"PM_HOLD_JOINT_QUIET_WEIGHT": "0.25"},
+        log_fn=lines.append,
+    )
+    comp = frozen["hold_joint_quiet"]
+    assert _params(comp)["weight"] == 0.25
+    assert _params(comp)["vel_scale"] == 25.0  # default when the knob is unset
+    assert "dof_indices" not in _params(comp)  # all-DOF default
+    assert _bindings(comp)["reference_still_mask"] == "reference_still_mask"
+    assert any(
+        l.startswith("RESUME INJECT component hold_joint_quiet weight=0.25")
+        for l in lines
+    )
+
+    # --- second resume: patch weight AND vel_scale, never re-inject.
+    lines2 = []
+    assert factories.resume_inject_reward_components(
+        frozen,
+        env={
+            "PM_HOLD_JOINT_QUIET_WEIGHT": "0.15",
+            "PM_HOLD_JOINT_QUIET_VEL_SCALE": "150",
+        },
+        log_fn=lines2.append,
+    )
+    assert _params(frozen["hold_joint_quiet"])["weight"] == 0.15
+    assert _params(frozen["hold_joint_quiet"])["vel_scale"] == 150.0
+    assert [l for l in lines2 if "RESUME INJECT" in l] == []
+    assert any("RESUME override hold_joint_quiet.weight = 0.15" in l for l in lines2)
+    assert any(
+        "RESUME override hold_joint_quiet.vel_scale = 150.0" in l for l in lines2
+    )
+
+    # --- an unchanged re-run is silent (no spurious churn in the resume log).
+    lines3 = []
+    assert (
+        factories.resume_inject_reward_components(
+            frozen,
+            env={
+                "PM_HOLD_JOINT_QUIET_WEIGHT": "0.15",
+                "PM_HOLD_JOINT_QUIET_VEL_SCALE": "150",
+            },
+            log_fn=lines3.append,
+        )
+        is False
+    )
+    assert lines3 == []
+
+    # --- a joint SUBSET resolves against the frozen DOF names.
+    frozen2 = {}
+    factories.resume_inject_reward_components(
+        frozen2,
+        env={
+            "PM_HOLD_JOINT_QUIET_WEIGHT": "0.25",
+            "PM_HOLD_JOINT_QUIET_JOINTS": "legs,waist",
+        },
+        log_fn=lambda _l: None,
+        dof_names=_H1_2_DOF_NAMES,
+    )
+    assert torch.equal(
+        _params(frozen2["hold_joint_quiet"])["dof_indices"],
+        torch.arange(13),
+    )
+
+    # --- a subset requested WITHOUT dof_names is a hard error, never a silent
+    # fallback to all-DOF (which would train a different reward than asked).
+    try:
+        factories.resume_inject_reward_components(
+            {},
+            env={
+                "PM_HOLD_JOINT_QUIET_WEIGHT": "0.25",
+                "PM_HOLD_JOINT_QUIET_JOINTS": "arms",
+            },
+            log_fn=lambda _l: None,
+        )
+    except ValueError as exc:
+        assert "no DOF name list" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for a subset without dof_names")
+
+    # --- the pre-existing injectable specs are untouched by the generalized
+    # extra-knob table (contact_match's threshold still rides its own var).
+    frozen3 = {}
+    factories.resume_inject_reward_components(
+        frozen3,
+        env={
+            "PM_CONTACT_MATCH_WEIGHT": "0.1",
+            "PM_CONTACT_MATCH_REF_THRESHOLD": "0.6",
+        },
+        log_fn=lambda _l: None,
+    )
+    assert _params(frozen3["contact_match"])["ref_contact_threshold"] == 0.6
+
+
+def test_train_agent_resume_rows_and_deferral_cover_hold_joint_quiet():
+    """READER/WRITER LAW: fresh-build gate <-> resume row <-> injectable set.
+
+    The re-apply loop runs BEFORE the injection pass, so an injectable
+    component's knobs must NOT be reported as "NO effect" on the resume that is
+    activating them -- the resume log is the only artifact anyone reads to
+    confirm what the reward became.
+    """
+    import pathlib
+
+    source = pathlib.Path(
+        __file__
+    ).resolve().parents[1].joinpath("train_agent.py").read_text()
+
+    for comp, var, key in (
+        ("hold_joint_quiet", "PM_HOLD_JOINT_QUIET_WEIGHT", "weight"),
+        ("hold_joint_quiet", "PM_HOLD_JOINT_QUIET_VEL_SCALE", "vel_scale"),
+    ):
+        assert f'"{var}"' in source, f"missing resume row for {var}"
+        assert f'"{comp}"' in source, f"missing component {comp}"
+        assert f'"{key}"' in source, f"missing static_params key {key}"
+
+    # The deferral branch and the dof_names plumbing must both be wired.
+    assert "RESUME_INJECTABLE_COMPONENTS" in source
+    assert "RESUME override DEFERRED" in source
+    assert "dof_names=" in source
+
+    # Every injectable component is spelled the same on both sides.
+    assert "hold_joint_quiet" in factories.RESUME_INJECTABLE_COMPONENTS
+    for name in factories.RESUME_INJECTABLE_COMPONENTS:
+        assert isinstance(name, str)

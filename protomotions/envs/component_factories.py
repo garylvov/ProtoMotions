@@ -708,10 +708,25 @@ def validate_dual_sigma_components(reward_components, log_fn):
     return active
 
 
+#: Components ``resume_inject_reward_components`` can CREATE on a resume when
+#: the frozen config lacks them. Exported so ``train_agent.py``'s per-key
+#: re-apply loop can tell "this knob is a genuine no-op" apart from "this
+#: knob's component is about to be injected by the later pass" -- without it
+#: the loop's M4 SKIP warning would lie about every knob of an injectable
+#: component on its FIRST activating resume.
+RESUME_INJECTABLE_COMPONENTS = (
+    "contact_match",
+    "liftoff_penalty",
+    "action_smooth_lme",
+    "hold_joint_quiet",
+)
+
+
 def resume_inject_reward_components(
     reward_components,
     env=None,
     log_fn=print,
+    dof_names=None,
 ) -> bool:
     """v5.4 resume-time COMPONENT INJECTION for env-gated reward components.
 
@@ -742,6 +757,13 @@ def resume_inject_reward_components(
     - ``action_smooth_lme`` <- PM_ACTION_SMOOTH_LME_WEIGHT
                               (graced LME arm-flail tax; grace mask zeroes it
                               during push/wrench recovery)
+    - ``hold_joint_quiet`` <- PM_HOLD_JOINT_QUIET_WEIGHT
+                              (+ PM_HOLD_JOINT_QUIET_VEL_SCALE, default 25.0;
+                              + PM_HOLD_JOINT_QUIET_JOINTS, default all DOFs.
+                              FIX A of the 2026-08-04 pause forensics: prices
+                              joint VELOCITY during held references, the
+                              ~1.19 Hz postural limit cycle no existing term
+                              can see)
 
     NOTE: hold_balance / root_gain are NOT here by design -- the HOLD-FIX
     boot path (``setup_hold_fix_components``) already reads
@@ -755,6 +777,10 @@ def resume_inject_reward_components(
         reward_components: The (frozen) reward components dict to mutate.
         env: Environment mapping (defaults to ``os.environ``).
         log_fn: Sink for the loud proof lines (``log.warning`` on resume).
+        dof_names: The robot's ordered DOF name list (from the FROZEN
+            ``robot_config.kinematic_info``). Required only to resolve a
+            ``PM_HOLD_JOINT_QUIET_JOINTS`` SUBSET; a subset requested without
+            it is a hard error, never a silent all-DOF fallback.
 
     Returns:
         True if anything was injected or patched.
@@ -784,17 +810,50 @@ def resume_inject_reward_components(
     def _build_action_smooth_lme(weight, env):
         return graced_action_smoothness_lme_factory(weight=weight)
 
+    def _build_hold_joint_quiet(weight, env):
+        from protomotions.envs.base_env.hold_fix import (
+            resolve_hold_quiet_dof_indices,
+        )
+
+        joints_spec = env.get("PM_HOLD_JOINT_QUIET_JOINTS")
+        indices = None
+        if joints_spec and joints_spec.strip().lower() != "all":
+            if not dof_names:
+                raise ValueError(
+                    f"PM_HOLD_JOINT_QUIET_JOINTS={joints_spec!r} asks for a "
+                    "joint SUBSET, but the resume path has no DOF name list to "
+                    "resolve it against (robot_config.kinematic_info.dof_names "
+                    "was empty/absent). Refusing to silently fall back to "
+                    "all-DOF: either set PM_HOLD_JOINT_QUIET_JOINTS=all, or "
+                    "start the run fresh so the teacher build gate resolves it."
+                )
+            indices, _ = resolve_hold_quiet_dof_indices(list(dof_names), joints_spec)
+        return hold_joint_quiet_factory(
+            weight=weight,
+            vel_scale=float(env.get("PM_HOLD_JOINT_QUIET_VEL_SCALE") or 25.0),
+            dof_indices=indices,
+        )
+
+    # (component name, weight env var, {extra env var: static_param key}, builder)
     specs = (
         ("contact_match", "PM_CONTACT_MATCH_WEIGHT",
-         "PM_CONTACT_MATCH_REF_THRESHOLD", _build_contact_match),
+         {"PM_CONTACT_MATCH_REF_THRESHOLD": "ref_contact_threshold"},
+         _build_contact_match),
         ("liftoff_penalty", "PM_LIFTOFF_PENALTY_WEIGHT",
-         "PM_LIFTOFF_REF_THRESHOLD", _build_liftoff),
+         {"PM_LIFTOFF_REF_THRESHOLD": "ref_contact_threshold"},
+         _build_liftoff),
         ("action_smooth_lme", "PM_ACTION_SMOOTH_LME_WEIGHT",
          None, _build_action_smooth_lme),
+        # FIX A (2026-08-04 pause forensics): joint-VELOCITY quiet bonus during
+        # held references -- the ~1.19 Hz postural limit cycle is invisible to
+        # every existing term. See hold_fix.compute_hold_joint_quiet.
+        ("hold_joint_quiet", "PM_HOLD_JOINT_QUIET_WEIGHT",
+         {"PM_HOLD_JOINT_QUIET_VEL_SCALE": "vel_scale"},
+         _build_hold_joint_quiet),
     )
 
     changed = False
-    for name, weight_var, thresh_var, builder in specs:
+    for name, weight_var, extra_vars, builder in specs:
         weight_val = env.get(weight_var)
         if not weight_val:
             continue
@@ -810,15 +869,16 @@ def resume_inject_reward_components(
                     f"(was {old_weight}, from {weight_var}; already present, "
                     f"patched not injected)"
                 )
-            thresh_val = env.get(thresh_var) if thresh_var else None
-            if thresh_val and sp.get("ref_contact_threshold") != float(thresh_val):
-                old_t = sp.get("ref_contact_threshold")
-                sp["ref_contact_threshold"] = float(thresh_val)
-                changed = True
-                log_fn(
-                    f"RESUME override {name}.ref_contact_threshold = "
-                    f"{float(thresh_val)} (was {old_t}, from {thresh_var})"
-                )
+            for extra_var, extra_key in (extra_vars or {}).items():
+                extra_val = env.get(extra_var)
+                if extra_val and sp.get(extra_key) != float(extra_val):
+                    old_t = sp.get(extra_key)
+                    sp[extra_key] = float(extra_val)
+                    changed = True
+                    log_fn(
+                        f"RESUME override {name}.{extra_key} = "
+                        f"{float(extra_val)} (was {old_t}, from {extra_var})"
+                    )
             continue
         component = builder(weight, env)
         reward_components[name] = component
@@ -1940,6 +2000,83 @@ def hold_balance_bonus_factory(
     )
 
 
+def hold_joint_quiet_factory(
+    weight: float = 0.0,
+    vel_scale: float = 25.0,
+    dof_indices=None,
+    zero_during_grace_period: bool = True,
+) -> MdpComponent:
+    """Factory for the held-reference JOINT-VELOCITY quiet bonus (dormant).
+
+    FIX A of the 2026-08-04 pause forensics (``PAUSE_EVAL.md``). Gated exactly
+    like ``hold_balance_bonus_factory`` -- same ``EnvContext.reference_still_mask``,
+    same ``zero_during_grace_period=True`` -- but it scores JOINT VELOCITY
+    instead of pelvis tilt/speed, which is the observable the measured ~1.19 Hz
+    whole-body postural limit cycle actually lives in. Like ``hold_balance`` it
+    contains NO actuation term, so it can never pay for rigidity or for a
+    frozen network output; it pays for the ROBOT being quiet.
+
+    See ``protomotions.envs.base_env.hold_fix.compute_hold_joint_quiet`` for
+    the dead-zone analysis this closes and the velocity-vs-position argument.
+
+    Args:
+        weight: Reward weight (default 0.0 = dormant; POSITIVE to enable --
+            this is a bounded [0, 1] BONUS, not a penalty).
+        vel_scale: Positive coefficient ``c`` in ``exp(-c * mean_j v^2)``,
+            units (rad/s)^-2. Default 25.0 (e-folding rms 0.20 rad/s), sized
+            for the ALL-DOF joint set.
+        dof_indices: Optional Long tensor / list of DOF columns to score.
+            None (default) = all DOFs, and the key stays OUT of
+            ``static_params`` so an all-DOF component pickles without it.
+        zero_during_grace_period: Zero the bonus during the post-reset /
+            post-perturbation grace period (default True) -- a shoved robot
+            must be free to move to recover without losing hold income.
+
+    Returns:
+        MdpComponent configured for the held-reference joint-quiet bonus.
+
+    Raises:
+        ValueError: on a negative weight or a non-positive ``vel_scale``.
+    """
+    import torch
+
+    from protomotions.envs.base_env.hold_fix import compute_hold_joint_quiet
+
+    if weight < 0.0:
+        raise ValueError(
+            f"hold_joint_quiet weight must be >= 0 (got {weight}); it is a "
+            "bounded [0,1] quiet-stance BONUS -- a negative weight would PAY "
+            "the policy to oscillate during holds."
+        )
+    if vel_scale <= 0.0:
+        raise ValueError(
+            f"hold_joint_quiet vel_scale must be > 0 (got {vel_scale}); it is "
+            "the coefficient c in exp(-c * mean_j v^2), so c <= 0 turns the "
+            "kernel into a constant (c=0) or an unbounded blow-up (c<0)."
+        )
+
+    static_params: Dict[str, Any] = {
+        "weight": weight,
+        "vel_scale": float(vel_scale),
+        "zero_during_grace_period": zero_during_grace_period,
+    }
+    if dof_indices is not None:
+        # Normalize a list/tuple to a Long tensor here so the kernel and the
+        # stat writer never have to care which shape the caller used.
+        static_params["dof_indices"] = torch.as_tensor(
+            dof_indices, dtype=torch.long
+        )
+
+    return MdpComponent(
+        compute_func=compute_hold_joint_quiet,
+        dynamic_vars={
+            "reference_still_mask": EnvContext.reference_still_mask,
+            "dof_vel": EnvContext.current.dof_vel,
+        },
+        static_params=static_params,
+    )
+
+
 def root_gain_rew_factory(weight: float = 0.0) -> MdpComponent:
     """Factory for the ROOT-GAIN displacement-gain reward (dormant).
 
@@ -3052,6 +3189,7 @@ __all__ = [
     "fall_penalty_factory",
     "drift_penalty_factory",
     "hold_balance_bonus_factory",
+    "hold_joint_quiet_factory",
     "wrist_dir_rew_factory",
     "root_gain_rew_factory",
     "mimic_tracking_rewards_factory",

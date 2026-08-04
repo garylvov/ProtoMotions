@@ -629,6 +629,199 @@ def compute_hold_balance_bonus(
 
 
 # =============================================================================
+# Joint-quiet bonus kernel (FIX A of the 2026-08-04 pause forensics)
+# =============================================================================
+
+
+#: Regex groups for ``PM_HOLD_JOINT_QUIET_JOINTS``. Deliberately a SEPARATE
+#: table from ``H1_2_GAIN_DR_GROUP_PATTERNS`` (simulator/base_simulator/
+#: config.py): that one is a strict PARTITION used to split gain-DR sample
+#: columns and fails loud on a double-match, so it cannot host the overlapping
+#: convenience token ``wrists`` (a subset of ``arms``) this knob wants. The
+#: ``legs``/``waist``/``arms`` patterns are kept byte-identical to it on
+#: purpose so the two vocabularies read the same to a human.
+HOLD_QUIET_JOINT_GROUPS: Dict[str, List[str]] = {
+    "legs": [
+        ".*_hip_(yaw|pitch|roll)_joint",
+        ".*_knee_joint",
+        ".*_ankle_(pitch|roll)_joint",
+    ],
+    "waist": ["torso_joint"],
+    "arms": [
+        ".*_shoulder_(pitch|roll|yaw)_joint",
+        ".*_elbow_joint",
+        ".*_wrist_(roll|pitch|yaw)_joint",
+    ],
+    "wrists": [".*_wrist_(roll|pitch|yaw)_joint"],
+}
+
+
+def resolve_hold_quiet_dof_indices(
+    dof_names: List[str],
+    spec: Optional[str],
+    device: Optional[torch.device] = None,
+):
+    """Resolve ``PM_HOLD_JOINT_QUIET_JOINTS`` into DOF column indices.
+
+    Accepts a comma-separated mix of GROUP tokens
+    (``all`` / ``legs`` / ``waist`` / ``arms`` / ``wrists``) and EXACT DOF
+    names, e.g. ``"legs,waist"`` or ``"torso_joint,left_knee_joint"``.
+    ``None`` / ``""`` / ``"all"`` means every DOF.
+
+    Returns ``(indices, names)`` where ``indices`` is ``None`` for the
+    all-DOF case -- deliberately not ``arange(num_dofs)``: a ``None`` keeps
+    ``dof_indices`` OUT of the component's ``static_params`` entirely (Rule 10,
+    no new pickle key) and keeps the kernel on the un-indexed tensor.
+
+    Fails LOUD (``ValueError``) on an unknown token or a group that matches no
+    DOF on this robot. A silently-dropped joint name would leave the term
+    quietly scoring the wrong joint set for a whole run -- exactly the trap
+    class the reward-audit law exists to prevent.
+    """
+    import re
+
+    if spec is None or not str(spec).strip():
+        return None, list(dof_names)
+    tokens = [t.strip() for t in str(spec).split(",") if t.strip()]
+    if not tokens:
+        raise ValueError(
+            "PM_HOLD_JOINT_QUIET_JOINTS was set but parsed to an empty token "
+            "list; give 'all', group names "
+            f"{sorted(HOLD_QUIET_JOINT_GROUPS)}, or comma-separated DOF names."
+        )
+    if any(t.lower() == "all" for t in tokens):
+        if len(tokens) != 1:
+            raise ValueError(
+                f"PM_HOLD_JOINT_QUIET_JOINTS={spec!r} mixes 'all' with other "
+                "tokens; 'all' must be used alone."
+            )
+        return None, list(dof_names)
+
+    selected: List[int] = []
+    unknown: List[str] = []
+    for token in tokens:
+        group = HOLD_QUIET_JOINT_GROUPS.get(token.lower())
+        if group is not None:
+            hits = [
+                i
+                for i, name in enumerate(dof_names)
+                if any(re.fullmatch(p, name) for p in group)
+            ]
+            if not hits:
+                raise ValueError(
+                    f"PM_HOLD_JOINT_QUIET_JOINTS group {token!r} matched NO DOF "
+                    f"on this robot. Patterns {group}; DOF names {list(dof_names)}."
+                )
+            selected.extend(hits)
+        elif token in dof_names:
+            selected.append(dof_names.index(token))
+        else:
+            unknown.append(token)
+    if unknown:
+        raise ValueError(
+            f"PM_HOLD_JOINT_QUIET_JOINTS names unknown tokens {unknown}. Valid "
+            f"groups: {sorted(HOLD_QUIET_JOINT_GROUPS)}. Valid DOF names for "
+            f"this robot: {list(dof_names)}"
+        )
+    # Deduplicate while preserving DOF order (so 'arms,wrists' is 'arms').
+    ordered = sorted(set(selected))
+    names = [dof_names[i] for i in ordered]
+    indices = torch.as_tensor(ordered, dtype=torch.long, device=device)
+    return indices, names
+
+
+def compute_hold_joint_quiet(
+    reference_still_mask: Optional[Tensor],
+    dof_vel: Tensor,
+    dof_indices: Optional[Tensor] = None,
+    vel_scale: float = 25.0,
+) -> Tensor:
+    """Joint-VELOCITY quiet bonus, paid ONLY during reference-still windows.
+
+    ``bonus = still * exp(-vel_scale * mean_j(dof_vel_j^2))``
+
+    THE GAP THIS CLOSES (measured, ``PAUSE_EVAL.md`` 2026-08-04). During a held
+    reference the policy runs a ~1.19 Hz whole-body postural LIMIT CYCLE
+    (coherence 0.86-0.96 across ankles/knees/torso/shoulders/wrists/pelvis;
+    commanded target amplitude EXCEEDS achieved at 1.03-1.09, so the policy is
+    the oscillator and the plant is faithfully executing it). Nothing in the
+    reward prices it:
+
+    - every tracking Gaussian has sigma 0.30 m / 0.35 rad / 1.0 m/s, so an
+      error must reach ~3 cm to cost 1% of its term. The measured 0.054 deg
+      joint tremor costs ``dof_pos_track`` 7e-6 of its weight.
+    - ``action_rate`` / ``action_smooth_lme`` are ONE-STEP deltas. At 1.2 Hz
+      there are ~42 control steps per cycle, so the per-step delta is ~7x
+      smaller than the amplitude -- structurally blind to this mode.
+    - ``hold_balance`` is the only reference-still-gated term and it watches
+      the PELVIS only (tilt + speed); at 0.01 m/s it reads exp(-4e-4) ~= 1.
+
+    VELOCITY, not position, is the right observable: at fixed amplitude the
+    velocity of a mode scales with its frequency, so a velocity kernel sees a
+    1.2 Hz oscillation ~40x more strongly than the position kernels do, WITHOUT
+    the near-Nyquist blindness of the one-step action taxes.
+
+    MEAN OF SQUARES, not a max or an L1: the mode is phase-locked across the
+    whole body, so every DOF is a valid observation of the SAME oscillator;
+    averaging the squares is the minimum-variance read of its energy. It also
+    means the reduction is dominated by the joints with the largest joint-space
+    velocity (the legs) -- see ``resolve_hold_quiet_dof_indices`` and the
+    parent's ``PM_HOLD_JOINT_QUIET_JOINTS`` gate for why the all-DOF default is
+    the recommended one.
+
+    NO ACTUATION TERM, exactly like ``compute_hold_balance_bonus``: this pays
+    for the ROBOT being quiet, never for the POLICY emitting zero action, so it
+    cannot be farmed by going limp or by freezing the network output. It is a
+    bounded [0, 1] bonus that is identically zero outside holds, so the worst
+    case is a constant offset during holds, never a tracking regression.
+
+    Args:
+        reference_still_mask: Bool[num_envs] hold mask, or None (no mask
+            source -> zeros, same convention as ``compute_hold_balance_bonus``).
+        dof_vel: Current joint velocities [num_envs, num_dofs] (rad/s).
+        dof_indices: Optional Long tensor of DOF columns to score. None = all
+            DOFs (and the key is absent from ``static_params``).
+        vel_scale: Positive coefficient ``c`` in ``exp(-c * mean_j v^2)``,
+            units (rad/s)^-2. The kernel's e-folding point is
+            ``rms(v) = 1/sqrt(c)``; c = 25 puts it at 0.20 rad/s, which is
+            where the measured all-DOF pause-window rms (0.06-0.15 rad/s)
+            produces a live 10-30% gradient. Scoring a NARROWER joint set needs
+            a LARGER c (arms-only rms is ~0.048 rad/s -> c ~ 150).
+
+    Returns:
+        Bonus in [0, 1] per env [num_envs].
+    """
+    if reference_still_mask is None:
+        return torch.zeros(dof_vel.shape[0], device=dof_vel.device)
+
+    dof_vel = select_hold_quiet_dofs(dof_vel, dof_indices)
+    mean_sq = (dof_vel * dof_vel).mean(dim=-1)
+    return reference_still_mask.float() * torch.exp(-vel_scale * mean_sq)
+
+
+def select_hold_quiet_dofs(
+    dof_vel: Tensor, dof_indices: Optional[Tensor]
+) -> Tensor:
+    """Apply the optional DOF subset, tolerating a CPU index tensor.
+
+    ``dof_indices`` is resolved at CONFIG time (teacher.py / the resume
+    injector), where the simulation device is not yet known, so it lands on the
+    CPU while ``dof_vel`` is on the GPU. Advanced indexing with a mismatched
+    index device is an error on modern torch, so move it here. The copy is 27
+    longs and only happens when the devices actually differ; the device check
+    itself is pure Python and costs nothing on the matched path.
+
+    Shared by the reward kernel and the env's stat writer so the reward and the
+    stat can never end up scoring different joint sets.
+    """
+    if dof_indices is None:
+        return dof_vel
+    if dof_indices.device != dof_vel.device:
+        dof_indices = dof_indices.to(dof_vel.device)
+    return dof_vel[:, dof_indices]
+
+
+# =============================================================================
 # Wrist direction-agreement reward kernel (WRIST-DIR)
 # =============================================================================
 
