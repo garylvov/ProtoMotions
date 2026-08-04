@@ -636,6 +636,78 @@ def graced_action_smoothness_lme_factory(
     )
 
 
+# Reward components whose Gaussian position kernel supports the OPTIONAL narrow
+# ("fine") companion. Kept beside the resume re-apply table so the two cannot
+# drift apart.
+DUAL_SIGMA_COMPONENTS = (
+    "global_wrist_pos",
+    "relative_body_pos",
+    "wrist_relative_body_pos",
+    "global_anchor_pos",
+    "dof_pos_track",
+    "heading_local_anchor_drift",
+)
+
+
+def validate_dual_sigma_components(reward_components, log_fn):
+    """Validate the DUAL-SIGMA fine companions after the resume re-apply pass.
+
+    ``fine_weight`` and ``fine_sigma`` are applied by INDEPENDENT resume rows,
+    so a half-set pair (weight without sigma) would otherwise survive config
+    time and only blow up inside the kernel on the first rollout. Fail LOUDLY
+    here instead, and emit a proof line for every companion that IS active so
+    the resume log states exactly what the reward became.
+
+    Args:
+        reward_components: name -> MdpComponent mapping (post re-apply).
+        log_fn: single-argument logger for WARNING-level proof lines.
+
+    Returns:
+        The list of component names whose fine companion is active.
+
+    Raises:
+        ValueError: on a negative fine_weight, or an enabled fine_weight whose
+            fine_sigma is missing or non-positive.
+    """
+    active = []
+    for name in DUAL_SIGMA_COMPONENTS:
+        comp = reward_components.get(name)
+        if comp is None:
+            continue
+        params = comp.static_params
+        fine_w = params.get("fine_weight", 0.0)
+        fine_s = params.get("fine_sigma")
+        if not fine_w:
+            continue
+        if fine_w < 0.0:
+            raise ValueError(
+                f"{name}.fine_weight must be >= 0 (got {fine_w}); the narrow "
+                "companion is a bonus near zero error, a negative weight would "
+                "carve a hole at the target."
+            )
+        if fine_s is None or fine_s <= 0.0:
+            raise ValueError(
+                f"{name}.fine_weight={fine_w} is enabled but fine_sigma is "
+                f"{fine_s!r}: set the matching *_FINE_SIGMA env var to a "
+                "positive width (a dual-sigma term with no narrow width is "
+                "meaningless)."
+            )
+        coarse = params.get("sigma")
+        if coarse is not None and fine_s >= coarse:
+            log_fn(
+                f"DUAL-SIGMA SUSPECT: {name}.fine_sigma={fine_s} is NOT "
+                f"narrower than sigma={coarse} -- the 'fine' companion buys no "
+                "extra precision, it just rescales the term. Intended?"
+            )
+        log_fn(
+            f"DUAL-SIGMA ACTIVE {name}: coarse sigma={coarse} + "
+            f"fine_weight={fine_w} x exp(-e^2/{fine_s}^2); term max value "
+            f"{1.0 + fine_w:.3f} x weight {params.get('weight')}"
+        )
+        active.append(name)
+    return active
+
+
 def resume_inject_reward_components(
     reward_components,
     env=None,
@@ -2054,19 +2126,53 @@ def fall_termination_factory(termination_height: float = 0.15) -> MdpComponent:
 # =============================================================================
 
 
+def _dual_sigma_static_params(
+    fine_weight: float, fine_sigma: Optional[float]
+) -> Dict[str, Any]:
+    """Resolve the OPTIONAL narrow-Gaussian companion into static_params.
+
+    Returns an EMPTY dict when ``fine_weight`` is 0.0/None, so the built
+    component's static_params are byte-identical to the pre-dual-sigma form
+    (no new pickle keys appear unless the companion is actually enabled).
+    Validates eagerly at BUILD time -- a bad sigma should fail the launch, not
+    surface as a NaN reward a thousand iterations in.
+    """
+    if not fine_weight:
+        return {}
+    if fine_weight < 0.0:
+        raise ValueError(f"fine_weight must be >= 0 (got {fine_weight}).")
+    if fine_sigma is None or fine_sigma <= 0.0:
+        raise ValueError(
+            f"fine_sigma must be > 0 when fine_weight={fine_weight} is non-zero "
+            f"(got {fine_sigma})."
+        )
+    return {"fine_weight": float(fine_weight), "fine_sigma": float(fine_sigma)}
+
+
 def global_anchor_pos_rew_factory(
-    weight: float = 0.5, sigma: float = 0.3
+    weight: float = 0.5,
+    sigma: float = 0.3,
+    fine_weight: float = 0.0,
+    fine_sigma: Optional[float] = None,
 ) -> MdpComponent:
     """Factory for global anchor position reward (BeyondMimic).
 
     Args:
         weight: Reward weight.
         sigma: Gaussian kernel width.
+        fine_weight: Optional relative weight of a NARROW Gaussian companion
+            added to the coarse kernel (dual-sigma; see
+            ``protomotions.envs.rewards.tracking._dual_sigma_exp``). 0.0
+            (default) = companion absent = byte-identical single-sigma term.
+        fine_sigma: Narrow companion width; required when ``fine_weight`` != 0.
 
     Returns:
         MdpComponent configured for global anchor position reward.
     """
     from protomotions.envs.rewards import compute_global_anchor_pos_rew
+
+    static_params: Dict[str, Any] = {"weight": weight, "sigma": sigma}
+    static_params.update(_dual_sigma_static_params(fine_weight, fine_sigma))
 
     return MdpComponent(
         compute_func=compute_global_anchor_pos_rew,
@@ -2075,7 +2181,7 @@ def global_anchor_pos_rew_factory(
             "ref_rigid_body_pos": EnvContext.mimic.ref_state.rigid_body_pos,
             "anchor_idx": EnvContext.mimic.anchor_idx,
         },
-        static_params={"weight": weight, "sigma": sigma},
+        static_params=static_params,
     )
 
 
@@ -2105,7 +2211,10 @@ def global_anchor_ori_rew_factory(
 
 
 def heading_local_anchor_drift_rew_factory(
-    weight: float = 0.5, sigma: float = 0.3
+    weight: float = 0.5,
+    sigma: float = 0.3,
+    fine_weight: float = 0.0,
+    fine_sigma: Optional[float] = None,
 ) -> MdpComponent:
     """Factory for heading-local anchor drift reward.
 
@@ -2117,11 +2226,18 @@ def heading_local_anchor_drift_rew_factory(
     Args:
         weight: Reward weight.
         sigma: Gaussian kernel width.
+        fine_weight: Optional relative weight of a NARROW Gaussian companion
+            added to the coarse kernel (dual-sigma). 0.0 (default) = companion
+            absent = byte-identical single-sigma term.
+        fine_sigma: Narrow companion width; required when ``fine_weight`` != 0.
 
     Returns:
         MdpComponent configured for heading-local anchor drift reward.
     """
     from protomotions.envs.rewards import compute_heading_local_anchor_drift_rew
+
+    static_params: Dict[str, Any] = {"weight": weight, "sigma": sigma}
+    static_params.update(_dual_sigma_static_params(fine_weight, fine_sigma))
 
     return MdpComponent(
         compute_func=compute_heading_local_anchor_drift_rew,
@@ -2130,7 +2246,7 @@ def heading_local_anchor_drift_rew_factory(
             "current_anchor_rot": EnvContext.current.anchor_rot,
             "ref_anchor_pos": EnvContext.mimic.ref_anchor_pos,
         },
-        static_params={"weight": weight, "sigma": sigma},
+        static_params=static_params,
     )
 
 
@@ -2175,12 +2291,23 @@ def relative_body_pos_rew_factory(
     body_indices: Optional[List[int]] = None,
     body_weights: Optional[Dict[str, float]] = None,
     body_names: Optional[List[str]] = None,
+    fine_weight: float = 0.0,
+    fine_sigma: Optional[float] = None,
 ) -> MdpComponent:
     """Factory for relative body position reward (BeyondMimic).
+
+    This is the factory behind BOTH the all-body ``relative_body_pos`` term and
+    the wrist-only ``wrist_relative_body_pos`` term, i.e. the one that actually
+    governs HAND placement (anchor-relative, heading-local frame).
 
     Args:
         weight: Reward weight.
         sigma: Gaussian kernel width.
+        fine_weight: Optional relative weight of a NARROW Gaussian companion
+            added to the coarse kernel (dual-sigma; see
+            ``protomotions.envs.rewards.tracking._dual_sigma_exp``). 0.0
+            (default) = companion absent = byte-identical single-sigma term.
+        fine_sigma: Narrow companion width; required when ``fine_weight`` != 0.
         body_indices: Optional body indices to restrict to a subset (uniform
             mean over the subset). Mutually exclusive with ``body_weights``.
         body_weights: Optional per-body weight multipliers, body-name ->
@@ -2200,6 +2327,7 @@ def relative_body_pos_rew_factory(
     static_params.update(
         _resolve_body_indices_and_weights(body_indices, body_weights, body_names)
     )
+    static_params.update(_dual_sigma_static_params(fine_weight, fine_sigma))
 
     return MdpComponent(
         compute_func=compute_relative_body_pos_rew,
@@ -2262,6 +2390,8 @@ def relative_body_ori_rew_factory(
 def dof_pos_track_rew_factory(
     weight: float = 1.0,
     sigma: float = 0.35,
+    fine_weight: float = 0.0,
+    fine_sigma: Optional[float] = None,
 ) -> MdpComponent:
     """Factory for the joint-space (DOF) position tracking reward.
 
@@ -2278,11 +2408,19 @@ def dof_pos_track_rew_factory(
         weight: Reward weight (POSITIVE; the posture pin is a reward, not a
             penalty).
         sigma: Gaussian kernel width in rad. Smaller = tighter posture demand.
+        fine_weight: Optional relative weight of a NARROW Gaussian companion
+            added to the coarse kernel (dual-sigma). 0.0 (default) = companion
+            absent = byte-identical single-sigma term.
+        fine_sigma: Narrow companion width (rad); required when
+            ``fine_weight`` != 0.
 
     Returns:
         MdpComponent configured for the joint-space DOF position tracking reward.
     """
     from protomotions.envs.rewards import compute_dof_pos_track_rew
+
+    static_params: Dict[str, Any] = {"weight": weight, "sigma": sigma}
+    static_params.update(_dual_sigma_static_params(fine_weight, fine_sigma))
 
     return MdpComponent(
         compute_func=compute_dof_pos_track_rew,
@@ -2290,7 +2428,144 @@ def dof_pos_track_rew_factory(
             "current_dof_pos": EnvContext.current.dof_pos,
             "ref_dof_pos": EnvContext.mimic.ref_state.dof_pos,
         },
-        static_params={"weight": weight, "sigma": sigma},
+        static_params=static_params,
+    )
+
+
+def global_body_pos_rew_factory(
+    weight: float = 0.6,
+    sigma: float = 0.3,
+    body_indices: Optional[List[int]] = None,
+    body_weights: Optional[Dict[str, float]] = None,
+    body_names: Optional[List[str]] = None,
+    fine_weight: float = 0.0,
+    fine_sigma: Optional[float] = None,
+    use_reference_still_mask: bool = False,
+) -> MdpComponent:
+    """Factory for the WORLD-frame body position reward (hand-in-the-world).
+
+    Closes the frame gap proven by the reward audit: every existing body
+    position term is ANCHOR-RELATIVE, so pelvis translation and yaw cancel out
+    and a hand riding a swaying base scores as perfect. This term measures the
+    hand where it actually is -- in the world -- so the arm is PAID to cancel
+    base motion. See
+    ``protomotions.envs.rewards.tracking.compute_global_body_pos_rew`` for the
+    frame-by-frame proof and the world-frame caveat.
+
+    Args:
+        weight: Reward weight (POSITIVE).
+        sigma: Coarse Gaussian width (m); preserves capture range.
+        body_indices: Body indices to score. Mutually exclusive with
+            ``body_weights``. Typically the two wrist bodies. The PELVIS is
+            deliberately not a recommended member -- the design target allows
+            the base to sway.
+        body_weights: Optional body-name -> multiplier map (requires
+            ``body_names``).
+        body_names: The robot's ordered body name list.
+        fine_weight: Optional relative weight of the NARROW dual-sigma
+            companion. 0.0 (default) = absent.
+        fine_sigma: Narrow companion width (m); required when
+            ``fine_weight`` != 0.
+        use_reference_still_mask: Restrict the term to held-reference envs.
+            Default False = always on (recommended: base sway displaces the
+            hand during motion too, and a hard gate is a discontinuity to
+            exploit).
+
+    Returns:
+        MdpComponent configured for the world-frame body position reward.
+    """
+    from protomotions.envs.rewards import compute_global_body_pos_rew
+
+    static_params: Dict[str, Any] = {"weight": weight, "sigma": sigma}
+    static_params.update(
+        _resolve_body_indices_and_weights(body_indices, body_weights, body_names)
+    )
+    static_params.update(_dual_sigma_static_params(fine_weight, fine_sigma))
+
+    dynamic_vars: Dict[str, Any] = {
+        "current_rigid_body_pos": EnvContext.current.rigid_body_pos,
+        "ref_rigid_body_pos": EnvContext.mimic.ref_state.rigid_body_pos,
+    }
+    if use_reference_still_mask:
+        dynamic_vars["reference_still_mask"] = EnvContext.reference_still_mask
+
+    return MdpComponent(
+        compute_func=compute_global_body_pos_rew,
+        dynamic_vars=dynamic_vars,
+        static_params=static_params,
+    )
+
+
+def static_hold_body_vel_penalty_factory(
+    weight: float = -0.5,
+    body_indices: Optional[List[int]] = None,
+    body_names: Optional[List[str]] = None,
+    body_name_filter: Optional[List[str]] = None,
+    ref_speed_gate: float = 0.05,
+    use_reference_still_mask: bool = False,
+    zero_during_grace_period: bool = True,
+) -> MdpComponent:
+    """Factory for the reference-still-gated body VELOCITY penalty.
+
+    Prices a body (typically the WRISTS) that keeps MOVING while its reference
+    target is parked -- the static-hold drift/sway the position-only Gaussian
+    stack cannot see. See
+    ``protomotions.envs.rewards.regularization.compute_static_hold_body_vel_penalty``
+    for the full gap analysis and the gate's exemption proof.
+
+    Args:
+        weight: Reward weight (NEGATIVE; this is a penalty).
+        body_indices: Explicit body indices to restrict the term to. Mutually
+            exclusive with ``body_name_filter``. None + no filter = all bodies.
+        body_names: The robot's ordered body name list, required to resolve
+            ``body_name_filter``.
+        body_name_filter: Body NAMES to restrict the term to (e.g. the wrist
+            bodies). Requires ``body_names``.
+        ref_speed_gate: Reference speed (m/s) strictly below which a body counts
+            as a static hold. 0.0 = term disabled.
+        use_reference_still_mask: When True, ALSO require the env-level HOLD-FIX
+            ``reference_still_mask``. Default False keeps the term
+            self-contained (no HOLD-FIX dependency).
+        zero_during_grace_period: Zero the penalty during the post-perturbation
+            grace period (default True) -- a shoved robot must be free to move
+            its arms to recover without paying a stillness tax.
+
+    Returns:
+        MdpComponent configured for the static-hold body velocity penalty.
+    """
+    from protomotions.envs.rewards import compute_static_hold_body_vel_penalty
+
+    if body_name_filter is not None:
+        if body_indices is not None:
+            raise ValueError(
+                "Provide either body_indices or body_name_filter, not both."
+            )
+        if body_names is None:
+            raise ValueError(
+                "body_names (the robot's ordered body name list) is required to "
+                "resolve body_name_filter."
+            )
+        body_indices = [body_names.index(name) for name in body_name_filter]
+
+    static_params: Dict[str, Any] = {
+        "weight": weight,
+        "ref_speed_gate": ref_speed_gate,
+        "zero_during_grace_period": zero_during_grace_period,
+    }
+    if body_indices is not None:
+        static_params["body_indices"] = body_indices
+
+    dynamic_vars: Dict[str, Any] = {
+        "rigid_body_vel": EnvContext.current.rigid_body_vel,
+        "ref_rigid_body_vel": EnvContext.mimic.ref_state.rigid_body_vel,
+    }
+    if use_reference_still_mask:
+        dynamic_vars["reference_still_mask"] = EnvContext.reference_still_mask
+
+    return MdpComponent(
+        compute_func=compute_static_hold_body_vel_penalty,
+        dynamic_vars=dynamic_vars,
+        static_params=static_params,
     )
 
 

@@ -162,6 +162,75 @@ def compute_rh_rew(
 # BeyondMimic-style Reward Kernels
 # =============================================================================
 
+def _dual_sigma_exp(
+    error: Tensor,
+    sigma: float,
+    fine_weight: float = 0.0,
+    fine_sigma: Optional[float] = None,
+) -> Tensor:
+    """Gaussian tracking kernel with an OPTIONAL narrow (fine) companion.
+
+    The single-sigma Gaussian ``exp(-e^2 / sigma^2)`` used by every position
+    tracking term here is nearly FLAT for errors far below ``sigma``: at
+    sigma=0.3 m a 2 cm error scores 0.9956 and its gradient is ~0.44 /m, so a
+    few-centimetre static-hold drift is effectively free while the term still
+    reads ~1.0. Tightening ``sigma`` alone fixes the dead zone but destroys the
+    CAPTURE RANGE -- at sigma=0.05 m a 30 cm error scores e^-36 ~ 2e-16 with a
+    vanishing gradient, so a policy that is far off gets no signal to come back.
+
+    This kernel keeps the coarse Gaussian EXACTLY as-is (capture range and
+    large-error gradient untouched) and optionally ADDS a narrow companion::
+
+        r = exp(-e^2 / sigma_coarse^2) + fine_weight * exp(-e^2 / sigma_fine^2)
+
+    The companion is essentially zero beyond a few ``fine_sigma``, so it changes
+    nothing about large-error behavior; near zero it supplies the precision
+    gradient the coarse term lacks. Because the MdpComponent ``weight`` w
+    multiplies the whole kernel, the effective decomposition is
+    ``w * coarse + (w * fine_weight) * fine`` -- i.e. ``fine_weight`` is the
+    fine term's weight RELATIVE to the coarse one, and the term's maximum value
+    rises from w to ``w * (1 + fine_weight)``.
+
+    RESUME RULE (Rule 10): ``fine_weight`` defaults to 0.0 and the OFF path
+    returns LITERALLY the original expression ``torch.exp(-error / (sigma**2))``
+    -- not an algebraically-equal rewrite -- so a frozen/unpickled config whose
+    static_params lack the new keys is BYTE-IDENTICAL (bit-exact in float32, no
+    ulp drift). Behavior changes ONLY when the explicit env knobs are set.
+
+    Args:
+        error: SQUARED error already reduced to [num_envs] (e.g. squared
+            distance in m^2, or mean squared per-DOF error in rad^2).
+        sigma: Coarse Gaussian kernel width (capture range). Unchanged.
+        fine_weight: Relative weight of the narrow companion. 0.0 (default) =
+            companion absent = byte-identical to the single-sigma kernel.
+            Must be >= 0.
+        fine_sigma: Narrow Gaussian kernel width. Required (and must be > 0)
+            whenever ``fine_weight`` is non-zero.
+
+    Returns:
+        Reward tensor with the same shape as ``error``.
+    """
+    if not fine_weight:
+        # BYTE-IDENTICAL OFF PATH -- do not "simplify" this into the dual form.
+        return torch.exp(-error / (sigma ** 2))
+    if fine_weight < 0.0:
+        raise ValueError(
+            f"fine_weight must be >= 0 (got {fine_weight}); the fine companion "
+            "is a REWARD bonus near zero error, a negative weight would carve a "
+            "hole at the target."
+        )
+    if fine_sigma is None:
+        raise ValueError(
+            f"fine_sigma is required when fine_weight={fine_weight} is non-zero "
+            "(no default is assumed: the narrow width is the whole point)."
+        )
+    if fine_sigma <= 0.0:
+        raise ValueError(f"fine_sigma must be > 0 (got {fine_sigma}).")
+    return torch.exp(-error / (sigma ** 2)) + fine_weight * torch.exp(
+        -error / (fine_sigma ** 2)
+    )
+
+
 def _weighted_body_mean(error: Tensor, weights: Optional[Tensor]) -> Tensor:
     """Reduce a [num_envs, num_bodies] per-body error to [num_envs].
 
@@ -180,6 +249,8 @@ def compute_global_position_error_exp(
     sigma: float,
     indices: Optional[Tensor] = None,
     weights: Optional[Tensor] = None,
+    fine_weight: float = 0.0,
+    fine_sigma: Optional[float] = None,
 ) -> Tensor:
     """Position error: exp(-||x - ref_x||^2 / sigma^2).
 
@@ -191,6 +262,10 @@ def compute_global_position_error_exp(
         weights: Optional per-body weight multipliers [num_bodies_subset],
             aligned with ``indices`` (or with the body dim if ``indices`` is
             None). None = uniform mean (default, backward compatible).
+        fine_weight: Optional relative weight of a NARROW Gaussian companion
+            added on top of the coarse one (see ``_dual_sigma_exp``). 0.0
+            (default) = absent = byte-identical single-sigma kernel.
+        fine_sigma: Narrow companion width; required when ``fine_weight`` != 0.
 
     Returns:
         Reward tensor [num_envs].
@@ -202,7 +277,7 @@ def compute_global_position_error_exp(
     error = (x - ref_x).pow(2).sum(dim=-1)
     if error.dim() == 2:
         error = _weighted_body_mean(error, weights)
-    return torch.exp(-error / (sigma ** 2))
+    return _dual_sigma_exp(error, sigma, fine_weight, fine_sigma)
 
 
 def compute_global_anchor_pos_rew(
@@ -210,20 +285,126 @@ def compute_global_anchor_pos_rew(
     ref_rigid_body_pos: Tensor,
     anchor_idx: int,
     sigma: float = 0.3,
+    fine_weight: float = 0.0,
+    fine_sigma: Optional[float] = None,
 ) -> Tensor:
     """Global anchor position reward (BeyondMimic style).
-    
+
+    NOTE (scope): the "anchor" is the ROOT/pelvis body only -- this term does
+    NOT see the hands. Sharpening it tightens WORLD-frame root placement, not
+    hand precision (see ``compute_relative_body_pos_rew`` for the hand).
+
     Args:
         current_anchor_pos: Current anchor position [num_envs, 3].
         ref_rigid_body_pos: Reference body positions [num_envs, num_bodies, 3].
         anchor_idx: Index of anchor body.
         sigma: Gaussian kernel width.
-    
+        fine_weight: Optional relative weight of a NARROW Gaussian companion
+            (see ``_dual_sigma_exp``). 0.0 (default) = absent = byte-identical.
+        fine_sigma: Narrow companion width; required when ``fine_weight`` != 0.
+
     Returns:
-        Reward: exp(-||anchor_pos - ref_anchor_pos||^2 / sigma^2).
+        Reward: exp(-||anchor_pos - ref_anchor_pos||^2 / sigma^2), plus the
+        optional narrow companion.
     """
     ref_anchor_pos = ref_rigid_body_pos[:, anchor_idx, :]
-    return compute_global_position_error_exp(current_anchor_pos, ref_anchor_pos, sigma)
+    return compute_global_position_error_exp(
+        current_anchor_pos,
+        ref_anchor_pos,
+        sigma,
+        fine_weight=fine_weight,
+        fine_sigma=fine_sigma,
+    )
+
+
+def compute_global_body_pos_rew(
+    current_rigid_body_pos: Tensor,
+    ref_rigid_body_pos: Tensor,
+    sigma: float = 0.3,
+    body_indices: Optional[Tensor] = None,
+    body_weights: Optional[Tensor] = None,
+    fine_weight: float = 0.0,
+    fine_sigma: Optional[float] = None,
+    reference_still_mask: Optional[Tensor] = None,
+) -> Tensor:
+    """WORLD-frame body position tracking -- the missing hand-in-the-world term.
+
+    WHY THIS EXISTS (frame audit, 2026-08-04). Every body-position term in the
+    canonical teacher stack is ANCHOR-RELATIVE:
+    ``compute_relative_body_pos_rew`` (bound as both ``relative_body_pos`` and
+    the wrist-only ``wrist_relative_body_pos``) subtracts the pelvis position
+    from every body on BOTH the current and the reference side and then rotates
+    into the pelvis's YAW-aligned frame::
+
+        current_rel_pos = current_rigid_body_pos - current_anchor_pos
+        ref_rel_pos     = ref_rigid_body_pos     - ref_anchor_pos
+
+    Consequences, exactly:
+
+    - Pelvis TRANSLATION cancels IDENTICALLY on both sides. A hand riding a
+      swaying base is scored as PERFECT. This is invisible to the reward.
+    - Pelvis YAW cancels too (``calc_heading_quat_inv`` is yaw-only).
+    - Pelvis PITCH/ROLL do NOT cancel, so tilt is partially visible -- but tilt
+      is the minority share of the drift.
+
+    The remaining position terms (``global_anchor_pos``,
+    ``heading_local_anchor_drift``) score the ROOT only, and ``dof_pos_track``
+    scores JOINT angles -- which actively OPPOSES compensation, since bending
+    the arm to cancel base sway is a deviation from the reference posture.
+
+    Net: NOTHING in the stack rewards the hand for being in the right place in
+    the WORLD. This kernel does. It scores the world-frame per-body position
+    error directly, so an arm that actively cancels base motion is PAID for it,
+    which is the stated design target ("the pelvis may sway; the hand must
+    stay put"). No pelvis stabilization is implied or required.
+
+    Restrict it to the hand/wrist bodies via ``body_indices``; the pelvis is
+    deliberately NOT a recommended member of that set.
+
+    WORLD-FRAME CAVEAT: with ``realign_motion_with_humanoid_on_each_step=False``
+    the reference and the robot can separate in world coordinates over an
+    episode. That separation is already bounded by the ``anchor_pos_drift``
+    termination (0.4 m) and priced by ``global_anchor_pos``, which lives in the
+    same world frame at weight 0.5 -- so this term inherits an established,
+    bounded convention rather than a new one. During a static hold (the case
+    that motivated it) the separation is exactly what we want measured.
+
+    Args:
+        current_rigid_body_pos: Current body positions [num_envs, num_bodies, 3]
+            in WORLD coordinates.
+        ref_rigid_body_pos: Reference body positions [num_envs, num_bodies, 3]
+            in WORLD coordinates.
+        sigma: Coarse Gaussian width (m). Preserves capture range.
+        body_indices: Body indices to score (e.g. the two wrist bodies).
+            None = all bodies.
+        body_weights: Optional per-body multipliers aligned with
+            ``body_indices``. None = uniform mean.
+        fine_weight: Optional relative weight of the NARROW companion
+            (see ``_dual_sigma_exp``). 0.0 = absent.
+        fine_sigma: Narrow companion width (m); required when
+            ``fine_weight`` != 0.
+        reference_still_mask: Optional [num_envs] bool/float mask. When given,
+            the reward is zeroed outside held-reference envs (the HOLD-FIX
+            gate). None (default) = the term applies at ALL times, which is the
+            recommended setting: base sway displaces the hand during motion
+            too, and an on/off gate introduces a reward discontinuity at the
+            gate boundary for the policy to exploit.
+
+    Returns:
+        Reward tensor [num_envs].
+    """
+    reward = compute_global_position_error_exp(
+        current_rigid_body_pos,
+        ref_rigid_body_pos,
+        sigma,
+        body_indices,
+        body_weights,
+        fine_weight=fine_weight,
+        fine_sigma=fine_sigma,
+    )
+    if reference_still_mask is not None:
+        reward = reward * reference_still_mask.to(reward.dtype)
+    return reward
 
 
 def compute_global_orientation_error_exp(
@@ -288,10 +469,19 @@ def compute_relative_body_pos_rew(
     sigma: float = 0.3,
     body_indices: Optional[Tensor] = None,
     body_weights: Optional[Tensor] = None,
+    fine_weight: float = 0.0,
+    fine_sigma: Optional[float] = None,
 ) -> Tensor:
     """Relative body position reward (BeyondMimic style).
 
     Computes reward based on body positions relative to anchor in anchor's local frame.
+
+    THIS is the kernel that actually governs HAND/WRIST placement in the
+    canonical teacher stack: bound once over all bodies ("relative_body_pos")
+    and once restricted to the two wrist bodies ("wrist_relative_body_pos",
+    ``body_indices=[left_wrist_yaw_link, right_wrist_yaw_link]``). The frame is
+    ANCHOR-RELATIVE and HEADING-LOCAL, i.e. hand position measured in the
+    robot's own pelvis/heading frame -- NOT world coordinates.
 
     Args:
         current_rigid_body_pos: Current body positions [num_envs, num_bodies, 3].
@@ -305,9 +495,13 @@ def compute_relative_body_pos_rew(
         body_weights: Optional per-body weight multipliers [num_bodies_subset],
             aligned with ``body_indices``. None = uniform mean over the
             selected bodies (default, backward compatible).
+        fine_weight: Optional relative weight of a NARROW Gaussian companion
+            (see ``_dual_sigma_exp``). 0.0 (default) = absent = byte-identical.
+        fine_sigma: Narrow companion width; required when ``fine_weight`` != 0.
 
     Returns:
-        Reward: exp(-||rel_pos - ref_rel_pos||^2 / sigma^2).
+        Reward: exp(-||rel_pos - ref_rel_pos||^2 / sigma^2), plus the optional
+        narrow companion.
     """
     # Extract reference anchor pos and rot
     ref_anchor_pos = ref_rigid_body_pos[:, anchor_idx, :]
@@ -339,7 +533,13 @@ def compute_relative_body_pos_rew(
     ).reshape(ref_rigid_body_pos.shape)
     
     return compute_global_position_error_exp(
-        current_rel_pos_local, ref_rel_pos_local, sigma, body_indices, body_weights
+        current_rel_pos_local,
+        ref_rel_pos_local,
+        sigma,
+        body_indices,
+        body_weights,
+        fine_weight=fine_weight,
+        fine_sigma=fine_sigma,
     )
 
 
@@ -398,6 +598,8 @@ def compute_dof_pos_track_rew(
     ref_dof_pos: Tensor,
     sigma: float = 0.35,
     indices: Optional[Tensor] = None,
+    fine_weight: float = 0.0,
+    fine_sigma: Optional[float] = None,
 ) -> Tensor:
     """Joint-space (DOF) position tracking reward: exp(-mean(dof_err^2) / sigma^2).
 
@@ -418,16 +620,21 @@ def compute_dof_pos_track_rew(
         ref_dof_pos: Reference joint positions [num_envs, num_dofs] (rad).
         sigma: Gaussian kernel width (rad). Smaller = tighter posture demand.
         indices: Optional DOF indices to restrict to a subset.
+        fine_weight: Optional relative weight of a NARROW Gaussian companion
+            (see ``_dual_sigma_exp``). 0.0 (default) = absent = byte-identical.
+        fine_sigma: Narrow companion width (rad); required when
+            ``fine_weight`` != 0.
 
     Returns:
-        Reward tensor [num_envs] in (0, 1].
+        Reward tensor [num_envs] in (0, 1] (or (0, 1 + fine_weight] when the
+        narrow companion is enabled).
     """
     if indices is not None:
         current_dof_pos = current_dof_pos[:, indices]
         ref_dof_pos = ref_dof_pos[:, indices]
 
     error = (current_dof_pos - ref_dof_pos).pow(2).mean(dim=-1)
-    return torch.exp(-error / (sigma ** 2))
+    return _dual_sigma_exp(error, sigma, fine_weight, fine_sigma)
 
 
 def compute_global_body_lin_vel_rew(
@@ -604,6 +811,8 @@ def compute_heading_local_anchor_drift_rew(
     current_anchor_rot: Tensor,
     ref_anchor_pos: Tensor,
     sigma: float = 0.3,
+    fine_weight: float = 0.0,
+    fine_sigma: Optional[float] = None,
 ) -> Tensor:
     """Heading-local anchor drift reward (the reward twin of the future-
     displacement command observation, ``build_mimic_future_displacement_cmd``).
@@ -619,6 +828,9 @@ def compute_heading_local_anchor_drift_rew(
         current_anchor_rot: Current anchor rotation [num_envs, 4] (w-last).
         ref_anchor_pos: Reference (current-time) anchor position [num_envs, 3].
         sigma: Gaussian kernel width.
+        fine_weight: Optional relative weight of a NARROW Gaussian companion
+            (see ``_dual_sigma_exp``). 0.0 (default) = absent = byte-identical.
+        fine_sigma: Narrow companion width; required when ``fine_weight`` != 0.
 
     Returns:
         Reward tensor [num_envs].
@@ -627,7 +839,7 @@ def compute_heading_local_anchor_drift_rew(
         current_anchor_pos, current_anchor_rot, ref_anchor_pos, w_last=True
     )
     error = drift.pow(2).sum(dim=-1)
-    return torch.exp(-error / (sigma ** 2))
+    return _dual_sigma_exp(error, sigma, fine_weight, fine_sigma)
 
 
 __all__ = [
@@ -649,6 +861,7 @@ __all__ = [
     "compute_global_orientation_error_exp",
     "compute_global_anchor_ori_rew",
     "compute_relative_body_pos_rew",
+    "compute_global_body_pos_rew",
     "compute_relative_body_ori_rew",
     "compute_dof_pos_track_rew",
     "compute_global_body_lin_vel_rew",

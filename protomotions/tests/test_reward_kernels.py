@@ -653,3 +653,349 @@ def test_reference_contact_liftoff_penalty_fires_only_on_unnecessary_liftoffs():
     assert pen[0] == 0.0          # no liftoff at all
     assert pen[1] > 0.0           # unnecessary liftoff pays
     assert pen[2] == 0.0          # ref-matched liftoff is free
+
+
+# =============================================================================
+# DUAL-SIGMA companion + static-hold velocity penalty (2026-08-04)
+# =============================================================================
+
+_DUAL_SIGMA_POSITION_KERNELS = (
+    "compute_global_position_error_exp",
+    "compute_global_anchor_pos_rew",
+    "compute_relative_body_pos_rew",
+    "compute_dof_pos_track_rew",
+    "compute_heading_local_anchor_drift_rew",
+)
+
+
+def _pos_kernel_call(name, fine_kwargs):
+    """Invoke each dual-sigma-capable kernel on a fixed fixture."""
+    torch.manual_seed(0)
+    n_env, n_body = 4, 6
+    cur_pos = torch.randn(n_env, n_body, 3)
+    ref_pos = cur_pos + 0.07 * torch.randn(n_env, n_body, 3)
+    cur_rot = _identity_quat(n_env)          # _identity_quat appends the 4
+    ref_rot = _identity_quat(n_env, n_body)
+    if name == "compute_global_position_error_exp":
+        return tracking.compute_global_position_error_exp(
+            cur_pos, ref_pos, 0.3, **fine_kwargs
+        )
+    if name == "compute_global_anchor_pos_rew":
+        return tracking.compute_global_anchor_pos_rew(
+            cur_pos[:, 0], ref_pos, anchor_idx=0, sigma=0.3, **fine_kwargs
+        )
+    if name == "compute_relative_body_pos_rew":
+        return tracking.compute_relative_body_pos_rew(
+            cur_pos, ref_pos, cur_rot, ref_rot, cur_pos[:, 0],
+            anchor_idx=0, sigma=0.3, **fine_kwargs,
+        )
+    if name == "compute_dof_pos_track_rew":
+        return tracking.compute_dof_pos_track_rew(
+            cur_pos.reshape(n_env, -1),
+            ref_pos.reshape(n_env, -1),
+            sigma=0.35,
+            **fine_kwargs,
+        )
+    if name == "compute_heading_local_anchor_drift_rew":
+        return tracking.compute_heading_local_anchor_drift_rew(
+            cur_pos[:, 0], cur_rot, ref_pos[:, 0], sigma=0.3, **fine_kwargs
+        )
+    raise AssertionError(name)
+
+
+def test_dual_sigma_off_path_is_bit_exact_for_every_position_kernel():
+    """RULE 10: unset fine companion == the ORIGINAL single-sigma expression.
+
+    Exact bitwise equality, not allclose: the OFF path must return literally
+    ``torch.exp(-error / sigma**2)``, never an algebraically-equal vectorized
+    rewrite (a sibling lane hit float32 ulp drift doing exactly that).
+    """
+    for name in _DUAL_SIGMA_POSITION_KERNELS:
+        default = _pos_kernel_call(name, {})
+        explicit_zero = _pos_kernel_call(name, {"fine_weight": 0.0})
+        zero_with_sigma = _pos_kernel_call(
+            name, {"fine_weight": 0.0, "fine_sigma": 0.05}
+        )
+        assert torch.equal(default, explicit_zero), name
+        assert torch.equal(default, zero_with_sigma), name
+
+    # The shared helper itself, on a hand-built error vector.
+    err = torch.tensor([0.0, 1e-4, 4e-4, 2.5e-3, 1e-2, 9e-2])
+    assert torch.equal(
+        tracking._dual_sigma_exp(err, 0.3), torch.exp(-err / (0.3 ** 2))
+    )
+
+
+def test_dual_sigma_math_is_coarse_plus_weighted_fine():
+    """r = exp(-e^2/sc^2) + w * exp(-e^2/sf^2), exactly."""
+    err = torch.tensor([0.0, 1e-4, 4e-4, 2.5e-3, 1e-2, 9e-2])  # squared error
+    sc, sf, w = 0.3, 0.05, 0.5
+    got = tracking._dual_sigma_exp(err, sc, w, sf)
+    want = torch.exp(-err / sc ** 2) + w * torch.exp(-err / sf ** 2)
+    assert torch.equal(got, want)
+
+    # Coarse channel is UNTOUCHED: where the narrow companion has decayed to
+    # nothing (large error), the dual reward IS today's reward.
+    far = torch.tensor([0.09, 0.25, 1.0])  # squared error: 30 cm, 50 cm, 1 m
+    assert torch.allclose(
+        tracking._dual_sigma_exp(far, sc, w, sf),
+        torch.exp(-far / sc ** 2),
+        rtol=0, atol=1e-12,
+    )
+
+    # Maximum at zero error is exactly 1 + fine_weight.
+    assert math.isclose(float(got[0]), 1.0 + w, rel_tol=0, abs_tol=1e-6)
+
+
+def test_dual_sigma_preserves_capture_range_and_restores_near_zero_gradient():
+    """The whole point: precision near 0, capture range untouched far away.
+
+    Compares three configurations at a spread of position errors:
+      A) today   sigma=0.3, no companion
+      B) naive   sigma=0.05 alone (what "just tighten it" would do)
+      C) dual    sigma=0.3 + 0.5 * exp(-e^2/0.05^2)
+    """
+    sc, sf, w = 0.3, 0.05, 0.5
+    e = torch.tensor([0.01, 0.02, 0.05, 0.10, 0.30], dtype=torch.float64)
+    e.requires_grad_(True)
+
+    def grad_of(fn):
+        r = fn(e.pow(2))
+        g, = torch.autograd.grad(r.sum(), e, retain_graph=False)
+        return g.abs()
+
+    coarse = lambda q: torch.exp(-q / sc ** 2)          # noqa: E731
+    naive = lambda q: torch.exp(-q / sf ** 2)           # noqa: E731
+    dual = lambda q: tracking._dual_sigma_exp(q, sc, w, sf)  # noqa: E731
+
+    g_coarse, g_naive, g_dual = grad_of(coarse), grad_of(naive), grad_of(dual)
+
+    # TODAY'S DEAD ZONE: at 1-2 cm the coarse gradient is tiny in absolute
+    # terms and far below what the narrow kernel provides.
+    assert g_coarse[0] < 0.25          # 1 cm: ~0.22 /m
+    assert g_dual[0] > 10 * g_coarse[0]
+    assert g_dual[1] > 10 * g_coarse[1]  # 2 cm
+
+    # CAPTURE RANGE PRESERVED: at 30 cm the dual kernel's gradient is
+    # indistinguishable from today's, while the naive tightening has collapsed.
+    assert torch.allclose(g_dual[4], g_coarse[4], rtol=1e-6)
+    assert g_naive[4] < 1e-12
+    assert g_dual[4] > 1e6 * g_naive[4]
+
+    # And the dual REWARD at 30 cm still equals today's (companion ~0 there).
+    with torch.no_grad():
+        assert torch.allclose(
+            dual(e[4:].pow(2)), coarse(e[4:].pow(2)), rtol=1e-9
+        )
+
+
+def test_dual_sigma_rejects_invalid_parameters():
+    err = torch.tensor([0.0, 1e-3])
+    for bad in ({"fine_weight": 0.5}, {"fine_weight": 0.5, "fine_sigma": 0.0},
+                {"fine_weight": 0.5, "fine_sigma": -0.1},
+                {"fine_weight": -0.5, "fine_sigma": 0.05}):
+        try:
+            tracking._dual_sigma_exp(err, 0.3, **bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"expected ValueError for {bad}")
+
+
+def test_static_hold_vel_penalty_gates_on_reference_stillness():
+    """Velocity term fires ONLY where the reference body is (near) static."""
+    # 3 envs, 2 bodies (think: the two wrists).
+    vel = torch.tensor([
+        [[0.10, 0.0, 0.0], [0.00, 0.0, 0.0]],   # env0: body0 drifting, body1 still
+        [[0.10, 0.0, 0.0], [0.10, 0.0, 0.0]],   # env1: both drifting
+        [[3.00, 0.0, 0.0], [3.00, 0.0, 0.0]],   # env2: both moving fast
+    ])
+    ref_vel = torch.tensor([
+        [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],     # env0: reference STATIC
+        [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],     # env1: reference STATIC
+        [[3.0, 0.0, 0.0], [3.0, 0.0, 0.0]],     # env2: reference MOVING
+    ])
+    out = regularization.compute_static_hold_body_vel_penalty(
+        vel, ref_vel, ref_speed_gate=0.05
+    )
+    # env0: mean(0.10, 0.0) = 0.05 ; env1: mean(0.10, 0.10) = 0.10
+    # env2: reference is moving -> fully EXEMPT -> 0.0
+    assert torch.allclose(out, torch.tensor([0.05, 0.10, 0.0]))
+
+    # A perfectly still hand against a still reference pays exactly zero.
+    still = torch.zeros(3, 2, 3)
+    assert torch.equal(
+        regularization.compute_static_hold_body_vel_penalty(
+            still, ref_vel, ref_speed_gate=0.05
+        ),
+        torch.zeros(3),
+    )
+
+    # Gate 0.0 disables the term entirely, even with a dead-still reference.
+    assert torch.equal(
+        regularization.compute_static_hold_body_vel_penalty(
+            vel, ref_vel, ref_speed_gate=0.0
+        ),
+        torch.zeros(3),
+    )
+
+    # LINEAR in speed (not squared): the whole point is gradient at slow drift.
+    slow = regularization.compute_static_hold_body_vel_penalty(
+        torch.full((1, 1, 3), 0.0), torch.zeros(1, 1, 3), ref_speed_gate=0.05
+    )
+    assert float(slow) == 0.0
+    for speed in (0.01, 0.02, 0.04):
+        v = torch.zeros(1, 1, 3)
+        v[0, 0, 0] = speed
+        got = regularization.compute_static_hold_body_vel_penalty(
+            v, torch.zeros(1, 1, 3), ref_speed_gate=0.05
+        )
+        assert math.isclose(float(got), speed, rel_tol=1e-6)
+
+
+def test_static_hold_vel_penalty_body_subset_and_still_mask():
+    vel = torch.tensor([[[1.0, 0, 0], [0.0, 0, 0], [0.5, 0, 0]]])
+    ref_vel = torch.zeros(1, 3, 3)
+
+    # All bodies: mean(1.0, 0.0, 0.5) = 0.5
+    assert torch.allclose(
+        regularization.compute_static_hold_body_vel_penalty(vel, ref_vel),
+        torch.tensor([0.5]),
+    )
+    # Subset to bodies [0, 2]: mean(1.0, 0.5) = 0.75
+    assert torch.allclose(
+        regularization.compute_static_hold_body_vel_penalty(
+            vel, ref_vel, body_indices=[0, 2]
+        ),
+        torch.tensor([0.75]),
+    )
+    # Env-level still mask False -> everything suppressed.
+    assert torch.equal(
+        regularization.compute_static_hold_body_vel_penalty(
+            vel, ref_vel, reference_still_mask=torch.tensor([False])
+        ),
+        torch.zeros(1),
+    )
+    assert torch.allclose(
+        regularization.compute_static_hold_body_vel_penalty(
+            vel, ref_vel, reference_still_mask=torch.tensor([True])
+        ),
+        torch.tensor([0.5]),
+    )
+
+
+def test_anchor_relative_terms_are_BLIND_to_base_translation_world_term_is_not():
+    """THE FRAME PROOF (2026-08-04 audit) -- headline guard for the hand fix.
+
+    Construct the exact failure mode: the reference is a static hold, the arm
+    holds its pose PERFECTLY relative to the pelvis, and the pelvis translates
+    4 cm sideways carrying the hand with it.
+
+    The anchor-relative term (which is what ``wrist_relative_body_pos`` and
+    ``relative_body_pos`` are) must score this as PERFECT -- proving nothing in
+    the existing stack objects to a hand riding a swaying base. The new
+    world-frame term must score it as an error.
+    """
+    n_body = 4
+    wrist = 3
+    ref_pos = torch.zeros(1, n_body, 3)
+    ref_pos[0, 0] = torch.tensor([0.0, 0.0, 1.0])    # pelvis (anchor, body 0)
+    ref_pos[0, wrist] = torch.tensor([0.4, 0.1, 1.2])  # hand at 0.54 m reach
+    ref_rot = _identity_quat(1, n_body)
+
+    # The WHOLE BODY translates 4 cm in +y -- the measured static-hold drift.
+    # Arm joint angles unchanged => hand-in-pelvis vector is bit-identical.
+    sway = torch.tensor([0.0, 0.04, 0.0])
+    cur_pos = ref_pos + sway
+    cur_anchor_rot = _identity_quat(1)
+
+    anchor_rel = tracking.compute_relative_body_pos_rew(
+        cur_pos, ref_pos, cur_anchor_rot, ref_rot, cur_pos[:, 0],
+        anchor_idx=0, sigma=0.3, body_indices=[wrist],
+    )
+    # PERFECT score: the pelvis offset was subtracted from both sides.
+    assert torch.allclose(anchor_rel, torch.ones(1), atol=1e-6), (
+        "anchor-relative term should be blind to pure base translation"
+    )
+    # Even a NARROW companion cannot see it -- the error it is given is zero.
+    anchor_rel_fine = tracking.compute_relative_body_pos_rew(
+        cur_pos, ref_pos, cur_anchor_rot, ref_rot, cur_pos[:, 0],
+        anchor_idx=0, sigma=0.3, body_indices=[wrist],
+        fine_weight=0.5, fine_sigma=0.05,
+    )
+    assert torch.allclose(anchor_rel_fine, torch.full((1,), 1.5), atol=1e-6), (
+        "a fine companion on an anchor-relative term still sees zero error -- "
+        "tightening sigma there cannot fix world-frame hand drift"
+    )
+
+    # The WORLD-frame term DOES see the 4 cm.
+    world = tracking.compute_global_body_pos_rew(
+        cur_pos, ref_pos, sigma=0.3, body_indices=[wrist]
+    )
+    assert float(world) < 1.0
+    assert math.isclose(float(world), math.exp(-(0.04 ** 2) / 0.3 ** 2), rel_tol=1e-5)
+
+    # ...and the narrow companion is what makes 4 cm actually COST something.
+    world_fine = tracking.compute_global_body_pos_rew(
+        cur_pos, ref_pos, sigma=0.3, body_indices=[wrist],
+        fine_weight=0.5, fine_sigma=0.05,
+    )
+    coarse_loss = 1.0 - float(world)                       # ~0.0177
+    fine_loss = 1.5 - float(world_fine)                    # ~0.254
+    assert fine_loss > 10 * coarse_loss
+
+    # A hand that is genuinely in the right world place scores 1 (+ companion).
+    perfect = tracking.compute_global_body_pos_rew(
+        ref_pos, ref_pos, sigma=0.3, body_indices=[wrist],
+        fine_weight=0.5, fine_sigma=0.05,
+    )
+    assert torch.allclose(perfect, torch.full((1,), 1.5), atol=1e-6)
+
+
+def test_world_body_pos_rew_off_path_and_still_mask():
+    torch.manual_seed(3)
+    cur = torch.randn(3, 5, 3)
+    ref = cur + 0.05 * torch.randn(3, 5, 3)
+
+    # OFF path is bit-exact with the plain global position kernel.
+    assert torch.equal(
+        tracking.compute_global_body_pos_rew(cur, ref, 0.3),
+        tracking.compute_global_position_error_exp(cur, ref, 0.3),
+    )
+    # Still-mask suppresses non-hold envs and leaves hold envs untouched.
+    mask = torch.tensor([True, False, True])
+    gated = tracking.compute_global_body_pos_rew(
+        cur, ref, 0.3, reference_still_mask=mask
+    )
+    ungated = tracking.compute_global_body_pos_rew(cur, ref, 0.3)
+    assert torch.equal(gated[0], ungated[0])
+    assert float(gated[1]) == 0.0
+    assert torch.equal(gated[2], ungated[2])
+    # No mask == mask of all-True.
+    assert torch.equal(
+        tracking.compute_global_body_pos_rew(
+            cur, ref, 0.3, reference_still_mask=torch.ones(3, dtype=torch.bool)
+        ),
+        ungated,
+    )
+
+
+def test_world_hand_sigma_choice_has_gradient_at_the_measured_droop():
+    """Recommended fine sigma must BITE at 40-70 mm, not just at 0.
+
+    Measured static hold: ~40 mm drift on top of a ~66-72 mm standing droop.
+    A narrow Gaussian centered on the reference is useless out there if it is
+    too narrow -- this guards the 0.05 recommendation against a 0.03 regression.
+    """
+    def grad(e, s):
+        return 2 * e / s ** 2 * math.exp(-((e / s) ** 2))
+
+    coarse = grad(0.07, 0.30)
+    fine_05 = 0.5 * grad(0.07, 0.05)
+    fine_03 = 0.5 * grad(0.07, 0.03)
+    # sigma 0.05 more than doubles the restoring gradient at the droop...
+    assert fine_05 > 2.0 * coarse
+    # ...while sigma 0.03 adds under a quarter of it: too narrow to matter.
+    assert fine_03 < 0.25 * coarse
+    # Both still leave the 30 cm capture gradient untouched.
+    for s in (0.05, 0.03):
+        assert 0.5 * grad(0.30, s) < 1e-6 * grad(0.30, 0.30)

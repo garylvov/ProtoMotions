@@ -733,6 +733,52 @@ def main():
             ("global_anchor_pos", "PM_GLOBAL_POS_WEIGHT", _SP, "weight"),
             ("global_anchor_pos", "PM_GLOBAL_POS_SIGMA", _SP, "sigma"),
             ("heading_local_anchor_drift", "PM_HEADING_DRIFT_WEIGHT", _SP, "weight"),
+            # DUAL-SIGMA companions (2026-08-04, static-hold precision): each
+            # position-tracking Gaussian gains an OPTIONAL narrow companion
+            # ``+ fine_weight * exp(-e^2 / fine_sigma^2)`` on top of the
+            # UNCHANGED coarse kernel, so precision near zero error is bought
+            # without shrinking capture range (see rewards/tracking.py
+            # ``_dual_sigma_exp``). Frozen configs were pickled WITHOUT these
+            # keys; the kernel defaults (fine_weight=0.0) keep them
+            # byte-identical, so the companion activates ONLY via these rows.
+            # fine_weight is RELATIVE to the component's own weight.
+            # WORLD-FRAME HAND POSITION (2026-08-04 frame audit): the only
+            # term that scores where the hand actually is in the WORLD, so the
+            # arm is paid to cancel base sway. Every other body-position term
+            # is anchor-relative and cancels pelvis translation/yaw exactly.
+            ("global_wrist_pos", "PM_GLOBAL_WRIST_POS_WEIGHT", _SP, "weight"),
+            ("global_wrist_pos", "PM_GLOBAL_WRIST_POS_SIGMA", _SP, "sigma"),
+            ("global_wrist_pos", "PM_GLOBAL_WRIST_POS_FINE_WEIGHT", _SP, "fine_weight"),
+            ("global_wrist_pos", "PM_GLOBAL_WRIST_POS_FINE_SIGMA", _SP, "fine_sigma"),
+            ("relative_body_pos", "PM_REL_POS_FINE_WEIGHT", _SP, "fine_weight"),
+            ("relative_body_pos", "PM_REL_POS_FINE_SIGMA", _SP, "fine_sigma"),
+            # wrist_relative_body_pos is the term that actually governs the
+            # HAND (anchor-relative, heading-local, body_indices = wrists).
+            ("wrist_relative_body_pos", "PM_WRIST_POS_FINE_WEIGHT", _SP, "fine_weight"),
+            ("wrist_relative_body_pos", "PM_WRIST_POS_FINE_SIGMA", _SP, "fine_sigma"),
+            ("global_anchor_pos", "PM_GLOBAL_POS_FINE_WEIGHT", _SP, "fine_weight"),
+            ("global_anchor_pos", "PM_GLOBAL_POS_FINE_SIGMA", _SP, "fine_sigma"),
+            ("dof_pos_track", "PM_DOF_POS_TRACK_FINE_WEIGHT", _SP, "fine_weight"),
+            ("dof_pos_track", "PM_DOF_POS_TRACK_FINE_SIGMA", _SP, "fine_sigma"),
+            (
+                "heading_local_anchor_drift",
+                "PM_HEADING_DRIFT_FINE_WEIGHT",
+                _SP,
+                "fine_weight",
+            ),
+            (
+                "heading_local_anchor_drift",
+                "PM_HEADING_DRIFT_FINE_SIGMA",
+                _SP,
+                "fine_sigma",
+            ),
+            # Static-hold body VELOCITY penalty (2026-08-04): gate + weight for
+            # the reference-still-gated hand/body velocity term. The component
+            # itself is registered by the fresh-build gate
+            # (PM_STATIC_HOLD_VEL_WEIGHT in teacher.py); these rows let a RESUME
+            # retune an already-registered one.
+            ("static_hold_vel", "PM_STATIC_HOLD_VEL_WEIGHT", _SP, "weight"),
+            ("static_hold_vel", "PM_STATIC_HOLD_VEL_REF_GATE", _SP, "ref_speed_gate"),
             # DOF-limit soft-margin proximity (2026-07-29, knees-at-full-
             # extension fix): frozen configs were pickled WITHOUT these keys;
             # the kernel defaults (soft_margin_frac=0.0) keep them byte-
@@ -776,6 +822,11 @@ def main():
             log.warning(
                 f"RESUME override {_comp}.{_key} = {_fval} (was {_old}, from {_var})"
             )
+        from protomotions.envs.component_factories import (
+            validate_dual_sigma_components as _validate_dual_sigma,
+        )
+
+        _validate_dual_sigma(_rc, log_fn=log.warning)
         # v5.2 placement gate needs a dynamic_var the pre-v5.2 frozen configs
         # were pickled WITHOUT: ref_rigid_body_pos. Inject it on resume when
         # the placement sigma is explicitly enabled, else the kernel silently

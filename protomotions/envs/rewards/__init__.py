@@ -48,6 +48,7 @@ from protomotions.envs.rewards.tracking import (
     compute_global_orientation_error_exp,
     compute_global_anchor_ori_rew,
     compute_relative_body_pos_rew,
+    compute_global_body_pos_rew,
     compute_relative_body_ori_rew,
     compute_dof_pos_track_rew,
     compute_global_body_lin_vel_rew,
@@ -93,6 +94,7 @@ from protomotions.envs.rewards.regularization import (
     compute_foot_slip_penalty,
     compute_fall_penalty,
     compute_drift_penalty,
+    compute_static_hold_body_vel_penalty,
     # Helper functions
     joint_limit_violation,
     contact_mismatch_sum,
@@ -129,6 +131,7 @@ __all__ = [
     "compute_global_orientation_error_exp",
     "compute_global_anchor_ori_rew",
     "compute_relative_body_pos_rew",
+    "compute_global_body_pos_rew",
     "compute_relative_body_ori_rew",
     "compute_dof_pos_track_rew",
     "compute_global_body_lin_vel_rew",
@@ -165,6 +168,7 @@ __all__ = [
     "StepBudgetPenalty",
     "compute_fall_penalty",
     "compute_drift_penalty",
+    "compute_static_hold_body_vel_penalty",
     # Regularization helper functions
     "joint_limit_violation",
     "contact_mismatch_sum",

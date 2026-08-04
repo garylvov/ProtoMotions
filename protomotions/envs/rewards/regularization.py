@@ -606,6 +606,84 @@ def compute_drift_penalty(
     return (distance > drift_threshold).float()
 
 
+def compute_static_hold_body_vel_penalty(
+    rigid_body_vel: Tensor,
+    ref_rigid_body_vel: Tensor,
+    body_indices: Optional[Tensor] = None,
+    ref_speed_gate: float = 0.05,
+    reference_still_mask: Optional[Tensor] = None,
+) -> Tensor:
+    """Body-velocity penalty GATED on the reference body being (near) STATIC.
+
+    THE GAP THIS CLOSES. Nothing in the canonical teacher reward prices a
+    HAND that keeps MOVING while its reference target is parked:
+
+    - ``relative_body_pos`` / ``wrist_relative_body_pos`` price POSITION error
+      only, through a sigma=0.3 m Gaussian that is nearly flat inside a few
+      centimetres -- a slow sway inside the dead zone is essentially free.
+    - ``body_lin_vel`` DOES see velocity, but as a Gaussian on the velocity
+      MATCH error with sigma = 1.0 m/s. A 0.05 m/s hand sway against a static
+      reference scores exp(-0.0025) = 0.9975: also free.
+    - ``hold_balance`` is the only reference-still-gated velocity term in the
+      stack, and it watches the ROOT linear velocity + torso upright only. It
+      never looks at a hand.
+
+    So a hand can orbit its target indefinitely at low speed and pay nothing.
+    This kernel prices exactly that: while the REFERENCE body is (near) still,
+    the body's OWN speed costs. Apply a NEGATIVE weight in the factory.
+
+    GATE. Per body and per env, the penalty engages only where
+    ``||ref_body_vel|| < ref_speed_gate``. A body whose reference is genuinely
+    MOVING is completely exempt -- fast tracking motion is never taxed, so this
+    cannot fight the imitation objective. Setting ``ref_speed_gate = 0.0``
+    disables the term entirely (nothing can be strictly below zero), which is
+    the natural "off" value alongside weight 0.0.
+
+    MAGNITUDE, NOT SQUARED, is deliberate: the whole complaint is SLOW drift,
+    and a squared form has vanishing gradient exactly there (d(v^2)/dv = 2v ->
+    0). The linear form keeps a constant restoring gradient down to zero speed,
+    matching ``compute_foot_slip_penalty``'s convention.
+
+    OPTIONAL ENV-LEVEL MASK. ``reference_still_mask`` (the HOLD-FIX
+    ``EnvContext.reference_still_mask``) is ANDed in when supplied, restricting
+    the term to envs the env itself already classifies as a hold. It defaults
+    to None so the kernel is fully self-contained and does NOT require HOLD-FIX
+    to be enabled -- the per-body reference-speed gate alone is sufficient.
+
+    RESUME RULE (Rule 10): this is a NEW component, registered only when its
+    weight env knob is explicitly set. Frozen configs that lack it are
+    unaffected; there is no in-place change to any existing kernel.
+
+    Args:
+        rigid_body_vel: Current per-body linear velocities
+            [num_envs, num_bodies, 3] (m/s, world frame).
+        ref_rigid_body_vel: Reference per-body linear velocities
+            [num_envs, num_bodies, 3] (m/s, world frame).
+        body_indices: Optional body indices to restrict the term to (e.g. the
+            two wrist bodies). None = all bodies.
+        ref_speed_gate: Reference speed (m/s) strictly below which a body
+            counts as a static hold. 0.0 = term disabled.
+        reference_still_mask: Optional bool/float [num_envs] env-level hold
+            mask, ANDed with the per-body gate when provided.
+
+    Returns:
+        Mean over the selected bodies of the gated speed magnitude (m/s)
+        [num_envs], >= 0. Zero when no reference body is static.
+    """
+    if body_indices is not None:
+        rigid_body_vel = rigid_body_vel[:, body_indices]
+        ref_rigid_body_vel = ref_rigid_body_vel[:, body_indices]
+
+    ref_speed = ref_rigid_body_vel.pow(2).sum(dim=-1).sqrt()
+    speed = rigid_body_vel.pow(2).sum(dim=-1).sqrt()
+
+    gate = (ref_speed < ref_speed_gate).to(speed.dtype)
+    if reference_still_mask is not None:
+        gate = gate * reference_still_mask.to(speed.dtype).unsqueeze(-1)
+
+    return (speed * gate).mean(dim=-1)
+
+
 # =============================================================================
 # Helper Functions (used by kernels or for advanced use cases)
 # =============================================================================
@@ -707,6 +785,7 @@ __all__ = [
     "compute_foot_contact_force_penalty",
     "compute_foot_slip_penalty",
     "compute_fall_penalty",
+    "compute_static_hold_body_vel_penalty",
     # Helper functions
     "joint_limit_violation",
     "contact_mismatch_sum",

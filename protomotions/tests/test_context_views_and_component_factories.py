@@ -489,3 +489,321 @@ def test_resume_inject_reward_components_v54_dormant_activation():
         frozen2, env={"PM_CONTACT_MATCH_WEIGHT": ""}, log_fn=lambda _l: None
     )
     assert changed is False and frozen2 == {}
+
+
+# =============================================================================
+# DUAL-SIGMA companion + static-hold velocity penalty (2026-08-04)
+# =============================================================================
+
+_DUAL_SIGMA_FACTORIES = {
+    "global_anchor_pos": factories.global_anchor_pos_rew_factory,
+    "global_wrist_pos": factories.global_body_pos_rew_factory,
+    "relative_body_pos": factories.relative_body_pos_rew_factory,
+    "dof_pos_track": factories.dof_pos_track_rew_factory,
+    "heading_local_anchor_drift": factories.heading_local_anchor_drift_rew_factory,
+}
+
+
+def test_dual_sigma_factories_add_no_static_params_when_off():
+    """RULE 10: unset companion => static_params byte-identical to before.
+
+    Not merely "fine_weight == 0": the KEYS must be ABSENT, so a config pickled
+    by this build is indistinguishable from one pickled before the option
+    existed and no frozen-config comparison can drift.
+    """
+    for name, factory in _DUAL_SIGMA_FACTORIES.items():
+        default = _params(factory())
+        explicit_off = _params(factory(fine_weight=0.0))
+        assert "fine_weight" not in default, name
+        assert "fine_sigma" not in default, name
+        assert default == explicit_off, name
+        # A sigma supplied without a weight is still fully off.
+        assert _params(factory(fine_weight=0.0, fine_sigma=0.05)) == default, name
+
+
+def test_dual_sigma_factories_record_companion_when_enabled():
+    for name, factory in _DUAL_SIGMA_FACTORIES.items():
+        params = _params(factory(fine_weight=0.5, fine_sigma=0.05))
+        assert params["fine_weight"] == 0.5, name
+        assert params["fine_sigma"] == 0.05, name
+        # The coarse sigma is untouched by enabling the companion.
+        assert params["sigma"] == _params(factory())["sigma"], name
+
+
+def test_dual_sigma_factories_reject_half_set_and_invalid_pairs():
+    for name, factory in _DUAL_SIGMA_FACTORIES.items():
+        for bad in (
+            {"fine_weight": 0.5},                        # sigma missing
+            {"fine_weight": 0.5, "fine_sigma": 0.0},     # sigma not positive
+            {"fine_weight": 0.5, "fine_sigma": -0.05},
+            {"fine_weight": -0.5, "fine_sigma": 0.05},   # negative weight
+        ):
+            try:
+                factory(**bad)
+            except ValueError:
+                continue
+            raise AssertionError(f"{name}: expected ValueError for {bad}")
+
+
+def test_wrist_position_term_is_the_hand_governing_dual_sigma_binding():
+    """The wrist term is relative_body_pos restricted to the wrist bodies.
+
+    Guards the Task-1 finding: hand placement is scored anchor-relative in the
+    heading-local frame, NOT in world coordinates, and NOT by global_anchor_pos
+    (which is the ROOT). If this binding ever changes, the dual-sigma knob
+    aimed at the hand is aimed at the wrong thing.
+    """
+    wrist = factories.relative_body_pos_rew_factory(
+        weight=1.3, sigma=0.3, body_indices=[21, 28],
+        fine_weight=0.5, fine_sigma=0.05,
+    )
+    params, bindings = _params(wrist), _bindings(wrist)
+    assert params["body_indices"] == [21, 28]
+    assert params["fine_weight"] == 0.5 and params["fine_sigma"] == 0.05
+    # Anchor-relative + heading-local: needs the anchor pose, not just world pos.
+    assert bindings["current_rigid_body_pos"] == "current.rigid_body_pos"
+    assert bindings["current_anchor_pos"] == "current.anchor_pos"
+    assert bindings["current_anchor_rot"] == "current.anchor_rot"
+    assert bindings["anchor_idx"] == "mimic.anchor_idx"
+
+    # global_anchor_pos, by contrast, never sees a per-body position at all.
+    root = _bindings(factories.global_anchor_pos_rew_factory(weight=0.5))
+    assert "current_rigid_body_pos" not in root
+    assert root["current_anchor_pos"] == "current.anchor_pos"
+
+
+def test_static_hold_vel_penalty_factory_binds_and_resolves_bodies():
+    comp = factories.static_hold_body_vel_penalty_factory(
+        weight=-0.5, ref_speed_gate=0.05
+    )
+    params, bindings = _params(comp), _bindings(comp)
+    assert params["weight"] == -0.5
+    assert params["ref_speed_gate"] == 0.05
+    assert params["zero_during_grace_period"] is True
+    assert "body_indices" not in params  # None = all bodies
+    assert bindings["rigid_body_vel"] == "current.rigid_body_vel"
+    assert bindings["ref_rigid_body_vel"] == "mimic.ref_state.rigid_body_vel"
+    # Self-contained by default: no HOLD-FIX still-mask dependency.
+    assert "reference_still_mask" not in bindings
+
+    masked = factories.static_hold_body_vel_penalty_factory(
+        weight=-0.5, use_reference_still_mask=True
+    )
+    assert _bindings(masked)["reference_still_mask"] == "reference_still_mask"
+
+    named = factories.static_hold_body_vel_penalty_factory(
+        weight=-0.5,
+        body_names=["pelvis", "left_wrist_yaw_link", "right_wrist_yaw_link"],
+        body_name_filter=["left_wrist_yaw_link", "right_wrist_yaw_link"],
+    )
+    assert _params(named)["body_indices"] == [1, 2]
+
+    for bad in (
+        {"body_indices": [1], "body_name_filter": ["x"]},  # mutually exclusive
+        {"body_name_filter": ["x"]},                       # body_names missing
+    ):
+        try:
+            factories.static_hold_body_vel_penalty_factory(weight=-0.5, **bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"expected ValueError for {bad}")
+
+
+def test_train_agent_resume_rows_cover_every_dual_sigma_and_static_hold_knob():
+    """READER/WRITER LAW: a fresh-build gate without its resume row is a trap.
+
+    The resume path freezes the reward config from the pickle, so a knob that
+    only exists in teacher.py silently no-ops on every warm resume. Assert the
+    re-apply table carries BOTH halves of every dual-sigma pair plus the
+    static-hold velocity knobs.
+    """
+    import pathlib
+
+    source = pathlib.Path(
+        __file__
+    ).resolve().parents[1].joinpath("train_agent.py").read_text()
+
+    expected = [
+        ("global_wrist_pos", "PM_GLOBAL_WRIST_POS_WEIGHT", "weight"),
+        ("global_wrist_pos", "PM_GLOBAL_WRIST_POS_SIGMA", "sigma"),
+        ("global_wrist_pos", "PM_GLOBAL_WRIST_POS_FINE_WEIGHT", "fine_weight"),
+        ("global_wrist_pos", "PM_GLOBAL_WRIST_POS_FINE_SIGMA", "fine_sigma"),
+        ("relative_body_pos", "PM_REL_POS_FINE_WEIGHT", "fine_weight"),
+        ("relative_body_pos", "PM_REL_POS_FINE_SIGMA", "fine_sigma"),
+        ("wrist_relative_body_pos", "PM_WRIST_POS_FINE_WEIGHT", "fine_weight"),
+        ("wrist_relative_body_pos", "PM_WRIST_POS_FINE_SIGMA", "fine_sigma"),
+        ("global_anchor_pos", "PM_GLOBAL_POS_FINE_WEIGHT", "fine_weight"),
+        ("global_anchor_pos", "PM_GLOBAL_POS_FINE_SIGMA", "fine_sigma"),
+        ("dof_pos_track", "PM_DOF_POS_TRACK_FINE_WEIGHT", "fine_weight"),
+        ("dof_pos_track", "PM_DOF_POS_TRACK_FINE_SIGMA", "fine_sigma"),
+        ("heading_local_anchor_drift", "PM_HEADING_DRIFT_FINE_WEIGHT", "fine_weight"),
+        ("heading_local_anchor_drift", "PM_HEADING_DRIFT_FINE_SIGMA", "fine_sigma"),
+        ("static_hold_vel", "PM_STATIC_HOLD_VEL_WEIGHT", "weight"),
+        ("static_hold_vel", "PM_STATIC_HOLD_VEL_REF_GATE", "ref_speed_gate"),
+    ]
+    for comp, var, key in expected:
+        assert f'"{var}"' in source, f"missing resume row for {var}"
+        assert f'"{comp}"' in source, f"missing component {comp}"
+        assert f'"{key}"' in source, f"missing static_params key {key}"
+
+
+def test_validate_dual_sigma_components_proves_and_rejects():
+    """The resume-time pair validator: loud proof lines, hard errors."""
+    # Nothing enabled => silent, nothing active.
+    frozen = {
+        "relative_body_pos": factories.relative_body_pos_rew_factory(),
+        "global_anchor_pos": factories.global_anchor_pos_rew_factory(),
+    }
+    lines = []
+    assert factories.validate_dual_sigma_components(frozen, lines.append) == []
+    assert lines == []
+
+    # Enabled => proof line naming the coarse sigma, fine width, and new max.
+    frozen["global_anchor_pos"].static_params["fine_weight"] = 0.5
+    frozen["global_anchor_pos"].static_params["fine_sigma"] = 0.05
+    lines = []
+    active = factories.validate_dual_sigma_components(frozen, lines.append)
+    assert active == ["global_anchor_pos"]
+    proof = [l for l in lines if l.startswith("DUAL-SIGMA ACTIVE global_anchor_pos")]
+    assert len(proof) == 1
+    assert "sigma=0.3" in proof[0] and "0.05" in proof[0] and "1.500" in proof[0]
+
+    # A fine sigma that is NOT narrower is a loud SUSPECT warning, not silence.
+    frozen["global_anchor_pos"].static_params["fine_sigma"] = 0.4
+    lines = []
+    factories.validate_dual_sigma_components(frozen, lines.append)
+    assert any(l.startswith("DUAL-SIGMA SUSPECT") for l in lines)
+
+    # Half-set pair (weight without sigma) is a HARD error, not a rollout NaN.
+    frozen["global_anchor_pos"].static_params.pop("fine_sigma")
+    try:
+        factories.validate_dual_sigma_components(frozen, lambda _l: None)
+    except ValueError as exc:
+        assert "fine_sigma" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for half-set dual-sigma pair")
+
+    # Negative fine weight is rejected.
+    frozen["global_anchor_pos"].static_params["fine_weight"] = -0.5
+    frozen["global_anchor_pos"].static_params["fine_sigma"] = 0.05
+    try:
+        factories.validate_dual_sigma_components(frozen, lambda _l: None)
+    except ValueError as exc:
+        assert "fine_weight" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for negative fine_weight")
+
+    # A component absent from the frozen config is skipped, never invented.
+    assert factories.validate_dual_sigma_components({}, lambda _l: None) == []
+
+
+def test_global_body_pos_factory_binds_world_frame_and_resolves_body_names():
+    """The world-frame wrist term: bindings, body-set resolution, gating."""
+    comp = factories.global_body_pos_rew_factory(
+        weight=0.6, sigma=0.3, body_indices=[21, 28]
+    )
+    params, bindings = _params(comp), _bindings(comp)
+    assert params["weight"] == 0.6 and params["sigma"] == 0.3
+    assert params["body_indices"] == [21, 28]
+    # WORLD frame: raw body positions vs raw reference positions. Crucially it
+    # binds NEITHER anchor_pos NOR anchor_rot -- that is the whole difference
+    # from relative_body_pos, which subtracts the anchor from both sides and so
+    # cancels base sway exactly.
+    assert bindings["current_rigid_body_pos"] == "current.rigid_body_pos"
+    assert bindings["ref_rigid_body_pos"] == "mimic.ref_state.rigid_body_pos"
+    assert "current_anchor_pos" not in bindings
+    assert "current_anchor_rot" not in bindings
+    assert "anchor_idx" not in bindings
+    # Default is UNGATED (holds + motion).
+    assert "reference_still_mask" not in bindings
+
+    gated = factories.global_body_pos_rew_factory(
+        weight=0.6, use_reference_still_mask=True
+    )
+    assert _bindings(gated)["reference_still_mask"] == "reference_still_mask"
+
+    # Body NAMES resolve through body_weights (name -> multiplier).
+    named = factories.global_body_pos_rew_factory(
+        weight=0.6,
+        body_names=["pelvis", "left_wrist_yaw_link", "right_wrist_yaw_link"],
+        body_weights={"left_wrist_yaw_link": 1.0, "right_wrist_yaw_link": 1.0},
+    )
+    assert _params(named)["body_indices"] == [1, 2]
+
+    # An unknown body name must FAIL LOUDLY, never resolve to a silent default.
+    try:
+        factories.global_body_pos_rew_factory(
+            weight=0.6,
+            body_names=["pelvis", "left_wrist_yaw_link"],
+            body_weights={"no_such_link": 1.0},
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected a hard failure on an unknown body name")
+
+
+def test_global_wrist_pos_stat_writer_emits_metres_only_when_registered():
+    """READER/WRITER: the go/no-go stat must exist, be a Tensor, and be silent
+    when the reward component is absent.
+
+    The reward itself is a Gaussian that already reads ~0.95 at the measured
+    error, so the METRE-valued error stat is what makes "is it learning"
+    answerable. It must also survive the agent's extras aggregator, which
+    silently drops non-Tensor values and skips anything under ``raw/``.
+    """
+    from protomotions.envs.base_env.env import BaseEnv
+
+    cur = torch.zeros(2, 4, 3)
+    ref = torch.zeros(2, 4, 3)
+    # env0: wrist bodies (2, 3) off by 3 cm and 7 cm. env1: exact.
+    cur[0, 2, 0] = 0.03
+    cur[0, 3, 1] = 0.07
+
+    ctx = SimpleNamespace(
+        current=SimpleNamespace(rigid_body_pos=cur),
+        mimic=SimpleNamespace(ref_state=SimpleNamespace(rigid_body_pos=ref)),
+    )
+
+    # --- component ABSENT => no keys written at all (Rule 10).
+    quiet = SimpleNamespace(
+        config=SimpleNamespace(reward_components={}), extras={}
+    )
+    BaseEnv._log_global_wrist_pos_extras(quiet, ctx)
+    assert quiet.extras == {}
+
+    # --- component REGISTERED => metre-valued per-env error over its body set.
+    comp = factories.global_body_pos_rew_factory(weight=0.6, body_indices=[2, 3])
+    env = SimpleNamespace(
+        config=SimpleNamespace(reward_components={"global_wrist_pos": comp}),
+        extras={},
+    )
+    BaseEnv._log_global_wrist_pos_extras(env, ctx)
+
+    assert set(env.extras) == {
+        "global_wrist_pos/err_m", "global_wrist_pos/err_max_m"
+    }
+    for key, value in env.extras.items():
+        assert isinstance(value, torch.Tensor), f"{key} must be a Tensor"
+        assert not key.startswith("raw/"), f"{key} would be skipped by the agent"
+        assert value.shape == (2,)
+
+    # env0 mean of (0.03, 0.07) = 0.05 ; max = 0.07 ; env1 is exact.
+    assert torch.allclose(
+        env.extras["global_wrist_pos/err_m"], torch.tensor([0.05, 0.0]), atol=1e-6
+    )
+    assert torch.allclose(
+        env.extras["global_wrist_pos/err_max_m"],
+        torch.tensor([0.07, 0.0]),
+        atol=1e-6,
+    )
+
+    # --- no mimic reference (e.g. a non-mimic env) => silent, no partial keys.
+    env2 = SimpleNamespace(
+        config=SimpleNamespace(reward_components={"global_wrist_pos": comp}),
+        extras={},
+    )
+    BaseEnv._log_global_wrist_pos_extras(
+        env2, SimpleNamespace(current=ctx.current, mimic=None)
+    )
+    assert env2.extras == {}

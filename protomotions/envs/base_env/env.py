@@ -1139,6 +1139,13 @@ class BaseEnv:
         # DELAY-DR instrumentation (no-op unless ACTION_DELAY_DR armed).
         self._log_delay_dr_extras()
 
+        # WORLD-frame wrist position error in METRES (no-op unless the
+        # global_wrist_pos reward component is registered). Deliberately NOT
+        # inside _log_hold_fix_extras: that helper returns early when no
+        # HOLD-FIX tracker is armed, and this stat must be readable whether or
+        # not HOLD-FIX is on.
+        self._log_global_wrist_pos_extras(self._current_context)
+
         # FALL-PENALTY visibility (2026-07-10 convene follow-up): the per-env
         # raw_r mean dilutes rare falls to 0.000 at TB precision; log the raw
         # firing COUNT per step across the batch so the tag is visibly alive.
@@ -1608,6 +1615,46 @@ class BaseEnv:
             self.extras["root_gain/active_frac"] = (
                 root_gain_tracker.active_frac.clone()
             )
+
+    def _log_global_wrist_pos_extras(self, ctx):
+        """WORLD-frame wrist position error, in METRES -- the go/no-go stat.
+
+        The ``global_wrist_pos`` reward is a Gaussian, so its own value is a
+        poor progress read: at the measured ~0.07 m error a sigma=0.3 kernel
+        already reads 0.95, and the whole point of the term is that such
+        errors were previously invisible. This logs the RAW error the term is
+        built on, in metres, so "is the arm learning to cancel base sway" is
+        answerable by eye.
+
+        Why it is needed at all: every OTHER body-position term is
+        anchor-relative, so no existing stat measures where the hand is in the
+        WORLD -- a hand riding a swaying base reads as perfect everywhere else.
+
+        Written ONLY when the reward component is registered, so unset configs
+        emit no new keys (Rule 10) and pay no cost. Values are Tensors (a
+        python float is silently dropped by the agent's extras aggregator) and
+        avoid the ``raw/`` prefix (which the aggregator skips).
+
+        TB tags: ``env/global_wrist_pos/err_m_mean`` (primary),
+        ``env/global_wrist_pos/err_max_m_mean``.
+        """
+        component = (self.config.reward_components or {}).get("global_wrist_pos")
+        if component is None:
+            return
+        mimic = getattr(ctx, "mimic", None)
+        if mimic is None or mimic.ref_state is None:
+            return
+        ref_state = mimic.ref_state
+        body_indices = component.static_params.get("body_indices")
+        current = ctx.current.rigid_body_pos
+        reference = ref_state.rigid_body_pos
+        if body_indices is not None:
+            current = current[:, body_indices]
+            reference = reference[:, body_indices]
+        # Per-body Euclidean distance [num_envs, num_bodies], then reduce.
+        distance = (current - reference).pow(2).sum(dim=-1).sqrt()
+        self.extras["global_wrist_pos/err_m"] = distance.mean(dim=-1)
+        self.extras["global_wrist_pos/err_max_m"] = distance.max(dim=-1).values
 
     def _log_delay_dr_extras(self):
         """DELAY-DR conviction instrumentation (per delay-bin outcome stats).
