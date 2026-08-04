@@ -81,6 +81,11 @@ for _name in (
     "_update_wrench_randomization",
     "_reset_wrench_randomization",
     "set_wrench_reference_scale_from_reference",
+    "_perturb_gain_multiplier",
+    # PM_DR_* env-gated override helpers (pre-existing borrow gap: the
+    # harness broke when _summed_wrench_buffers grew these calls).
+    "_wrench_dr_env_mask",
+    "_wrench_dr_force_scale",
 ):
     setattr(_Host, _name, getattr(Simulator, _name))
 _Host._sample_wrench_vectors = staticmethod(Simulator._sample_wrench_vectors)

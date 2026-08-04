@@ -894,6 +894,49 @@ def main():
             _ctrl.initialize_control_info(robot_config.asset)
             log.warning("RESUME override arm: rebuilt control_info from MJCF + overrides")
 
+        # PM_GAIN_DR_LOW / PM_GAIN_DR_HIGH (env-gated, resume-safe):
+        # MARIONETTE-mode actuator-gain DR range widening (2026-08-04).
+        # simulator_config is frozen from the pickle, so teacher.py's
+        # fresh-build gate never runs on a resume -- re-apply the sampled
+        # gain-scale range here. The simulator is rebuilt from
+        # simulator_config every boot and GAIN-DR resamples at build, so
+        # mutating the ranges is sufficient. Both stiffness and damping
+        # ranges move together (single knob pair). GUARD: fires only when
+        # a var is EXPLICITLY PRESENT; unset = frozen ranges byte-identical.
+        # Companion runtime knobs PM_PERTURB_GAIN_EXP / PM_PERTURB_SCALE_MIN
+        # are read LIVE by the simulator (no config row needed; default
+        # exp=0 = coupling OFF = byte-identical).
+        _glo = os.environ.get("PM_GAIN_DR_LOW")
+        _ghi = os.environ.get("PM_GAIN_DR_HIGH")
+        if _glo is not None or _ghi is not None:
+            _ag = getattr(
+                getattr(simulator_config, "domain_randomization", None),
+                "actuator_gain",
+                None,
+            )
+            if _ag is None:
+                log.warning(
+                    "RESUME override SKIPPED: PM_GAIN_DR_LOW/HIGH set but "
+                    "actuator_gain DR is absent from the frozen config "
+                    "(env vars have NO effect on this resume)"
+                )
+            else:
+                for _fld in ("stiffness_scale_range", "damping_scale_range"):
+                    _old = getattr(_ag, _fld)
+                    _new = (
+                        float(_glo) if _glo is not None else float(_old[0]),
+                        float(_ghi) if _ghi is not None else float(_old[1]),
+                    )
+                    if not (0.0 < _new[0] <= _new[1]):
+                        raise ValueError(
+                            f"PM_GAIN_DR_LOW/HIGH must satisfy 0 < low <= high, got {_new}"
+                        )
+                    setattr(_ag, _fld, _new)
+                    log.warning(
+                        f"RESUME override actuator_gain.{_fld} = {_new} "
+                        f"(was {tuple(_old)}, from PM_GAIN_DR_LOW/PM_GAIN_DR_HIGH)"
+                    )
+
         # v5.4 COMPONENT INJECTION (env-gated, resume-safe): reward components
         # are env-side -- adding one changes no obs/network shape -- but the
         # re-apply family above can only PATCH components already present in

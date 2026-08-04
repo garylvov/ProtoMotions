@@ -394,6 +394,13 @@ class Simulator(RecordingMixin, ABC):
             torch.rand(num_due, 3, device=self.device) * 2 - 1
         ) * self._push_max_ang_vel * _pscale
 
+        # MARIONETTE coupling: soft-plant (low-gain) envs get proportionally
+        # weaker pushes. None (byte-identical) unless PM_PERTURB_GAIN_EXP set.
+        _gmult = self._perturb_gain_multiplier()
+        if _gmult is not None:
+            lin_vel = lin_vel * _gmult[due_env_ids, None]
+            ang_vel = ang_vel * _gmult[due_env_ids, None]
+
         self._apply_root_velocity_impulse(lin_vel, ang_vel, due_env_ids)
         if getattr(self, "_push_grace_steps", 0) > 0:
             # Arm the post-push action-rate grace window for the pushed envs.
@@ -643,6 +650,15 @@ class Simulator(RecordingMixin, ABC):
         if fscale is not None:
             total_f = total_f * fscale
             total_t = total_t * fscale
+        # MARIONETTE coupling: per-env gain-tied down-scale of the SUMMED
+        # wrench+bag force/torque (covers the short-burst wrench class, the
+        # sustained wrist-bag class, and any additional classes alike, since
+        # all are summed here). None (byte-identical) unless
+        # PM_PERTURB_GAIN_EXP is set — see _perturb_gain_multiplier.
+        gmult = self._perturb_gain_multiplier()
+        if gmult is not None:
+            total_f = total_f * gmult[:, None, None]
+            total_t = total_t * gmult[:, None, None]
         return total_f, total_t
 
     def _wrench_dr_force_scale(self):
@@ -672,6 +688,61 @@ class Simulator(RecordingMixin, ABC):
                 < self._pm_dr_env_fraction
             )
         return self._pm_dr_env_mask
+
+    def _perturb_gain_multiplier(self):
+        """MARIONETTE coupling (2026-08-04): per-env perturbation scale tied
+        to the episode's sampled actuator-gain scale.
+
+        ``multiplier_e = clamp(g_e ** PM_PERTURB_GAIN_EXP,
+        PM_PERTURB_SCALE_MIN, 1.0)`` where ``g_e`` is the per-env geometric
+        mean of the GAIN-DR stiffness scales (``env_gain_scale``, stamped by
+        ``_process_actuator_gain_domain_randomization`` at sample time — the
+        exact scales the episode's plant runs with; GAIN-DR is a static
+        per-env assignment). A soft plant cannot resist full-strength pokes:
+        unscaled pushes/wrenches on low-gain envs just teach falling.
+
+        Returns None (a FULL no-op — push and wrench paths untouched,
+        byte-identical) when PM_PERTURB_GAIN_EXP is unset or 0, or when
+        GAIN-DR is inactive (loud WARNING in that case: the knob was set but
+        cannot act). Parsed and built once, cached on ``self.device``.
+        Knobs: PM_PERTURB_GAIN_EXP (default 0 = OFF; 1.0 = linear coupling),
+        PM_PERTURB_SCALE_MIN (default 0.25 = floor of the down-scale).
+        """
+        if not hasattr(self, "_pm_perturb_gain_mult"):
+            _exp = float(os.environ.get("PM_PERTURB_GAIN_EXP", "0") or "0")
+            _min = float(os.environ.get("PM_PERTURB_SCALE_MIN", "0.25") or "0.25")
+            self._pm_perturb_gain_mult = None
+            if _exp != 0.0:
+                _dr = getattr(self, "_domain_randomization", None) or {}
+                _gain_dr = _dr.get("actuator_gain")
+                _g = None if _gain_dr is None else _gain_dr.get("env_gain_scale")
+                if _g is None:
+                    log.warning(
+                        "[marionette] PM_PERTURB_GAIN_EXP=%s is set but "
+                        "actuator_gain DR is not active (no per-env gain "
+                        "scale) — perturbation-gain coupling is a NO-OP",
+                        _exp,
+                    )
+                else:
+                    _mult = torch.clamp(
+                        _g.to(device=self.device, dtype=torch.float) ** _exp,
+                        min=_min,
+                        max=1.0,
+                    )
+                    self._pm_perturb_gain_mult = _mult
+                    log.warning(
+                        "[marionette] perturbation-gain coupling ACTIVE: "
+                        "exp=%.3f min=%.3f -> multiplier mean/min/max="
+                        "%.4f/%.4f/%.4f over %d envs (applies to push "
+                        "velocities + wrench/sustained-burst forces+torques)",
+                        _exp,
+                        _min,
+                        _mult.mean().item(),
+                        _mult.min().item(),
+                        _mult.max().item(),
+                        self.num_envs,
+                    )
+        return self._pm_perturb_gain_mult
 
     def set_wrench_reference_scale_from_reference(
         self,
@@ -2368,11 +2439,20 @@ class Simulator(RecordingMixin, ABC):
             )
         )
 
+        # MARIONETTE coupling (2026-08-04): per-env aggregate gain scale
+        # g_e = geometric mean of the sampled stiffness scales across the
+        # randomized DOFs. Consumed by _perturb_gain_multiplier() to scale
+        # push/wrench perturbations DOWN on soft-plant (low-gain) envs.
+        # Pure extra dict key — backend apply paths read only the four keys
+        # above, so this is byte-identical for every existing consumer.
+        env_gain_scale = torch.exp(torch.log(stiffness_scales).mean(dim=1))
+
         return {
             "dof_indices": dof_indices,
             "stiffness_scales": stiffness_scales,
             "damping_scales": damping_scales,
             "effort_limit_scales": effort_limit_scales,
+            "env_gain_scale": env_gain_scale,
         }
 
     def _process_object_asset_domain_randomization(
