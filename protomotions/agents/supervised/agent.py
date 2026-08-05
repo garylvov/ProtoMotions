@@ -506,7 +506,347 @@ class SupervisedAgent(BaseAgent):
             extra_loss = extra_loss + delta_weight * delta_loss
             log_dict["supervised/action_delta_loss"] = delta_loss.detach()
 
+        # FK Cartesian wrist loss. Both weights default to 0.0 and are read via
+        # getattr (old resolved_configs pickles predate the fields), so an
+        # unconfigured run pays ZERO FK cost and stays byte-identical.
+        fk_pos_weight = getattr(self.config, "fk_wrist_pos_weight", 0.0)
+        fk_ori_weight = getattr(self.config, "fk_wrist_ori_weight", 0.0)
+        if fk_pos_weight > 0 or fk_ori_weight > 0:
+            fk_pos_loss, fk_ori_loss = self._calculate_fk_wrist_loss(
+                batch_dict, actions
+            )
+            if fk_pos_weight > 0:
+                extra_loss = extra_loss + fk_pos_weight * fk_pos_loss
+                log_dict["supervised/fk_wrist_pos_loss"] = fk_pos_loss.detach()
+            if fk_ori_weight > 0:
+                extra_loss = extra_loss + fk_ori_weight * fk_ori_loss
+                log_dict["supervised/fk_wrist_ori_loss"] = fk_ori_loss.detach()
+
         return extra_loss, log_dict
+
+    # ------------------------------------------------------------------
+    # FK Cartesian wrist loss
+    # ------------------------------------------------------------------
+
+    #: Cached, device-resident kinematic/index context for the FK wrist loss.
+    #: Built ONCE (first gated call) and reused for every subsequent step.
+    _fk_wrist_ctx = None
+
+    def _fk_wrist_context(self, device: torch.device) -> Dict:
+        """Build (once) everything the FK wrist loss needs per step.
+
+        Everything here is static for the life of the run: the MJCF-derived
+        ``KinematicInfo`` (already parsed by the robot config -- we never
+        re-parse the MJCF), the action->joint-target transform parameters, and
+        the flat indices into the reference observation. The per-step path
+        therefore does pure tensor work only.
+        """
+        if self._fk_wrist_ctx is not None:
+            return self._fk_wrist_ctx
+
+        env = self.env
+        robot_config = env.robot_config
+        kinematic_info = robot_config.kinematic_info.to(device)
+        body_names = list(kinematic_info.body_names)
+
+        # The reference observation is expressed relative to the ROOT body
+        # (build_sparse_target_poses subtracts body 0). The teacher's reward is
+        # expressed relative to the ANCHOR body. They only agree when the anchor
+        # IS the root, which is the case for every mimic robot config shipped
+        # here (anchor_body_index == 0 == pelvis).
+        anchor_body_index = int(getattr(robot_config, "anchor_body_index", 0) or 0)
+        if anchor_body_index != 0:
+            raise ValueError(
+                "fk_wrist_*_weight requires anchor_body_index == 0 (root): the "
+                "reference observation is ROOT-relative while the teacher's "
+                f"reward is ANCHOR-relative, and this robot anchors at body "
+                f"{anchor_body_index} ({body_names[anchor_body_index]})."
+            )
+
+        # --- bodies to score -------------------------------------------------
+        wrist_body_names = getattr(self.config, "fk_wrist_body_names", None)
+        if not wrist_body_names:
+            naming = getattr(robot_config, "common_naming_to_robot_body_names", {}) or {}
+            wrist_body_names = list(naming.get("all_left_hand_bodies", [])) + list(
+                naming.get("all_right_hand_bodies", [])
+            )
+        if not wrist_body_names:
+            raise ValueError(
+                "fk_wrist_*_weight > 0 but no bodies to score: set "
+                "fk_wrist_body_names, or give the robot config "
+                "all_left_hand_bodies / all_right_hand_bodies."
+            )
+        missing = [n for n in wrist_body_names if n not in body_names]
+        if missing:
+            raise ValueError(
+                f"fk_wrist_body_names {missing} are not robot bodies. "
+                f"Available: {body_names}"
+            )
+        wrist_body_indices = torch.tensor(
+            [body_names.index(n) for n in wrist_body_names],
+            dtype=torch.long,
+            device=device,
+        )
+
+        # --- conditionable bodies of the reference observation ---------------
+        ref_key = getattr(
+            self.config, "fk_wrist_ref_key", "masked_mimic_target_poses"
+        )
+        conditionable_body_ids = None
+        obs_components = getattr(env.config, "observation_components", None) or {}
+        ref_component = obs_components.get(ref_key)
+        if ref_component is not None:
+            conditionable_body_ids = (ref_component.static_params or {}).get(
+                "conditionable_body_ids"
+            )
+        if conditionable_body_ids is None:
+            trackable = getattr(robot_config, "trackable_bodies_subset", None)
+            if not trackable:
+                raise ValueError(
+                    f"Could not resolve the conditionable body order for "
+                    f"'{ref_key}': the observation component does not declare "
+                    "conditionable_body_ids and the robot config has no "
+                    "trackable_bodies_subset."
+                )
+            conditionable_body_ids = [body_names.index(n) for n in trackable]
+        conditionable_body_ids = [int(i) for i in conditionable_body_ids]
+
+        wrist_slots = []
+        for name in wrist_body_names:
+            body_id = body_names.index(name)
+            if body_id not in conditionable_body_ids:
+                raise ValueError(
+                    f"'{name}' is not in the masked-mimic conditionable set "
+                    f"{[body_names[i] for i in conditionable_body_ids]}, so "
+                    f"'{ref_key}' carries no reference pose for it."
+                )
+            wrist_slots.append(conditionable_body_ids.index(body_id))
+        wrist_slots = torch.tensor(wrist_slots, dtype=torch.long, device=device)
+
+        # --- action -> joint position targets --------------------------------
+        # Reuse the env's OWN action pipeline so the FK input is exactly the
+        # joint-position target the simulator would receive (tanh/clamp
+        # transform + PD offset/scale). No second copy of that math.
+        action_config = getattr(env.config, "action_config", None)
+        if not action_config or "fn" not in action_config:
+            raise ValueError(
+                "fk_wrist_*_weight > 0 requires env.config.action_config (a PD "
+                "position-target action pipeline); the FK loss is only "
+                "meaningful when the action IS a joint-position target."
+            )
+        action_fn = action_config["fn"]
+        action_params = {
+            key: (value.to(device) if isinstance(value, Tensor) else value)
+            for key, value in action_config.items()
+            if key != "fn"
+        }
+
+        self._fk_wrist_ctx = {
+            "kinematic_info": kinematic_info,
+            "num_bodies": kinematic_info.num_bodies,
+            "num_dofs": kinematic_info.num_dofs,
+            "num_conditionable": len(conditionable_body_ids),
+            "wrist_body_indices": wrist_body_indices,
+            "wrist_slots": wrist_slots,
+            "wrist_body_names": list(wrist_body_names),
+            "action_fn": action_fn,
+            "action_params": action_params,
+        }
+        return self._fk_wrist_ctx
+
+    def _fk_wrist_reference(self, batch_td, ctx: Dict):
+        """Slice the reference wrist pose + visibility masks out of the batch.
+
+        ``masked_mimic_target_poses`` (build_sparse_target_poses,
+        include_root_relative=True) is laid out as
+        ``[envs, steps, conditionable_bodies, 2, 12]`` where the leading "2"
+        splits TRANSLATION features from ROTATION features, and each 12 is
+        ``[body-relative (6, zero-padded), root-relative (6, zero-padded)]``.
+        We take the ROOT-RELATIVE halves: positions at ``[..., 0, 6:9]`` and the
+        6D tan-norm rotation at ``[..., 1, 6:12]``. Both are already in the
+        HEADING-LOCAL frame of the current root.
+        """
+        ref_key = getattr(
+            self.config, "fk_wrist_ref_key", "masked_mimic_target_poses"
+        )
+        mask_key = getattr(
+            self.config, "fk_wrist_ref_mask_key", "masked_mimic_target_masks"
+        )
+        for key in (ref_key, mask_key):
+            if key not in batch_td.keys():
+                raise KeyError(
+                    f"fk_wrist_*_weight > 0 requires '{key}' in the training "
+                    f"batch. Available keys: {list(batch_td.keys())}"
+                )
+
+        num_cond = ctx["num_conditionable"]
+        ref = batch_td[ref_key]
+        batch_size = ref.shape[0]
+        features_per_step = num_cond * 24
+        if ref.shape[-1] % features_per_step != 0:
+            raise ValueError(
+                f"'{ref_key}' width {ref.shape[-1]} is not a multiple of "
+                f"{features_per_step} (= {num_cond} conditionable bodies x 24 "
+                "features). The FK wrist loss needs "
+                "include_root_relative=True sparse target poses."
+            )
+        num_steps = ref.shape[-1] // features_per_step
+        step = int(getattr(self.config, "fk_wrist_future_step", 0))
+        if not 0 <= step < num_steps:
+            raise ValueError(
+                f"fk_wrist_future_step={step} out of range for "
+                f"{num_steps} future steps in '{ref_key}'."
+            )
+
+        ref = ref.view(batch_size, num_steps, num_cond, 2, 12)
+        slots = ctx["wrist_slots"]
+        ref_pos = ref[:, step, :, 0, 6:9].index_select(1, slots)
+        ref_rot_tan_norm = ref[:, step, :, 1, 6:12].index_select(1, slots)
+
+        masks = batch_td[mask_key]
+        expected_mask_width = num_steps * num_cond * 2
+        if masks.shape[-1] != expected_mask_width:
+            raise ValueError(
+                f"'{mask_key}' width {masks.shape[-1]} != expected "
+                f"{expected_mask_width} (steps x bodies x 2) for '{ref_key}'."
+            )
+        masks = masks.view(batch_size, num_steps, num_cond, 2).to(ref_pos.dtype)
+        pos_mask = masks[:, step, :, 0].index_select(1, slots)
+        rot_mask = masks[:, step, :, 1].index_select(1, slots)
+        return ref_pos, ref_rot_tan_norm, pos_mask, rot_mask
+
+    def _fk_wrist_root_heading_local_rot(
+        self, batch_td, ctx: Dict, like: Tensor
+    ) -> Tensor:
+        """Root rotation in the HEADING-LOCAL frame (i.e. its roll/pitch), [B,3,3].
+
+        Read out of the max-coords humanoid observation, whose layout is
+        ``[root_h (1), body_pos (3*(NB-1)), body_rot_tan_norm (6*NB), ...]`` with
+        every rotation already premultiplied by ``calc_heading_quat_inv(root_rot)``.
+        Body 0 is the root, so the first 6 rotation features ARE
+        ``heading_inv * root_rot``. Returns identity when the key is configured
+        to None.
+        """
+        from protomotions.components.pose_lib import quaternion_to_matrix
+        from protomotions.utils.rotations import tan_norm_to_quat
+
+        key = getattr(self.config, "fk_wrist_root_rot_obs_key", "max_coords_obs")
+        num_bodies = ctx["num_bodies"]
+        if key is None:
+            eye = torch.eye(3, device=like.device, dtype=like.dtype)
+            return eye.expand(like.shape[0], 3, 3)
+
+        if key not in batch_td.keys():
+            raise KeyError(
+                f"fk_wrist_root_rot_obs_key='{key}' is missing from the "
+                f"training batch. Available keys: {list(batch_td.keys())}"
+            )
+        obs = batch_td[key]
+        min_width = 1 + 3 * (num_bodies - 1) + 15 * num_bodies
+        if obs.shape[-1] < min_width:
+            raise ValueError(
+                f"'{key}' width {obs.shape[-1]} is too small for a max-coords "
+                f"observation of {num_bodies} bodies (expected >= {min_width}). "
+                "Set fk_wrist_root_rot_obs_key to the correct key, or to None "
+                "to skip the heading-local correction."
+            )
+        rot_offset = 1 + 3 * (num_bodies - 1)
+        root_tan_norm = obs[..., rot_offset : rot_offset + 6]
+        root_quat = tan_norm_to_quat(root_tan_norm, w_last=True)
+        return quaternion_to_matrix(root_quat, w_last=True)
+
+    def _calculate_fk_wrist_loss(self, batch_td, actions: Tensor):
+        """TRUE FK Cartesian wrist loss on the predicted action.
+
+        The student's action IS a PD joint-position target, so running forward
+        kinematics on it yields the COMMANDED wrist pose, differentiable w.r.t.
+        the action. The teacher buys its wrist accuracy from
+        ``relative_body_pos_rew_factory(body_indices=wrist_indices)`` /
+        ``relative_body_ori_rew_factory``; rewards carry no gradient, so this is
+        the BC-side stand-in for them.
+
+        FRAME (matches ``compute_relative_body_pos_rew``): anchor-relative,
+        HEADING-LOCAL -- wrist position measured from the pelvis, expressed in
+        the robot's own yaw-aligned frame. NOT world. World would be dominated
+        by root drift (a metre of pelvis translation error would swamp the ~13 cm
+        wrist deficit we are trying to close), and the teacher's reward never
+        sees world coordinates either. Concretely:
+          * FK is run with ``root_pos = 0`` and identity root rotation, so its
+            output is already anchor-relative in the PELVIS BODY frame;
+          * that is then rotated by the root's heading-local rotation (its
+            roll/pitch, read from ``max_coords_obs``) to land in the same
+            heading-local frame the reference observation uses.
+
+        HONEST LIMITATION: FK(action) is the COMMANDED wrist pose, not the
+        ACHIEVED one. It ignores PD tracking error, gravity droop, joint
+        friction/armature and contact, so a perfectly-zero loss here does NOT
+        mean a perfectly-zero MuJoCo ``wrist_err``. The term shapes the whole arm
+        chain toward the reference in Cartesian space -- which plain 27-dof
+        action MSE does not do, since MSE weights every joint equally regardless
+        of its Cartesian lever arm -- but it is a surrogate for, not identical
+        to, the achieved-pose metric.
+
+        Returns:
+            ``(pos_loss, ori_loss)``, each a scalar. Both are computed whenever
+            either weight is on; the caller adds only the enabled ones.
+        """
+        ctx = self._fk_wrist_context(actions.device)
+        from protomotions.components.pose_lib import (
+            compute_forward_kinematics_from_transforms,
+            extract_transforms_from_qpos_non_root,
+        )
+
+        if actions.shape[-1] != ctx["num_dofs"]:
+            raise ValueError(
+                f"FK wrist loss expects the action to be a {ctx['num_dofs']}-dof "
+                f"joint-position target, got action dim {actions.shape[-1]}."
+            )
+
+        # 1) action -> joint position targets (env's own pipeline, differentiable)
+        joint_targets = ctx["action_fn"](actions, **ctx["action_params"])[
+            "processed_action"
+        ]
+
+        # 2) FK in the pelvis body frame (root at origin, identity root rotation)
+        kinematic_info = ctx["kinematic_info"]
+        joint_rot_mats = extract_transforms_from_qpos_non_root(
+            kinematic_info, joint_targets
+        )
+        root_pos = joint_targets.new_zeros(joint_targets.shape[0], 3)
+        body_pos, body_rot = compute_forward_kinematics_from_transforms(
+            kinematic_info, root_pos, joint_rot_mats
+        )
+        wrist_idx = ctx["wrist_body_indices"]
+        wrist_pos_pelvis = body_pos.index_select(1, wrist_idx)  # [B, W, 3]
+        wrist_rot_pelvis = body_rot.index_select(1, wrist_idx)  # [B, W, 3, 3]
+
+        # 3) reference (validated first: it names the term's primary contract)
+        ref_pos, ref_rot_tan_norm, pos_mask, rot_mask = self._fk_wrist_reference(
+            batch_td, ctx
+        )
+
+        # 4) pelvis body frame -> heading-local frame, the reference's frame
+        root_rot = self._fk_wrist_root_heading_local_rot(
+            batch_td, ctx, wrist_pos_pelvis
+        )  # [B, 3, 3]
+        wrist_pos = torch.einsum("bij,bwj->bwi", root_rot, wrist_pos_pelvis)
+        wrist_rot = torch.einsum("bij,bwjk->bwik", root_rot, wrist_rot_pelvis)
+
+        ref_pos = ref_pos.detach()
+        ref_rot_tan_norm = ref_rot_tan_norm.detach()
+
+        pos_sq_err = (wrist_pos - ref_pos).pow(2).sum(dim=-1)  # [B, W], metres^2
+        pos_loss = (pos_sq_err * pos_mask).sum() / pos_mask.sum().clamp_min(1.0)
+
+        # tan-norm = (R @ x_hat, R @ z_hat) = columns 0 and 2 of the rotation
+        # matrix -- exactly what quat_to_tan_norm produces for the reference.
+        wrist_tan_norm = torch.cat(
+            (wrist_rot[..., :, 0], wrist_rot[..., :, 2]), dim=-1
+        )
+        ori_sq_err = (wrist_tan_norm - ref_rot_tan_norm).pow(2).sum(dim=-1)
+        ori_loss = (ori_sq_err * rot_mask).sum() / rot_mask.sum().clamp_min(1.0)
+
+        return pos_loss, ori_loss
 
     def _previous_actions_from_batch(self, batch_td, actions: Tensor) -> Tensor:
         if "previous_actions" not in batch_td.keys():

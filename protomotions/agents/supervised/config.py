@@ -111,6 +111,87 @@ class SupervisedAgentConfig(BaseAgentConfig):
             )
         },
     )
+    # --- FK Cartesian wrist loss (default OFF; see
+    # SupervisedAgent._calculate_fk_wrist_loss for the full contract). ---
+    fk_wrist_pos_weight: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "Weight of the FK Cartesian wrist POSITION loss. FK is applied "
+                "to the predicted action (a PD joint-position target), giving "
+                "the COMMANDED wrist position in the anchor-relative, "
+                "heading-local frame -- the same frame the teacher's "
+                "relative_body_pos_rew_factory reward uses. 0.0 (default) = "
+                "term absent, zero FK cost paid."
+            )
+        },
+    )
+    fk_wrist_ori_weight: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "Weight of the FK Cartesian wrist ORIENTATION loss (MSE over "
+                "the 6D tan-norm encoding of the heading-local wrist rotation, "
+                "the same encoding the reference observation carries). Student "
+                "twin of relative_body_ori_rew_factory. 0.0 (default) = off."
+            )
+        },
+    )
+    fk_wrist_body_names: Optional[list] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Bodies scored by the FK wrist loss. None (default) resolves "
+                "to the robot's hand bodies "
+                "(common_naming_to_robot_body_names all_left/right_hand_bodies, "
+                "i.e. left/right_wrist_yaw_link on H1_2). Every name must also "
+                "be in the masked-mimic conditionable set, since the reference "
+                "target comes from that observation."
+            )
+        },
+    )
+    fk_wrist_ref_key: str = field(
+        default="masked_mimic_target_poses",
+        metadata={
+            "help": (
+                "Batch key carrying the masked-mimic sparse target poses "
+                "(build_sparse_target_poses with include_root_relative=True). "
+                "Its root-relative block supplies the reference wrist pose."
+            )
+        },
+    )
+    fk_wrist_ref_mask_key: str = field(
+        default="masked_mimic_target_masks",
+        metadata={
+            "help": (
+                "Batch key carrying the per-(step, body, {pos,rot}) visibility "
+                "masks aligned with fk_wrist_ref_key. Samples whose wrist "
+                "target is masked out contribute nothing to the loss."
+            )
+        },
+    )
+    fk_wrist_root_rot_obs_key: Optional[str] = field(
+        default="max_coords_obs",
+        metadata={
+            "help": (
+                "Batch key of the max-coords humanoid observation, used to read "
+                "the root's heading-local rotation (its roll/pitch) so the FK "
+                "output can be rotated from the pelvis body frame into the "
+                "heading-local frame the reference lives in. Set to None to "
+                "skip that rotation (assumes an upright pelvis -- a real "
+                "approximation, only for robots/tasks with no root tilt)."
+            )
+        },
+    )
+    fk_wrist_future_step: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Which masked-mimic future frame to score against (0 = the "
+                "nearest sampled future frame)."
+            )
+        },
+    )
     action_dim_weights: Optional[list] = field(
         default=None,
         metadata={
