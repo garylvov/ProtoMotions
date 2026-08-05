@@ -114,16 +114,54 @@ def _pack_reference(robot_config, ref_pos, ref_tan_norm, num_steps=3, step=0):
     return obs.reshape(batch, -1), masks.reshape(batch, -1)
 
 
-def _pack_max_coords_obs(robot_config, root_quat_heading_local):
-    """Synthetic ``max_coords_obs`` carrying only the root rotation block."""
-    num_bodies = robot_config.kinematic_info.num_bodies
-    width = 1 + 3 * (num_bodies - 1) + 15 * num_bodies
-    obs = torch.zeros(root_quat_heading_local.shape[0], width)
-    offset = 1 + 3 * (num_bodies - 1)
-    obs[:, offset : offset + 6] = rotations.quat_to_tan_norm(
-        root_quat_heading_local, w_last=True
+def _real_max_coords_obs(robot_config, root_world_quat, observe_contacts=False):
+    """Build ``max_coords_obs`` with the REAL kernel, not a hand-rolled tensor.
+
+    The original version of this helper synthesized a tensor from the same
+    (wrong) width formula the reader used, so the suite happily agreed with a
+    bug that killed the live run at its first optimize step. Everything the
+    reader is tested against now comes out of
+    ``compute_humanoid_max_coords_observations`` itself.
+
+    Args:
+        root_world_quat: the root's WORLD rotation [B, 4], w-last.
+
+    Returns:
+        ``(obs, root_heading_local_mat)`` -- the observation, and the
+        heading-local root rotation the reader is expected to recover. The
+        expectation is derived from ``calc_heading_quat_inv``, the kernel's own
+        definition, NOT assumed: a tilt about a non-vertical axis still carries
+        some heading, so ``heading_inv * root_world`` is not simply "the tilt".
+    """
+    from protomotions.envs.obs.humanoid import (
+        compute_humanoid_max_coords_observations,
     )
-    return obs
+
+    num_bodies = robot_config.kinematic_info.num_bodies
+    batch = root_world_quat.shape[0]
+
+    body_rot = torch.nn.functional.normalize(
+        torch.randn(batch, num_bodies, 4), dim=-1
+    )
+    body_rot[:, 0] = root_world_quat
+    obs = compute_humanoid_max_coords_observations(
+        body_pos=torch.randn(batch, num_bodies, 3),
+        body_rot=body_rot,
+        body_vel=torch.randn(batch, num_bodies, 3),
+        body_ang_vel=torch.randn(batch, num_bodies, 3),
+        ground_height=torch.zeros(batch),
+        body_contacts=torch.zeros(batch, 2),
+        local_obs=True,
+        root_height_obs=True,
+        observe_contacts=observe_contacts,
+        w_last=True,
+    )
+    heading_local_quat = rotations.quat_mul(
+        rotations.calc_heading_quat_inv(root_world_quat, w_last=True),
+        root_world_quat,
+        w_last=True,
+    )
+    return obs, pose_lib.quaternion_to_matrix(heading_local_quat, w_last=True)
 
 
 def _wrist_indices(robot_config):
@@ -225,7 +263,7 @@ def test_zero_weight_is_byte_identical_to_config_without_the_fields(robot_config
             "previous_actions": torch.zeros_like(actions),
             "masked_mimic_target_poses": ref,
             "masked_mimic_target_masks": masks,
-            "max_coords_obs": _pack_max_coords_obs(robot_config, root_quat),
+            "max_coords_obs": _real_max_coords_obs(robot_config, root_quat)[0],
         }
 
     # Old pickled config: the fields do not exist at all.
@@ -345,7 +383,8 @@ def test_loss_is_zero_under_a_tilted_root(robot_config):
         torch.tensor([[0.4, 0.9, 0.0]]).repeat(batch_size, 1), dim=-1
     )
     root_quat = rotations.quat_from_angle_axis(angle, axis, w_last=True)
-    root_mat = pose_lib.quaternion_to_matrix(root_quat, w_last=True)
+    # Observation first: it defines what the heading-local rotation actually is.
+    max_coords_obs, root_mat = _real_max_coords_obs(robot_config, root_quat)
 
     with torch.no_grad():
         ref_pos, ref_tan = _commanded_wrist_pose(robot_config, actions, root_mat)
@@ -359,7 +398,7 @@ def test_loss_is_zero_under_a_tilted_root(robot_config):
         "privileged_action": actions,
         "masked_mimic_target_poses": ref,
         "masked_mimic_target_masks": masks,
-        "max_coords_obs": _pack_max_coords_obs(robot_config, root_quat),
+        "max_coords_obs": max_coords_obs,
     }
     pos_loss, ori_loss = agent._calculate_fk_wrist_loss(batch, actions)
     assert pos_loss.item() < 1e-8
@@ -460,7 +499,7 @@ def test_gradient_reaches_the_action_tensor(robot_config):
         "privileged_action": actions,
         "masked_mimic_target_poses": ref,
         "masked_mimic_target_masks": masks,
-        "max_coords_obs": _pack_max_coords_obs(robot_config, root_quat),
+        "max_coords_obs": _real_max_coords_obs(robot_config, root_quat)[0],
     }
 
     extra_loss, log_dict = agent.calculate_extra_loss(batch, actions)
@@ -576,7 +615,171 @@ def test_reference_slice_matches_the_real_masked_mimic_obs_kernel(robot_config):
 
 
 # ---------------------------------------------------------------------------
-# 6. config surface
+# 6. the root-rotation reader against the REAL experiment observation spec
+#
+# REGRESSION (2026-08-05): the live 8-rank run died at its first optimize step
+# with "'max_coords_obs' width 433 is too small ... expected >= 520". The reader
+# validated against 1 + 3*(NB-1) + 15*NB; the kernel emits
+# 1 + 3*(NB-1) + 12*NB (6*NB rotation + 3*NB vel + 3*NB ang_vel). The suite
+# passed anyway because its helper BUILT the tensor from the same wrong formula.
+# These tests take the observation from the real factory + real kernel.
+# ---------------------------------------------------------------------------
+
+
+def _experiment_max_coords_component(use_noisy=False, local_obs=True):
+    """The exact component this experiment's config builds."""
+    from protomotions.envs.component_factories import max_coords_obs_factory
+
+    return max_coords_obs_factory(
+        use_noisy=use_noisy,
+        local_obs=local_obs,
+        root_height_obs=True,
+        observe_contacts=False,
+    )
+
+
+def test_real_max_coords_obs_width_matches_the_readers_expectation(robot_config):
+    """The width the kernel emits must be the width the reader demands."""
+    root_quat = torch.tensor([[0.0, 0.0, 0.0, 1.0]]).repeat(4, 1)
+    obs, _ = _real_max_coords_obs(robot_config, root_quat)
+
+    agent = _make_agent(robot_config, {"fk_wrist_pos_weight": 1.0})
+    ctx = agent._fk_wrist_context(torch.device("cpu"))
+
+    num_bodies = robot_config.kinematic_info.num_bodies
+    assert obs.shape[-1] == 1 + 3 * (num_bodies - 1) + 12 * num_bodies
+    assert obs.shape[-1] == ctx["root_rot_min_width"]
+    assert ctx["root_rot_offset"] == 1 + 3 * (num_bodies - 1)
+
+
+def test_reader_recovers_root_rotation_from_the_real_observation(robot_config):
+    """End-to-end: real factory + real kernel -> reader returns the tilt."""
+    torch.manual_seed(9)
+    batch = 5
+    angle = torch.linspace(0.05, 0.6, batch)
+    axis = torch.nn.functional.normalize(
+        torch.tensor([[0.3, 0.8, 0.0]]).repeat(batch, 1), dim=-1
+    )
+    root_quat = rotations.quat_from_angle_axis(angle, axis, w_last=True)
+
+    agent = _make_agent(robot_config, {"fk_wrist_pos_weight": 1.0})
+    agent.env.config.observation_components = {
+        "max_coords_obs": _experiment_max_coords_component()
+    }
+    ctx = agent._fk_wrist_context(torch.device("cpu"))
+
+    obs, expected = _real_max_coords_obs(robot_config, root_quat)
+    got = agent._fk_wrist_root_heading_local_rot(
+        {"max_coords_obs": obs}, ctx, torch.zeros(batch, 2, 3)
+    )
+    assert torch.allclose(got, expected, atol=1e-5)
+    # And it is a genuine tilt, not a degenerate identity that would pass anyway.
+    assert (expected - torch.eye(3)).abs().max() > 0.02
+
+
+def test_full_loss_runs_against_the_real_observation_spec(robot_config):
+    """The exact path the live run took: nothing hand-rolled but the reference."""
+    torch.manual_seed(10)
+    num_dofs = robot_config.kinematic_info.num_dofs
+    batch = 4
+    actions = (torch.randn(batch, num_dofs) * 0.2).requires_grad_(True)
+
+    angle = torch.full((batch,), 0.3)
+    axis = torch.nn.functional.normalize(
+        torch.tensor([[0.5, 0.7, 0.0]]).repeat(batch, 1), dim=-1
+    )
+    root_quat = rotations.quat_from_angle_axis(angle, axis, w_last=True)
+    max_coords_obs, root_mat = _real_max_coords_obs(robot_config, root_quat)
+
+    with torch.no_grad():
+        ref_pos, ref_tan = _commanded_wrist_pose(robot_config, actions, root_mat)
+    ref, masks = _pack_reference(robot_config, ref_pos, ref_tan)
+
+    agent = _make_agent(
+        robot_config,
+        {"fk_wrist_pos_weight": 1.0, "fk_wrist_ori_weight": 1.0},
+    )
+    agent.env.config.observation_components = {
+        "max_coords_obs": _experiment_max_coords_component()
+    }
+    batch_td = {
+        "privileged_action": actions,
+        "masked_mimic_target_poses": ref,
+        "masked_mimic_target_masks": masks,
+        "max_coords_obs": max_coords_obs,
+    }
+
+    extra_loss, log_dict = agent.calculate_extra_loss(batch_td, actions)
+    assert log_dict["supervised/fk_wrist_pos_loss"].item() < 1e-8
+    assert log_dict["supervised/fk_wrist_ori_loss"].item() < 1e-8
+    assert torch.isfinite(extra_loss)
+
+
+def test_contact_tail_does_not_disturb_the_reader(robot_config):
+    """observe_contacts appends AFTER everything read; must still resolve."""
+    torch.manual_seed(11)
+    batch = 3
+    angle = torch.full((batch,), 0.2)
+    axis = torch.nn.functional.normalize(
+        torch.tensor([[1.0, 0.0, 0.0]]).repeat(batch, 1), dim=-1
+    )
+    root_quat = rotations.quat_from_angle_axis(angle, axis, w_last=True)
+
+    agent = _make_agent(robot_config, {"fk_wrist_pos_weight": 1.0})
+    ctx = agent._fk_wrist_context(torch.device("cpu"))
+
+    obs, expected = _real_max_coords_obs(
+        robot_config, root_quat, observe_contacts=True
+    )
+    assert obs.shape[-1] > ctx["root_rot_min_width"]
+    got = agent._fk_wrist_root_heading_local_rot(
+        {"max_coords_obs": obs}, ctx, torch.zeros(batch, 2, 3)
+    )
+    assert torch.allclose(got, expected, atol=1e-5)
+
+
+def test_world_frame_observation_is_rejected_up_front(robot_config):
+    """local_obs=False has the SAME width but the wrong frame -> must raise."""
+    agent = _make_agent(robot_config, {"fk_wrist_pos_weight": 1.0})
+    agent.env.config.observation_components = {
+        "max_coords_obs": _experiment_max_coords_component(local_obs=False)
+    }
+    with pytest.raises(ValueError, match="local_obs=False"):
+        agent._fk_wrist_context(torch.device("cpu"))
+
+
+def test_noisy_root_rotation_source_is_flagged(robot_config, caplog):
+    """This run's max_coords_obs is use_noisy=True; the clean twin is preferred."""
+    import logging
+
+    agent = _make_agent(robot_config, {"fk_wrist_pos_weight": 1.0})
+    agent.env.config.observation_components = {
+        "max_coords_obs": _experiment_max_coords_component(use_noisy=True),
+        "clean_max_coords_obs": _experiment_max_coords_component(use_noisy=False),
+    }
+    with caplog.at_level(logging.WARNING):
+        agent._fk_wrist_context(torch.device("cpu"))
+    assert "clean_max_coords_obs" in caplog.text
+
+    # The clean twin must NOT warn.
+    caplog.clear()
+    clean_agent = _make_agent(
+        robot_config,
+        {
+            "fk_wrist_pos_weight": 1.0,
+            "fk_wrist_root_rot_obs_key": "clean_max_coords_obs",
+        },
+    )
+    clean_agent.env.config.observation_components = (
+        agent.env.config.observation_components
+    )
+    with caplog.at_level(logging.WARNING):
+        clean_agent._fk_wrist_context(torch.device("cpu"))
+    assert "clean_max_coords_obs" not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# 7. config surface
 # ---------------------------------------------------------------------------
 
 

@@ -641,9 +641,62 @@ class SupervisedAgent(BaseAgent):
             if key != "fn"
         }
 
+        # --- root rotation source, validated ONCE against the real obs spec ---
+        # The rotation block sits after root height + body positions. Both
+        # offsets are derived from the robot's own body count.
+        num_bodies = kinematic_info.num_bodies
+        root_rot_key = getattr(
+            self.config, "fk_wrist_root_rot_obs_key", "max_coords_obs"
+        )
+        root_rot_offset = 1 + 3 * (num_bodies - 1)
+        root_rot_min_width = root_rot_offset + 12 * num_bodies
+        if root_rot_key is not None:
+            root_rot_component = obs_components.get(root_rot_key)
+            if root_rot_component is not None:
+                static_params = root_rot_component.static_params or {}
+                # A width check can NEVER catch this: local_obs=False produces a
+                # tensor of exactly the same width whose rotations are WORLD, not
+                # heading-local, which would silently compare two different
+                # frames. Reject it up front.
+                if static_params.get("local_obs", True) is not True:
+                    raise ValueError(
+                        f"fk_wrist_root_rot_obs_key='{root_rot_key}' is built "
+                        "with local_obs=False, so its body rotations are WORLD "
+                        "rotations, not heading-local ones. Point the key at a "
+                        "local_obs=True max-coords observation, or set it to "
+                        "None to skip the heading-local correction."
+                    )
+            else:
+                log.info(
+                    "FK wrist loss: '%s' is not a declared observation "
+                    "component; its layout will be validated by width only.",
+                    root_rot_key,
+                )
+            # The root rotation should come from a CLEAN observation. `use_noisy`
+            # is a FACTORY argument, not a static_param -- it selects the context
+            # binding -- so the only way to detect it is the dynamic_vars path.
+            # Reading a noisy frame would price the policy for jitter it cannot
+            # control, so warn loudly and name the fix.
+            if root_rot_component is not None:
+                bindings = root_rot_component.dynamic_vars or {}
+                body_rot_path = getattr(bindings.get("body_rot"), "path", "")
+                if str(body_rot_path).startswith("noisy"):
+                    log.warning(
+                        "FK wrist loss: root rotation is being read from '%s', "
+                        "which is bound to the NOISY state ('%s'). The loss "
+                        "frame will carry observation noise; prefer the clean "
+                        "twin (e.g. 'clean_max_coords_obs') via "
+                        "fk_wrist_root_rot_obs_key.",
+                        root_rot_key,
+                        body_rot_path,
+                    )
+
         self._fk_wrist_ctx = {
             "kinematic_info": kinematic_info,
-            "num_bodies": kinematic_info.num_bodies,
+            "num_bodies": num_bodies,
+            "root_rot_key": root_rot_key,
+            "root_rot_offset": root_rot_offset,
+            "root_rot_min_width": root_rot_min_width,
             "num_dofs": kinematic_info.num_dofs,
             "num_conditionable": len(conditionable_body_ids),
             "wrist_body_indices": wrist_body_indices,
@@ -720,18 +773,22 @@ class SupervisedAgent(BaseAgent):
     ) -> Tensor:
         """Root rotation in the HEADING-LOCAL frame (i.e. its roll/pitch), [B,3,3].
 
-        Read out of the max-coords humanoid observation, whose layout is
-        ``[root_h (1), body_pos (3*(NB-1)), body_rot_tan_norm (6*NB), ...]`` with
-        every rotation already premultiplied by ``calc_heading_quat_inv(root_rot)``.
-        Body 0 is the root, so the first 6 rotation features ARE
-        ``heading_inv * root_rot``. Returns identity when the key is configured
-        to None.
+        Read out of the max-coords humanoid observation
+        (``compute_humanoid_max_coords_observations``), whose layout is exactly
+
+            root_h (1) | body_pos (3*(NB-1)) | body_rot_tan_norm (6*NB)
+                       | body_vel (3*NB) | body_ang_vel (3*NB) | [contacts]
+
+        so the rotation block starts at ``1 + 3*(NB-1)`` -- derived from the
+        robot's body count, never a hardcoded stride. With ``local_obs=True``
+        every rotation is premultiplied by ``calc_heading_quat_inv(root_rot)``,
+        and body 0 is the root, so the first 6 rotation features ARE
+        ``heading_inv * root_rot``. Returns identity when the key is None.
         """
         from protomotions.components.pose_lib import quaternion_to_matrix
         from protomotions.utils.rotations import tan_norm_to_quat
 
-        key = getattr(self.config, "fk_wrist_root_rot_obs_key", "max_coords_obs")
-        num_bodies = ctx["num_bodies"]
+        key = ctx["root_rot_key"]
         if key is None:
             eye = torch.eye(3, device=like.device, dtype=like.dtype)
             return eye.expand(like.shape[0], 3, 3)
@@ -742,15 +799,18 @@ class SupervisedAgent(BaseAgent):
                 f"training batch. Available keys: {list(batch_td.keys())}"
             )
         obs = batch_td[key]
-        min_width = 1 + 3 * (num_bodies - 1) + 15 * num_bodies
+        rot_offset = ctx["root_rot_offset"]
+        min_width = ctx["root_rot_min_width"]
         if obs.shape[-1] < min_width:
             raise ValueError(
-                f"'{key}' width {obs.shape[-1]} is too small for a max-coords "
-                f"observation of {num_bodies} bodies (expected >= {min_width}). "
-                "Set fk_wrist_root_rot_obs_key to the correct key, or to None "
-                "to skip the heading-local correction."
+                f"'{key}' width {obs.shape[-1]} is not a max-coords observation "
+                f"of {ctx['num_bodies']} bodies: that is "
+                f"1 + 3*(NB-1) + 12*NB = {min_width} features "
+                "(root height, body positions, 6D body rotations, body linear "
+                "and angular velocities), plus an optional contact tail. Set "
+                "fk_wrist_root_rot_obs_key to the correct key, or to None to "
+                "skip the heading-local correction."
             )
-        rot_offset = 1 + 3 * (num_bodies - 1)
         root_tan_norm = obs[..., rot_offset : rot_offset + 6]
         root_quat = tan_norm_to_quat(root_tan_norm, w_last=True)
         return quaternion_to_matrix(root_quat, w_last=True)
