@@ -1312,6 +1312,24 @@ class BaseAgent:
             log_dict.update(env_log_dict)
         log_dict.update(training_log_dict)
 
+        # SILENTLY-DEAD reward-term canary (2026-08-05 v57 post-mortem; it is
+        # deliberately GENERIC and names no term).
+        # Reads only the already-reduced scalars above; adds keys
+        # ONLY when a weighted term has been exactly zero for N epochs, so a
+        # healthy run's log surface is unchanged. See
+        # protomotions/agents/utils/dead_term_canary.py.
+        canary = getattr(self, "_dead_term_canary", None)
+        if canary is None:
+            from protomotions.agents.utils.dead_term_canary import DeadTermCanary
+
+            canary = DeadTermCanary.from_env()
+            self._dead_term_canary = canary
+        canary_extras, canary_warnings = canary.update(log_dict)
+        log_dict.update(canary_extras)
+        if canary_warnings and getattr(self.fabric, "global_rank", 0) == 0:
+            for block in canary_warnings:
+                print(block, flush=True)
+
         # Aggregate metrics across all devices before logging
         # This ensures wandb reports representative metrics from all ranks, not just rank 0
         aggregated_log_dict = aggregate_scalar_metrics(
