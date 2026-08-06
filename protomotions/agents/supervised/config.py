@@ -183,6 +183,57 @@ class SupervisedAgentConfig(BaseAgentConfig):
             )
         },
     )
+    # --- FK ALL-BODY (global) Cartesian tracking loss (default OFF). Shares the
+    # wrist term's FK pass and context; see
+    # SupervisedAgent._calculate_fk_global_loss. ---
+    fk_global_pos_weight: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "Weight of the all-body FK Cartesian position loss: mean over "
+                "bodies of the squared root-relative, heading-local position "
+                "residual (metres^2). Targets the gating eval criterion "
+                "mean_body_pos_error, which the BC action-MSE never sees and "
+                "the 2-body wrist term barely touches. 0.0 (default) = term "
+                "absent, zero FK cost paid."
+            )
+        },
+    )
+    fk_global_body_names: Optional[list] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Bodies scored by the all-body FK loss. None (default) = EVERY "
+                "robot body, matching the eval metric's body set. Note that "
+                "the ROOT body contributes a constant with zero gradient (FK "
+                "always places it at the origin while its reference is the "
+                "root tracking error), so listing every body EXCEPT the root "
+                "makes the logged value purely the quantity being optimized."
+            )
+        },
+    )
+    fk_global_ref_key: str = field(
+        default="mimic_target_poses",
+        metadata={
+            "help": (
+                "Batch key carrying the ALL-BODY reference "
+                "(build_max_coords_target_poses). Its first block, "
+                "target_body_pos, is the root-relative heading-local reference "
+                "position for every body. NOTE: masked_mimic_target_poses "
+                "cannot be used here -- it only carries the conditionable "
+                "bodies."
+            )
+        },
+    )
+    fk_global_future_step: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Which future frame of fk_global_ref_key to score against "
+                "(0 = the first buffered step)."
+            )
+        },
+    )
     fk_wrist_future_step: int = field(
         default=0,
         metadata={
