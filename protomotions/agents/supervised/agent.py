@@ -619,61 +619,48 @@ class SupervisedAgent(BaseAgent):
             device=device,
         )
 
-        # --- conditionable bodies of the reference observation ---------------
-        ref_key = getattr(
-            self.config, "fk_wrist_ref_key", "masked_mimic_target_poses"
-        )
-        conditionable_body_ids = None
-        obs_components = getattr(env.config, "observation_components", None) or {}
-        ref_component = obs_components.get(ref_key)
-        if ref_component is not None:
-            conditionable_body_ids = (ref_component.static_params or {}).get(
-                "conditionable_body_ids"
-            )
-        if conditionable_body_ids is None:
-            trackable = getattr(robot_config, "trackable_bodies_subset", None)
-            if not trackable:
-                raise ValueError(
-                    f"Could not resolve the conditionable body order for "
-                    f"'{ref_key}': the observation component does not declare "
-                    "conditionable_body_ids and the robot config has no "
-                    "trackable_bodies_subset."
-                )
-            conditionable_body_ids = [body_names.index(n) for n in trackable]
-        conditionable_body_ids = [int(i) for i in conditionable_body_ids]
-
-        wrist_slots = []
-        for name in wrist_body_names:
-            body_id = body_names.index(name)
-            if body_id not in conditionable_body_ids:
-                raise ValueError(
-                    f"'{name}' is not in the masked-mimic conditionable set "
-                    f"{[body_names[i] for i in conditionable_body_ids]}, so "
-                    f"'{ref_key}' carries no reference pose for it."
-                )
-            wrist_slots.append(conditionable_body_ids.index(body_id))
-        wrist_slots = torch.tensor(wrist_slots, dtype=torch.long, device=device)
-
-        # --- all-body reference layout ---------------------------------------
-        # `mimic_target_poses` (build_max_coords_target_poses) is the ONLY
-        # all-body reference this recipe carries. It covers EVERY rigid body
-        # (no conditionable subsetting -- num_bodies comes straight off the
-        # reference state), unlike masked_mimic_target_poses which carries only
-        # the 6 conditionable bodies.
+        # --- reference layout (shared by BOTH FK terms) -----------------------
+        # `mimic_target_poses` (build_max_coords_target_poses) covers EVERY
+        # rigid body -- num_bodies comes straight off the reference state, no
+        # conditionable subsetting. That ALL-BODY property is not a convenience:
+        # it is what makes the reference usable at all, because the root must be
+        # present so the reference can be re-anchored to its OWN root (see
+        # _fk_reference_body_pos). `masked_mimic_target_poses` carries only the
+        # 6 conditionable bodies and the pelvis is NOT among them, so it can
+        # never be root-anchored and is not a valid source for either term.
         #
         # Per future step it concatenates, IN THIS ORDER:
-        #     target_body_pos      (3*NB)  <- the block we want
+        #     target_body_pos      (3*NB)  <- position block
         #     target_body_pos_rel  (3*NB)  ] only when with_relative
-        #     target_body_rot      (6*NB)
+        #     target_body_rot      (6*NB)  <- orientation block
         #     target_rel_body_rot  (6*NB)  ] only when with_relative
         #     local_target_vel     (3*NB)  ] only when with_velocities
         #     local_target_ang_vel (3*NB)  ]
         # and the result is viewed as [envs, steps * features_per_step], i.e.
         # STEP-MAJOR. target_body_pos is always FIRST within a step, so its
         # offset is 0 regardless of the flags; only the per-step STRIDE moves.
+        obs_components = getattr(env.config, "observation_components", None) or {}
         global_ref_key = getattr(
             self.config, "fk_global_ref_key", "mimic_target_poses"
         )
+        wrist_ref_key = getattr(self.config, "fk_wrist_ref_key", global_ref_key)
+        for label, key in (
+            ("fk_global_ref_key", global_ref_key),
+            ("fk_wrist_ref_key", wrist_ref_key),
+        ):
+            component = obs_components.get(key)
+            compute_func = getattr(component, "compute_func", None)
+            if getattr(compute_func, "__name__", "") == "compute_target_poses_only":
+                raise ValueError(
+                    f"{label}='{key}' is a SPARSE masked-mimic observation "
+                    "(compute_target_poses_only). It carries only the "
+                    "conditionable bodies and the ROOT is not among them, so "
+                    "its reference cannot be re-anchored to the reference root "
+                    "-- the residual would be contaminated by the root's "
+                    "displacement over the lookahead. Point this at an "
+                    "all-body build_max_coords_target_poses observation "
+                    "(e.g. 'mimic_target_poses')."
+                )
         global_ref_component = obs_components.get(global_ref_key)
         global_static = (
             global_ref_component.static_params if global_ref_component else None
@@ -684,6 +671,9 @@ class SupervisedAgent(BaseAgent):
         global_features_per_body = (
             3 + 6 + (3 + 6 if with_relative else 0) + (3 + 3 if with_velocities else 0)
         )
+        # target_body_rot sits after the position block(s): 3*NB, plus another
+        # 3*NB when target_body_pos_rel is present.
+        global_rot_offset_per_body = 3 + (3 if with_relative else 0)
         if global_ref_component is None:
             log.info(
                 "FK global loss: '%s' is not a declared observation component; "
@@ -777,7 +767,11 @@ class SupervisedAgent(BaseAgent):
 
             root_noisy = _is_noisy(root_rot_component, "body_rot")
             for label, component, param in (
-                ("fk_wrist_ref_key", ref_component, "current_state_body_rot"),
+                (
+                    "fk_wrist_ref_key",
+                    obs_components.get(wrist_ref_key),
+                    "current_state_body_rot",
+                ),
                 (
                     "fk_global_ref_key",
                     global_ref_component,
@@ -807,79 +801,18 @@ class SupervisedAgent(BaseAgent):
             "global_body_indices": global_body_indices,
             "global_body_names": list(global_body_names),
             "global_features_per_body": global_features_per_body,
+            "global_rot_offset_per_body": global_rot_offset_per_body,
+            "wrist_ref_key": wrist_ref_key,
             "root_rot_key": root_rot_key,
             "root_rot_offset": root_rot_offset,
             "root_rot_min_width": root_rot_min_width,
             "num_dofs": kinematic_info.num_dofs,
-            "num_conditionable": len(conditionable_body_ids),
             "wrist_body_indices": wrist_body_indices,
-            "wrist_slots": wrist_slots,
             "wrist_body_names": list(wrist_body_names),
             "action_fn": action_fn,
             "action_params": action_params,
         }
         return self._fk_wrist_ctx
-
-    def _fk_wrist_reference(self, batch_td, ctx: Dict):
-        """Slice the reference wrist pose + visibility masks out of the batch.
-
-        ``masked_mimic_target_poses`` (build_sparse_target_poses,
-        include_root_relative=True) is laid out as
-        ``[envs, steps, conditionable_bodies, 2, 12]`` where the leading "2"
-        splits TRANSLATION features from ROTATION features, and each 12 is
-        ``[body-relative (6, zero-padded), root-relative (6, zero-padded)]``.
-        We take the ROOT-RELATIVE halves: positions at ``[..., 0, 6:9]`` and the
-        6D tan-norm rotation at ``[..., 1, 6:12]``. Both are already in the
-        HEADING-LOCAL frame of the current root.
-        """
-        ref_key = getattr(
-            self.config, "fk_wrist_ref_key", "masked_mimic_target_poses"
-        )
-        mask_key = getattr(
-            self.config, "fk_wrist_ref_mask_key", "masked_mimic_target_masks"
-        )
-        for key in (ref_key, mask_key):
-            if key not in batch_td.keys():
-                raise KeyError(
-                    f"fk_wrist_*_weight > 0 requires '{key}' in the training "
-                    f"batch. Available keys: {list(batch_td.keys())}"
-                )
-
-        num_cond = ctx["num_conditionable"]
-        ref = batch_td[ref_key]
-        batch_size = ref.shape[0]
-        features_per_step = num_cond * 24
-        if ref.shape[-1] % features_per_step != 0:
-            raise ValueError(
-                f"'{ref_key}' width {ref.shape[-1]} is not a multiple of "
-                f"{features_per_step} (= {num_cond} conditionable bodies x 24 "
-                "features). The FK wrist loss needs "
-                "include_root_relative=True sparse target poses."
-            )
-        num_steps = ref.shape[-1] // features_per_step
-        step = int(getattr(self.config, "fk_wrist_future_step", 0))
-        if not 0 <= step < num_steps:
-            raise ValueError(
-                f"fk_wrist_future_step={step} out of range for "
-                f"{num_steps} future steps in '{ref_key}'."
-            )
-
-        ref = ref.view(batch_size, num_steps, num_cond, 2, 12)
-        slots = ctx["wrist_slots"]
-        ref_pos = ref[:, step, :, 0, 6:9].index_select(1, slots)
-        ref_rot_tan_norm = ref[:, step, :, 1, 6:12].index_select(1, slots)
-
-        masks = batch_td[mask_key]
-        expected_mask_width = num_steps * num_cond * 2
-        if masks.shape[-1] != expected_mask_width:
-            raise ValueError(
-                f"'{mask_key}' width {masks.shape[-1]} != expected "
-                f"{expected_mask_width} (steps x bodies x 2) for '{ref_key}'."
-            )
-        masks = masks.view(batch_size, num_steps, num_cond, 2).to(ref_pos.dtype)
-        pos_mask = masks[:, step, :, 0].index_select(1, slots)
-        rot_mask = masks[:, step, :, 1].index_select(1, slots)
-        return ref_pos, ref_rot_tan_norm, pos_mask, rot_mask
 
     def _fk_wrist_root_heading_local_rot(
         self, batch_td, ctx: Dict, like: Tensor
@@ -936,14 +869,7 @@ class SupervisedAgent(BaseAgent):
             or getattr(self.config, "fk_wrist_ori_weight", 0.0) > 0
         ):
             required.append(
-                getattr(
-                    self.config, "fk_wrist_ref_key", "masked_mimic_target_poses"
-                )
-            )
-            required.append(
-                getattr(
-                    self.config, "fk_wrist_ref_mask_key", "masked_mimic_target_masks"
-                )
+                getattr(self.config, "fk_wrist_ref_key", "mimic_target_poses")
             )
         if getattr(self.config, "fk_global_pos_weight", 0.0) > 0:
             required.append(
@@ -1038,13 +964,13 @@ class SupervisedAgent(BaseAgent):
         ``mean_body_pos_error`` follows. The root's own drift is left to the
         rest of the objective.
 
-        NOTE ON THE ROOT BODY: with the default all-body set, body 0 (pelvis)
-        is included to match the metric's body set, but FK always places it at
-        the origin while its reference is the root tracking error. It therefore
-        contributes a CONSTANT with exactly zero gradient -- harmless, but it
-        inflates the logged value and dilutes the mean by 1/NB. Exclude it via
-        ``fk_global_body_names`` if you want the logged number to be purely the
-        quantity being optimized.
+        NOTE ON THE ROOT BODY: body 0 (pelvis) is in the default set to match
+        the metric's body set, and after the anchor correction it contributes
+        EXACTLY ZERO -- FK places it at the origin and the root-anchored
+        reference is zero there by construction. It costs one row of arithmetic
+        and dilutes the mean by 1/NB, nothing more. (Before the correction it
+        contributed the root tracking error as a constant; that constant WAS
+        the contamination.)
 
         Same honest limitation as the wrist term: FK(action) is the COMMANDED
         pose, not the ACHIEVED one -- no PD tracking error, gravity droop or
@@ -1062,22 +988,39 @@ class SupervisedAgent(BaseAgent):
         # the same form as the wrist term, so the two weights are comparable.
         return (commanded - ref_pos).pow(2).sum(dim=-1).mean()
 
-    def _fk_global_reference(self, batch_td, ctx: Dict) -> Tensor:
-        """Slice ``target_body_pos`` for the scored bodies out of the batch.
+    def _fk_reference_blocks(self, batch_td, ctx: Dict, key: str, future_step: int):
+        """Slice the ROOT-ANCHORED reference position + orientation blocks.
 
-        Layout (``build_max_coords_target_poses``, viewed [envs, steps, blocks]
-        then flattened): STEP-MAJOR, and ``target_body_pos`` is always the FIRST
-        block within a step, so its offset inside a step is 0 whatever the
-        with_relative / with_velocities flags are. Only the per-step stride
-        moves, and that is derived from the component's own static params and
-        the robot's body count -- never a hardcoded number.
+        ``build_max_coords_target_poses`` is STEP-MAJOR, and within a step
+        ``target_body_pos`` is always first while ``target_body_rot`` sits after
+        the position block(s). Both offsets are derived from the component's own
+        static params and the robot's body count -- never a hardcoded stride.
+
+        THE ANCHOR CORRECTION (root fix, 2026-08-05). The raw block is
+
+            target_body_pos[b] = R_hinv_current . (ref_body[b](t+d) - root(t))
+
+        i.e. the reference body at time t+d measured from the CURRENT root at
+        time t. That is NOT the convention ``compute_relative_body_pos_rew``
+        uses -- the reward subtracts the REFERENCE anchor from the reference
+        bodies and the CURRENT anchor from the current bodies. Using the raw
+        block makes the residual carry the ROOT'S DISPLACEMENT over the
+        lookahead, which for locomotion is METRES and swamps the articulation
+        signal entirely. Subtracting the reference's OWN root entry restores the
+        reward's convention:
+
+            ref[b] - ref[root] = R_hinv_current . (ref_body[b] - ref_root)
+
+        (still rotated by the current heading rather than the reference
+        heading -- the residual heading change over the lookahead is a genuine
+        but far smaller effect, and the FK side has no access to the reference
+        heading anyway). This is why the reference MUST be an all-body
+        observation: the root has to be in it.
         """
-        key = ctx["global_ref_key"]
         if key not in batch_td.keys():
             raise KeyError(
-                f"fk_global_pos_weight > 0 requires '{key}' in the training "
-                f"batch (the all-body reference). Available keys: "
-                f"{list(batch_td.keys())}"
+                f"FK loss requires '{key}' in the training batch (the all-body "
+                f"reference). Available keys: {list(batch_td.keys())}"
             )
         ref = batch_td[key]
         num_bodies = ctx["num_bodies"]
@@ -1088,19 +1031,48 @@ class SupervisedAgent(BaseAgent):
                 f"{features_per_step} (= {ctx['global_features_per_body']} "
                 f"features/body x {num_bodies} bodies). Check that the "
                 "component's with_relative / with_velocities flags match the "
-                "observation actually being produced."
+                "observation actually being produced, and that this really is "
+                "an all-body build_max_coords_target_poses observation."
             )
         num_steps = ref.shape[-1] // features_per_step
-        step = int(getattr(self.config, "fk_global_future_step", 0))
-        if not 0 <= step < num_steps:
+        if not 0 <= future_step < num_steps:
             raise ValueError(
-                f"fk_global_future_step={step} out of range for {num_steps} "
+                f"FK future_step={future_step} out of range for {num_steps} "
                 f"future steps in '{key}'."
             )
-        start = step * features_per_step
-        target_body_pos = ref[..., start : start + 3 * num_bodies]
-        target_body_pos = target_body_pos.view(ref.shape[0], num_bodies, 3)
-        return target_body_pos.index_select(1, ctx["global_body_indices"])
+        base = future_step * features_per_step
+        batch_size = ref.shape[0]
+
+        pos = ref[..., base : base + 3 * num_bodies].view(batch_size, num_bodies, 3)
+        # ---- the anchor correction ----
+        pos = pos - pos[:, 0:1, :]
+
+        rot_start = base + ctx["global_rot_offset_per_body"] * num_bodies
+        rot = ref[..., rot_start : rot_start + 6 * num_bodies].view(
+            batch_size, num_bodies, 6
+        )
+        return pos, rot
+
+    def _fk_global_reference(self, batch_td, ctx: Dict) -> Tensor:
+        """Root-anchored all-body reference positions for the scored bodies."""
+        pos, _ = self._fk_reference_blocks(
+            batch_td,
+            ctx,
+            ctx["global_ref_key"],
+            int(getattr(self.config, "fk_global_future_step", 0)),
+        )
+        return pos.index_select(1, ctx["global_body_indices"])
+
+    def _fk_wrist_reference(self, batch_td, ctx: Dict):
+        """Root-anchored reference position + 6D orientation for the wrists."""
+        pos, rot = self._fk_reference_blocks(
+            batch_td,
+            ctx,
+            ctx["wrist_ref_key"],
+            int(getattr(self.config, "fk_wrist_future_step", 0)),
+        )
+        idx = ctx["wrist_body_indices"]
+        return pos.index_select(1, idx), rot.index_select(1, idx)
 
     def _calculate_fk_wrist_loss(self, batch_td, actions: Tensor, cached=None):
         """TRUE FK Cartesian wrist loss on the predicted action.
@@ -1114,15 +1086,24 @@ class SupervisedAgent(BaseAgent):
 
         FRAME (matches ``compute_relative_body_pos_rew``): anchor-relative,
         HEADING-LOCAL -- wrist position measured from the pelvis, expressed in
-        the robot's own yaw-aligned frame. NOT world. World would be dominated
-        by root drift (a metre of pelvis translation error would swamp the ~13 cm
-        wrist deficit we are trying to close), and the teacher's reward never
-        sees world coordinates either. Concretely:
+        the robot's own yaw-aligned frame. NOT world. Concretely:
           * FK is run with ``root_pos = 0`` and identity root rotation, so its
             output is already anchor-relative in the PELVIS BODY frame;
           * that is then rotated by the root's heading-local rotation (its
-            roll/pitch, read from ``max_coords_obs``) to land in the same
-            heading-local frame the reference observation uses.
+            roll/pitch, read from ``max_coords_obs``) into the heading-local
+            frame the reference lives in;
+          * and the REFERENCE is re-anchored to its OWN root
+            (``_fk_reference_blocks``), which is what actually makes both sides
+            anchor-relative in the reward's sense.
+
+        That last step is load-bearing and was missing until 2026-08-05. The
+        raw observation block measures the reference body at t+d from the
+        CURRENT root at t, so the residual carried the root's displacement over
+        the lookahead -- METRES for locomotion. It inflated the live
+        ``fk_wrist_pos_loss`` to ~7.7 (2.8 m RMS) for a robot whose wrists sit
+        ~0.5 m from the pelvis. The reference source must therefore be an
+        ALL-BODY observation; the sparse masked-mimic one has no root entry and
+        is rejected at context-build time.
 
         HONEST LIMITATION: FK(action) is the COMMANDED wrist pose, not the
         ACHIEVED one. It ignores PD tracking error, gravity droop, joint
@@ -1142,27 +1123,23 @@ class SupervisedAgent(BaseAgent):
         ctx, body_pos, body_rot = cached
 
         # Reference first: it names the term's primary contract.
-        ref_pos, ref_rot_tan_norm, pos_mask, rot_mask = self._fk_wrist_reference(
-            batch_td, ctx
-        )
+        ref_pos, ref_rot_tan_norm = self._fk_wrist_reference(batch_td, ctx)
+        ref_pos = ref_pos.detach()
+        ref_rot_tan_norm = ref_rot_tan_norm.detach()
 
         wrist_idx = ctx["wrist_body_indices"]
         wrist_pos = body_pos.index_select(1, wrist_idx)  # [B, W, 3]
         wrist_rot = body_rot.index_select(1, wrist_idx)  # [B, W, 3, 3]
 
-        ref_pos = ref_pos.detach()
-        ref_rot_tan_norm = ref_rot_tan_norm.detach()
-
-        pos_sq_err = (wrist_pos - ref_pos).pow(2).sum(dim=-1)  # [B, W], metres^2
-        pos_loss = (pos_sq_err * pos_mask).sum() / pos_mask.sum().clamp_min(1.0)
+        # Mean over scored elements of the squared position residual, metres^2.
+        pos_loss = (wrist_pos - ref_pos).pow(2).sum(dim=-1).mean()
 
         # tan-norm = (R @ x_hat, R @ z_hat) = columns 0 and 2 of the rotation
         # matrix -- exactly what quat_to_tan_norm produces for the reference.
         wrist_tan_norm = torch.cat(
             (wrist_rot[..., :, 0], wrist_rot[..., :, 2]), dim=-1
         )
-        ori_sq_err = (wrist_tan_norm - ref_rot_tan_norm).pow(2).sum(dim=-1)
-        ori_loss = (ori_sq_err * rot_mask).sum() / rot_mask.sum().clamp_min(1.0)
+        ori_loss = (wrist_tan_norm - ref_rot_tan_norm).pow(2).sum(dim=-1).mean()
 
         return pos_loss, ori_loss
 

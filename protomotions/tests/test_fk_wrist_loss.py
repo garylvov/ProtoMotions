@@ -1,17 +1,31 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Guard tests for the FK Cartesian wrist loss (supervised student).
+"""Guard tests for the FK Cartesian losses (supervised student).
 
-Covers, in order:
-  * ``pose_lib``'s batched torch FK matches MuJoCo ``mj_forward`` on the very
-    same MJCF (position AND rotation), and is differentiable;
-  * ``fk_wrist_*_weight = 0`` leaves total extra loss, log dict and gradients
-    byte-identical to a config that has never heard of the fields;
-  * the loss is (numerically) zero when the commanded wrist pose equals the
-    reference, in the pelvis frame AND under a tilted root;
-  * the visibility mask gates the term;
-  * the gradient reaches the action tensor.
+Two terms, one shared FK pass and one shared reference:
+  * ``fk_wrist_*``    -- wrist position + orientation
+  * ``fk_global_pos`` -- all-body position, targeting the eval's
+                         ``mean_body_pos_error``
+
+Both read ``mimic_target_poses`` (``build_max_coords_target_poses``) and
+RE-ANCHOR it to its own root before comparing.
+
+THE TWO BUGS THIS FILE EXISTS TO PREVENT
+----------------------------------------
+1. (2026-08-04) ``max_coords_obs`` width was validated as 1+3*(NB-1)+15*NB when
+   the kernel emits 1+3*(NB-1)+12*NB. The suite passed anyway because its
+   helper built the tensor from the SAME wrong formula. Fix: every observation
+   the readers are tested against now comes out of the real kernel via the real
+   factory.
+2. (2026-08-05) The reference was used WITHOUT re-anchoring it to its own root.
+   The raw block is ``R_hinv_cur . (ref_body(t+d) - root(t))``: the reference
+   body at t+d measured from the CURRENT root, so the residual carried the
+   root's displacement over the lookahead -- metres for locomotion. It drove
+   the live ``fk_wrist_pos_loss`` to ~7.7 (2.8 m RMS) on a robot whose wrists
+   sit ~0.5 m from the pelvis. The decisive guard is
+   ``test_pure_root_translation_scores_exactly_zero``: translate the reference
+   bodily while holding the joint angles, and a correct term must score 0.
 """
 
 import numpy as np
@@ -35,7 +49,7 @@ WRISTS = ["left_wrist_yaw_link", "right_wrist_yaw_link"]
 
 
 # ---------------------------------------------------------------------------
-# helpers
+# helpers -- every observation comes from the REAL kernel
 # ---------------------------------------------------------------------------
 
 
@@ -55,8 +69,113 @@ def _fk(kinematic_info, joint_targets, root_pos=None):
     )
 
 
+def _experiment_max_coords_component(use_noisy=False, local_obs=True):
+    from protomotions.envs.component_factories import max_coords_obs_factory
+
+    return max_coords_obs_factory(
+        use_noisy=use_noisy,
+        local_obs=local_obs,
+        root_height_obs=True,
+        observe_contacts=False,
+    )
+
+
+def _experiment_mimic_target_poses_component(
+    with_velocities=True, with_relative=True, future_steps=1, use_noisy=False
+):
+    """The exact component masked_mimic_trackc_v1.py builds."""
+    from protomotions.envs.component_factories import (
+        mimic_target_poses_max_coords_factory,
+    )
+
+    return mimic_target_poses_max_coords_factory(
+        use_noisy=use_noisy,
+        with_velocities=with_velocities,
+        with_relative=with_relative,
+        future_steps=future_steps,
+    )
+
+
+def _experiment_components():
+    return {
+        "max_coords_obs": _experiment_max_coords_component(),
+        "mimic_target_poses": _experiment_mimic_target_poses_component(),
+    }
+
+
+def _real_max_coords_obs(robot_config, cur_pos, cur_rot, observe_contacts=False):
+    """max_coords_obs from the real kernel + the heading-local root rotation."""
+    from protomotions.envs.obs.humanoid import (
+        compute_humanoid_max_coords_observations,
+    )
+
+    batch, num_bodies = cur_pos.shape[0], cur_pos.shape[1]
+    obs = compute_humanoid_max_coords_observations(
+        body_pos=cur_pos,
+        body_rot=cur_rot,
+        body_vel=torch.zeros(batch, num_bodies, 3),
+        body_ang_vel=torch.zeros(batch, num_bodies, 3),
+        ground_height=torch.zeros(batch),
+        body_contacts=torch.zeros(batch, 2),
+        local_obs=True,
+        root_height_obs=True,
+        observe_contacts=observe_contacts,
+        w_last=True,
+    )
+    heading_local = rotations.quat_mul(
+        rotations.calc_heading_quat_inv(cur_rot[:, 0], w_last=True),
+        cur_rot[:, 0],
+        w_last=True,
+    )
+    return obs, pose_lib.quaternion_to_matrix(heading_local, w_last=True)
+
+
+def _real_mimic_target_poses(
+    cur_pos, cur_rot, ref_pos, ref_rot, with_velocities=True, with_relative=True
+):
+    """mimic_target_poses from the real kernel. All inputs are WORLD frame."""
+    from protomotions.envs.obs.target_poses import build_max_coords_target_poses
+
+    batch, num_bodies = cur_pos.shape[0], cur_pos.shape[1]
+    return build_max_coords_target_poses(
+        current_state_body_pos=cur_pos,
+        current_state_body_rot=cur_rot,
+        current_state_body_vel=torch.zeros(batch, num_bodies, 3),
+        current_state_body_ang_vel=torch.zeros(batch, num_bodies, 3),
+        mimic_ref_pos=ref_pos.unsqueeze(1),
+        mimic_ref_rot=ref_rot.unsqueeze(1),
+        mimic_ref_vel=torch.zeros(batch, 1, num_bodies, 3),
+        mimic_ref_ang_vel=torch.zeros(batch, 1, num_bodies, 3),
+        with_velocities=with_velocities,
+        with_relative=with_relative,
+        w_last=True,
+    )
+
+
+def _random_state(robot_config, batch, seed=None):
+    """A random but well-formed (body_pos, body_rot) world state."""
+    if seed is not None:
+        torch.manual_seed(seed)
+    num_bodies = robot_config.kinematic_info.num_bodies
+    pos = torch.randn(batch, num_bodies, 3)
+    rot = torch.nn.functional.normalize(torch.randn(batch, num_bodies, 4), dim=-1)
+    return pos, rot
+
+
+def _pose_from_action(robot_config, actions, root_world_rot):
+    """World body poses of the COMMANDED configuration, root at the origin."""
+    action_config = make_pd_action_config(robot_config)
+    params = {k: v for k, v in action_config.items() if k != "fn"}
+    joint_targets = action_config["fn"](actions, **params)["processed_action"]
+    pos_pelvis, rot_pelvis = _fk(robot_config.kinematic_info, joint_targets)
+    root_mat = pose_lib.quaternion_to_matrix(root_world_rot, w_last=True)
+    pos_world = torch.einsum("bij,bnj->bni", root_mat, pos_pelvis)
+    rot_world = torch.einsum("bij,bnjk->bnik", root_mat, rot_pelvis)
+    quat_world = pose_lib.matrix_to_quaternion(rot_world, w_last=True)
+    return pos_world, quat_world
+
+
 def _make_agent(robot_config, config_overrides=None, has_fk_fields=True):
-    """A SupervisedAgent shell with just enough env/config for extra losses."""
     agent = object.__new__(SupervisedAgent)
     fields = dict(
         model=SimpleNamespace(),
@@ -74,8 +193,7 @@ def _make_agent(robot_config, config_overrides=None, has_fk_fields=True):
             fk_wrist_pos_weight=0.0,
             fk_wrist_ori_weight=0.0,
             fk_wrist_body_names=list(WRISTS),
-            fk_wrist_ref_key="masked_mimic_target_poses",
-            fk_wrist_ref_mask_key="masked_mimic_target_masks",
+            fk_wrist_ref_key="mimic_target_poses",
             fk_wrist_root_rot_obs_key="max_coords_obs",
             fk_wrist_future_step=0,
             fk_global_pos_weight=0.0,
@@ -90,87 +208,22 @@ def _make_agent(robot_config, config_overrides=None, has_fk_fields=True):
     agent.env = SimpleNamespace(
         robot_config=robot_config,
         config=SimpleNamespace(
-            observation_components={},
+            observation_components=_experiment_components(),
             action_config=make_pd_action_config(robot_config),
         ),
     )
     return agent
 
 
-def _pack_reference(robot_config, ref_pos, ref_tan_norm, num_steps=3, step=0):
-    """Build a synthetic ``masked_mimic_target_poses`` / mask pair.
-
-    Layout mirrors ``build_sparse_target_poses(include_root_relative=True)``:
-    ``[envs, steps, conditionable_bodies, 2, 12]`` with the root-relative
-    halves at ``[..., 0, 6:9]`` (position) and ``[..., 1, 6:12]`` (rotation).
-    """
-    body_names = robot_config.kinematic_info.body_names
-    cond = [body_names.index(n) for n in robot_config.trackable_bodies_subset]
-    slots = [cond.index(body_names.index(n)) for n in WRISTS]
-    batch = ref_pos.shape[0]
-
-    obs = torch.zeros(batch, num_steps, len(cond), 2, 12)
-    masks = torch.zeros(batch, num_steps, len(cond), 2)
-    for w, slot in enumerate(slots):
-        obs[:, step, slot, 0, 6:9] = ref_pos[:, w]
-        obs[:, step, slot, 1, 6:12] = ref_tan_norm[:, w]
-        masks[:, step, slot, :] = 1.0
-    return obs.reshape(batch, -1), masks.reshape(batch, -1)
-
-
-def _real_max_coords_obs(robot_config, root_world_quat, observe_contacts=False):
-    """Build ``max_coords_obs`` with the REAL kernel, not a hand-rolled tensor.
-
-    The original version of this helper synthesized a tensor from the same
-    (wrong) width formula the reader used, so the suite happily agreed with a
-    bug that killed the live run at its first optimize step. Everything the
-    reader is tested against now comes out of
-    ``compute_humanoid_max_coords_observations`` itself.
-
-    Args:
-        root_world_quat: the root's WORLD rotation [B, 4], w-last.
-
-    Returns:
-        ``(obs, root_heading_local_mat)`` -- the observation, and the
-        heading-local root rotation the reader is expected to recover. The
-        expectation is derived from ``calc_heading_quat_inv``, the kernel's own
-        definition, NOT assumed: a tilt about a non-vertical axis still carries
-        some heading, so ``heading_inv * root_world`` is not simply "the tilt".
-    """
-    from protomotions.envs.obs.humanoid import (
-        compute_humanoid_max_coords_observations,
-    )
-
-    num_bodies = robot_config.kinematic_info.num_bodies
-    batch = root_world_quat.shape[0]
-
-    body_rot = torch.nn.functional.normalize(
-        torch.randn(batch, num_bodies, 4), dim=-1
-    )
-    body_rot[:, 0] = root_world_quat
-    obs = compute_humanoid_max_coords_observations(
-        body_pos=torch.randn(batch, num_bodies, 3),
-        body_rot=body_rot,
-        body_vel=torch.randn(batch, num_bodies, 3),
-        body_ang_vel=torch.randn(batch, num_bodies, 3),
-        ground_height=torch.zeros(batch),
-        body_contacts=torch.zeros(batch, 2),
-        local_obs=True,
-        root_height_obs=True,
-        observe_contacts=observe_contacts,
-        w_last=True,
-    )
-    heading_local_quat = rotations.quat_mul(
-        rotations.calc_heading_quat_inv(root_world_quat, w_last=True),
-        root_world_quat,
-        w_last=True,
-    )
-    return obs, pose_lib.quaternion_to_matrix(heading_local_quat, w_last=True)
-
-
-def _wrist_indices(robot_config):
-    body_names = robot_config.kinematic_info.body_names
-    return [body_names.index(n) for n in WRISTS]
+def _batch(robot_config, actions, cur_pos, cur_rot, ref_pos, ref_rot):
+    max_coords_obs, _ = _real_max_coords_obs(robot_config, cur_pos, cur_rot)
+    return {
+        "privileged_action": actions,
+        "max_coords_obs": max_coords_obs,
+        "mimic_target_poses": _real_mimic_target_poses(
+            cur_pos, cur_rot, ref_pos, ref_rot
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -179,12 +232,11 @@ def _wrist_indices(robot_config):
 
 
 def test_pose_lib_fk_matches_mujoco_forward(robot_config):
-    """pose_lib FK == MuJoCo mj_forward on the same MJCF, pos and rot."""
     mujoco = pytest.importorskip("mujoco")
 
     model = mujoco.MjModel.from_xml_path(MJCF_PATH)
     data = mujoco.MjData(model)
-    kinematic_info = robot_config.kinematic_info
+    ki = robot_config.kinematic_info
 
     mj_joint_names = [
         mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, i)
@@ -194,24 +246,20 @@ def test_pose_lib_fk_matches_mujoco_forward(robot_config):
         mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, i)
         for i in range(model.nbody)
     ]
-    # Free joint first, worldbody first: both orderings must line up with the
-    # KinematicInfo the robot config parsed out of the same file.
-    assert mj_joint_names[1:] == list(kinematic_info.dof_names)
-    assert mj_body_names[1:] == list(kinematic_info.body_names)
+    assert mj_joint_names[1:] == list(ki.dof_names)
+    assert mj_body_names[1:] == list(ki.body_names)
 
     rng = np.random.RandomState(0)
     for trial in range(3):
-        joints = rng.uniform(-0.4, 0.4, size=kinematic_info.num_dofs)
+        joints = rng.uniform(-0.4, 0.4, size=ki.num_dofs)
         data.qpos[:3] = 0.0
         data.qpos[3:7] = [1.0, 0.0, 0.0, 0.0]
         data.qpos[7:] = joints
         mujoco.mj_forward(model, data)
 
-        torch_joints = torch.tensor(joints, dtype=torch.float32)[None]
-        pos, rot = _fk(kinematic_info, torch_joints)
-
-        for name in kinematic_info.body_names:
-            i = kinematic_info.body_names.index(name)
+        pos, rot = _fk(ki, torch.tensor(joints, dtype=torch.float32)[None])
+        for name in ki.body_names:
+            i = ki.body_names.index(name)
             j = mj_body_names.index(name)
             assert np.allclose(
                 pos[0, i].numpy(), data.xpos[j], atol=1e-5
@@ -222,26 +270,319 @@ def test_pose_lib_fk_matches_mujoco_forward(robot_config):
 
 
 def test_pose_lib_fk_is_differentiable(robot_config):
-    """The FK used by the loss must propagate gradients to the joint targets."""
-    kinematic_info = robot_config.kinematic_info
-    joints = (torch.randn(4, kinematic_info.num_dofs) * 0.2).requires_grad_(True)
-    pos, rot = _fk(kinematic_info, joints)
-    left = kinematic_info.body_names.index("left_wrist_yaw_link")
-    pos[:, left].pow(2).sum().backward()
+    ki = robot_config.kinematic_info
+    joints = (torch.randn(4, ki.num_dofs) * 0.2).requires_grad_(True)
+    pos, _ = _fk(ki, joints)
+    pos[:, ki.body_names.index("left_wrist_yaw_link")].pow(2).sum().backward()
     assert joints.grad is not None
     assert torch.isfinite(joints.grad).all()
     assert joints.grad.abs().sum() > 0
 
 
 # ---------------------------------------------------------------------------
-# 2. weight = 0 is byte-identical (and pays no FK cost)
+# 2. THE ANCHOR GUARD -- the test that would have caught the ~7.7 bug
+# ---------------------------------------------------------------------------
+
+
+def test_pure_root_translation_scores_exactly_zero(robot_config):
+    """The robot walked d metres holding the SAME joint angles.
+
+    The commanded joint configuration is already perfect, so BOTH terms must
+    score exactly zero. Without the root re-anchoring the reference is measured
+    from the CURRENT root and this scores ~||d||^2 instead -- which is exactly
+    how the wrist term reached 7.7 m^2 (2.8 m RMS) on the live run.
+    """
+    torch.manual_seed(30)
+    ki = robot_config.kinematic_info
+    batch = 6
+    actions = (torch.randn(batch, ki.num_dofs) * 0.25).requires_grad_(True)
+
+    root_quat = torch.nn.functional.normalize(torch.randn(batch, 4), dim=-1)
+    cur_pos, cur_rot = _pose_from_action(robot_config, actions, root_quat)
+    cur_pos, cur_rot = cur_pos.detach(), cur_rot.detach()
+
+    # Same pose, translated bodily by a large displacement (the live scale).
+    disp = torch.tensor([[2.4, -1.3, 0.35]]).repeat(batch, 1)
+    ref_pos = cur_pos + disp.unsqueeze(1)
+    ref_rot = cur_rot.clone()
+
+    agent = _make_agent(
+        robot_config,
+        {
+            "fk_wrist_pos_weight": 1.0,
+            "fk_wrist_ori_weight": 1.0,
+            "fk_global_pos_weight": 1.0,
+        },
+    )
+    batch_td = _batch(robot_config, actions, cur_pos, cur_rot, ref_pos, ref_rot)
+
+    pos_loss, ori_loss = agent._calculate_fk_wrist_loss(batch_td, actions)
+    global_loss = agent._calculate_fk_global_loss(batch_td, actions)
+
+    assert pos_loss.item() < 1e-8, (
+        f"wrist position loss {pos_loss.item():.4f} != 0 under a pure root "
+        f"translation of {disp[0].tolist()} m -- reference is not root-anchored"
+    )
+    assert ori_loss.item() < 1e-8
+    assert global_loss.item() < 1e-8, (
+        f"global loss {global_loss.item():.4f} != 0 under a pure root "
+        "translation -- reference is not root-anchored"
+    )
+
+
+def test_anchor_correction_removes_exactly_the_root_offset(robot_config):
+    """Pin the failure mode: un-anchored, the block carries the root offset."""
+    torch.manual_seed(31)
+    ki = robot_config.kinematic_info
+    batch = 4
+    actions = torch.randn(batch, ki.num_dofs) * 0.2
+    root_quat = torch.tensor([[0.0, 0.0, 0.0, 1.0]]).repeat(batch, 1)
+    cur_pos, cur_rot = _pose_from_action(robot_config, actions, root_quat)
+
+    disp_len = 2.8
+    ref_pos = cur_pos + torch.tensor([[disp_len, 0.0, 0.0]]).repeat(
+        batch, 1
+    ).unsqueeze(1)
+
+    agent = _make_agent(robot_config, {"fk_global_pos_weight": 1.0})
+    ctx = agent._fk_wrist_context(torch.device("cpu"))
+    obs = _real_mimic_target_poses(cur_pos, cur_rot, ref_pos, cur_rot)
+
+    raw = obs[..., : 3 * ki.num_bodies].view(batch, ki.num_bodies, 3)
+    anchored, _ = agent._fk_reference_blocks(
+        {"mimic_target_poses": obs}, ctx, "mimic_target_poses", 0
+    )
+    # Every body in the raw block sits ~disp_len away from the current root.
+    assert raw.norm(dim=-1).min() > disp_len - 1.0
+    # The anchor correction removes exactly that.
+    assert torch.allclose(anchored, raw - raw[:, 0:1, :], atol=1e-6)
+    assert anchored[:, 0].abs().max() < 1e-6
+
+
+# ---------------------------------------------------------------------------
+# 3. physically-interpretable units
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("offset_cm", [5.0, 13.1, 25.0])
+def test_wrist_loss_equals_squared_offset_in_metres(robot_config, offset_cm):
+    """A known N-cm wrist offset must score exactly (N/100)^2."""
+    torch.manual_seed(32)
+    ki = robot_config.kinematic_info
+    batch = 4
+    actions = torch.randn(batch, ki.num_dofs) * 0.2
+    root_quat = torch.nn.functional.normalize(torch.randn(batch, 4), dim=-1)
+    cur_pos, cur_rot = _pose_from_action(robot_config, actions, root_quat)
+
+    d = offset_cm / 100.0
+    ref_pos = cur_pos.clone()
+    for name in WRISTS:
+        b = ki.body_names.index(name)
+        ref_pos[:, b] = ref_pos[:, b] + torch.tensor([0.0, 0.0, d])
+
+    agent = _make_agent(robot_config, {"fk_wrist_pos_weight": 1.0})
+    batch_td = _batch(robot_config, actions, cur_pos, cur_rot, ref_pos, cur_rot)
+    pos_loss, _ = agent._calculate_fk_wrist_loss(batch_td, actions)
+    assert pos_loss.item() == pytest.approx(d * d, rel=1e-4)
+
+
+@pytest.mark.parametrize("offset_cm", [10.0, 20.0])
+def test_global_loss_equals_squared_offset_in_metres(robot_config, offset_cm):
+    """The same units guard for the all-body term."""
+    torch.manual_seed(33)
+    ki = robot_config.kinematic_info
+    batch = 3
+    actions = torch.randn(batch, ki.num_dofs) * 0.2
+    root_quat = torch.tensor([[0.0, 0.0, 0.0, 1.0]]).repeat(batch, 1)
+    cur_pos, cur_rot = _pose_from_action(robot_config, actions, root_quat)
+
+    d = offset_cm / 100.0
+    ref_pos = cur_pos.clone()
+    # every body EXCEPT the root (displacing the root is a pure translation and
+    # is correctly invisible after anchoring)
+    ref_pos[:, 1:] = ref_pos[:, 1:] + torch.tensor([0.0, d, 0.0])
+
+    agent = _make_agent(robot_config, {"fk_global_pos_weight": 1.0})
+    batch_td = _batch(robot_config, actions, cur_pos, cur_rot, ref_pos, cur_rot)
+    loss = agent._calculate_fk_global_loss(batch_td, actions)
+    expected = d * d * (ki.num_bodies - 1) / ki.num_bodies
+    assert loss.item() == pytest.approx(expected, rel=1e-4)
+
+
+def test_losses_are_zero_when_commanded_equals_reference(robot_config):
+    torch.manual_seed(34)
+    ki = robot_config.kinematic_info
+    batch = 4
+    actions = (torch.randn(batch, ki.num_dofs) * 0.25).requires_grad_(True)
+    root_quat = torch.nn.functional.normalize(torch.randn(batch, 4), dim=-1)
+    cur_pos, cur_rot = _pose_from_action(robot_config, actions, root_quat)
+    cur_pos, cur_rot = cur_pos.detach(), cur_rot.detach()
+
+    agent = _make_agent(
+        robot_config,
+        {
+            "fk_wrist_pos_weight": 1.0,
+            "fk_wrist_ori_weight": 1.0,
+            "fk_global_pos_weight": 1.0,
+        },
+    )
+    batch_td = _batch(robot_config, actions, cur_pos, cur_rot, cur_pos, cur_rot)
+    pos_loss, ori_loss = agent._calculate_fk_wrist_loss(batch_td, actions)
+    assert pos_loss.item() < 1e-8
+    assert ori_loss.item() < 1e-8
+    assert agent._calculate_fk_global_loss(batch_td, actions).item() < 1e-8
+
+
+def test_root_body_contributes_exactly_zero(robot_config):
+    """After the anchor correction the root residual is identically zero."""
+    torch.manual_seed(35)
+    ki = robot_config.kinematic_info
+    batch = 3
+    actions = torch.randn(batch, ki.num_dofs) * 0.2
+    root_quat = torch.nn.functional.normalize(torch.randn(batch, 4), dim=-1)
+    cur_pos, cur_rot = _pose_from_action(robot_config, actions, root_quat)
+    ref_pos, ref_rot = _random_state(robot_config, batch, seed=36)
+
+    agent = _make_agent(
+        robot_config,
+        {
+            "fk_global_pos_weight": 1.0,
+            "fk_global_body_names": [ki.body_names[0]],
+        },
+    )
+    batch_td = _batch(robot_config, actions, cur_pos, cur_rot, ref_pos, ref_rot)
+    assert agent._calculate_fk_global_loss(batch_td, actions).item() == 0.0
+
+
+# ---------------------------------------------------------------------------
+# 4. the sparse masked-mimic reference is rejected (it has no root)
+# ---------------------------------------------------------------------------
+
+
+def test_sparse_masked_mimic_reference_is_rejected(robot_config):
+    from protomotions.envs.mdp_component import MdpComponent
+    from protomotions.envs.obs.masked_mimic import compute_target_poses_only
+
+    ki = robot_config.kinematic_info
+    cond = torch.tensor(
+        [ki.body_names.index(n) for n in robot_config.trackable_bodies_subset],
+        dtype=torch.long,
+    )
+    assert 0 not in cond.tolist(), "premise: the pelvis is not conditionable"
+
+    agent = _make_agent(
+        robot_config,
+        {
+            "fk_wrist_pos_weight": 1.0,
+            "fk_wrist_ref_key": "masked_mimic_target_poses",
+        },
+    )
+    agent.env.config.observation_components = dict(
+        _experiment_components(),
+        masked_mimic_target_poses=MdpComponent(
+            compute_func=compute_target_poses_only,
+            dynamic_vars={},
+            static_params={
+                "conditionable_body_ids": cond,
+                "include_root_relative": True,
+            },
+        ),
+    )
+    with pytest.raises(ValueError, match="ROOT is not among them"):
+        agent._fk_wrist_context(torch.device("cpu"))
+
+
+# ---------------------------------------------------------------------------
+# 5. reference layout resolution
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "with_relative,with_velocities,expected_per_body",
+    [(True, True, 24), (True, False, 18), (False, True, 15), (False, False, 9)],
+)
+def test_reference_stride_is_derived_not_hardcoded(
+    robot_config, with_relative, with_velocities, expected_per_body
+):
+    ki = robot_config.kinematic_info
+    batch = 3
+    cur_pos, cur_rot = _random_state(robot_config, batch, seed=38)
+    ref_pos, ref_rot = _random_state(robot_config, batch, seed=39)
+
+    obs = _real_mimic_target_poses(
+        cur_pos,
+        cur_rot,
+        ref_pos,
+        ref_rot,
+        with_velocities=with_velocities,
+        with_relative=with_relative,
+    )
+    assert obs.shape[-1] == expected_per_body * ki.num_bodies
+
+    agent = _make_agent(robot_config, {"fk_global_pos_weight": 1.0})
+    agent.env.config.observation_components = {
+        "mimic_target_poses": _experiment_mimic_target_poses_component(
+            with_velocities=with_velocities, with_relative=with_relative
+        ),
+        "max_coords_obs": _experiment_max_coords_component(),
+    }
+    ctx = agent._fk_wrist_context(torch.device("cpu"))
+    assert ctx["global_features_per_body"] == expected_per_body
+
+    pos, rot = agent._fk_reference_blocks(
+        {"mimic_target_poses": obs}, ctx, "mimic_target_poses", 0
+    )
+    # Independent recomputation of the root-anchored reference.
+    hinv = rotations.calc_heading_quat_inv(cur_rot[:, 0], w_last=True)
+    for b in range(ki.num_bodies):
+        want = rotations.quat_rotate(
+            hinv, ref_pos[:, b] - ref_pos[:, 0], w_last=True
+        )
+        assert torch.allclose(pos[:, b], want, atol=1e-5)
+        want_rot = rotations.quat_to_tan_norm(
+            rotations.quat_mul(hinv, ref_rot[:, b], w_last=True), w_last=True
+        )
+        assert torch.allclose(rot[:, b], want_rot, atol=1e-5)
+
+
+def test_multi_step_reference_selects_the_right_step(robot_config):
+    """The live config resolves future_steps=4; indexing must be step-major."""
+    ki = robot_config.kinematic_info
+    batch = 3
+    cur_pos, cur_rot = _random_state(robot_config, batch, seed=41)
+    per_step, obs_steps = [], []
+    for s in range(3):
+        ref_pos, ref_rot = _random_state(robot_config, batch, seed=50 + s)
+        per_step.append(ref_pos)
+        obs_steps.append(
+            _real_mimic_target_poses(cur_pos, cur_rot, ref_pos, ref_rot)
+        )
+    obs = torch.cat(obs_steps, dim=-1)
+
+    hinv = rotations.calc_heading_quat_inv(cur_rot[:, 0], w_last=True)
+    for s in range(3):
+        agent = _make_agent(
+            robot_config,
+            {"fk_global_pos_weight": 1.0, "fk_global_future_step": s},
+        )
+        ctx = agent._fk_wrist_context(torch.device("cpu"))
+        got = agent._fk_global_reference({"mimic_target_poses": obs}, ctx)
+        ref_pos = per_step[s]
+        for b in range(ki.num_bodies):
+            want = rotations.quat_rotate(
+                hinv, ref_pos[:, b] - ref_pos[:, 0], w_last=True
+            )
+            assert torch.allclose(got[:, b], want, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# 6. no-op at zero
 # ---------------------------------------------------------------------------
 
 
 def _extra_loss_with_grad(agent, batch, actions):
     extra_loss, log_dict = agent.calculate_extra_loss(batch, actions)
     if not extra_loss.requires_grad:
-        # No enabled term touches the action at all -> no gradient path.
         return extra_loss, log_dict, None
     grad = torch.autograd.grad(
         extra_loss, actions, allow_unused=True, retain_graph=True
@@ -249,492 +590,257 @@ def _extra_loss_with_grad(agent, batch, actions):
     return extra_loss, log_dict, grad
 
 
-def test_zero_weight_is_byte_identical_to_config_without_the_fields(robot_config):
-    torch.manual_seed(0)
-    num_dofs = robot_config.kinematic_info.num_dofs
-    actions_a = (torch.randn(6, num_dofs) * 0.1).requires_grad_(True)
+def test_all_weights_zero_is_byte_identical_and_builds_no_context(robot_config):
+    torch.manual_seed(42)
+    ki = robot_config.kinematic_info
+    batch = 5
+    actions_a = (torch.randn(batch, ki.num_dofs) * 0.1).requires_grad_(True)
     actions_b = actions_a.detach().clone().requires_grad_(True)
+    cur_pos, cur_rot = _random_state(robot_config, batch, seed=43)
+    ref_pos, ref_rot = _random_state(robot_config, batch, seed=44)
 
-    ref_pos = torch.randn(6, 2, 3)
-    ref_tan = torch.randn(6, 2, 6)
-    ref, masks = _pack_reference(robot_config, ref_pos, ref_tan)
-    root_quat = torch.tensor([[0.0, 0.0, 0.0, 1.0]]).repeat(6, 1)
-
-    def make_batch(actions):
-        return {
-            "privileged_action": actions,
-            "expert_actions": torch.zeros_like(actions),
-            "previous_actions": torch.zeros_like(actions),
-            "masked_mimic_target_poses": ref,
-            "masked_mimic_target_masks": masks,
-            "max_coords_obs": _real_max_coords_obs(robot_config, root_quat)[0],
-        }
-
-    # Old pickled config: the fields do not exist at all.
     legacy = _make_agent(robot_config, has_fk_fields=False)
-    # New config, fields present at their 0.0 defaults.
     current = _make_agent(robot_config)
 
-    loss_legacy, log_legacy, grad_legacy = _extra_loss_with_grad(
-        legacy, make_batch(actions_a), actions_a
+    la, loga, ga = _extra_loss_with_grad(
+        legacy,
+        _batch(robot_config, actions_a, cur_pos, cur_rot, ref_pos, ref_rot),
+        actions_a,
     )
-    loss_current, log_current, grad_current = _extra_loss_with_grad(
-        current, make_batch(actions_b), actions_b
+    lb, logb, gb = _extra_loss_with_grad(
+        current,
+        _batch(robot_config, actions_b, cur_pos, cur_rot, ref_pos, ref_rot),
+        actions_b,
     )
 
-    assert loss_legacy.item() == loss_current.item() == 0.0
-    assert log_legacy == log_current == {}
-    # No FK term means no path from extra_loss to the action at all.
-    assert grad_legacy is None and grad_current is None
-    # And the FK context is never built -> zero FK cost paid.
+    assert la.item() == lb.item() == 0.0
+    assert loga == logb == {}
+    assert ga is None and gb is None
     assert current._fk_wrist_ctx is None
-    assert "supervised/fk_wrist_pos_loss" not in log_current
-    assert "supervised/fk_wrist_ori_loss" not in log_current
 
 
 def test_zero_weight_leaves_an_existing_extra_term_untouched(robot_config):
-    """A live extra term (action_rate) must be bit-identical with FK at 0."""
-    torch.manual_seed(1)
-    num_dofs = robot_config.kinematic_info.num_dofs
-    actions_a = (torch.randn(5, num_dofs) * 0.1).requires_grad_(True)
+    torch.manual_seed(45)
+    ki = robot_config.kinematic_info
+    batch = 5
+    actions_a = (torch.randn(batch, ki.num_dofs) * 0.1).requires_grad_(True)
     actions_b = actions_a.detach().clone().requires_grad_(True)
-    previous = torch.randn(5, num_dofs) * 0.1
-
-    def make_batch(actions):
-        return {
-            "privileged_action": actions,
-            "previous_actions": previous,
-        }
+    previous = torch.randn(batch, ki.num_dofs) * 0.1
 
     legacy = _make_agent(
         robot_config, {"action_rate_weight": 0.5}, has_fk_fields=False
     )
     current = _make_agent(robot_config, {"action_rate_weight": 0.5})
 
-    loss_a, log_a, grad_a = _extra_loss_with_grad(
-        legacy, make_batch(actions_a), actions_a
+    la, loga, ga = _extra_loss_with_grad(
+        legacy,
+        {"privileged_action": actions_a, "previous_actions": previous},
+        actions_a,
     )
-    loss_b, log_b, grad_b = _extra_loss_with_grad(
-        current, make_batch(actions_b), actions_b
+    lb, logb, gb = _extra_loss_with_grad(
+        current,
+        {"privileged_action": actions_b, "previous_actions": previous},
+        actions_b,
+    )
+    assert la.item() == lb.item()
+    assert set(loga) == set(logb) == {"supervised/action_rate_loss"}
+    assert torch.equal(ga, gb)
+
+
+def test_global_weight_zero_leaves_the_wrist_term_untouched(robot_config):
+    torch.manual_seed(46)
+    ki = robot_config.kinematic_info
+    batch = 4
+    actions_a = (torch.randn(batch, ki.num_dofs) * 0.2).requires_grad_(True)
+    actions_b = actions_a.detach().clone().requires_grad_(True)
+    cur_pos, cur_rot = _random_state(robot_config, batch, seed=47)
+    ref_pos, ref_rot = _random_state(robot_config, batch, seed=48)
+
+    legacy = _make_agent(robot_config, {"fk_wrist_pos_weight": 1.0})
+    for f in (
+        "fk_global_pos_weight",
+        "fk_global_body_names",
+        "fk_global_ref_key",
+        "fk_global_future_step",
+    ):
+        delattr(legacy.config, f)
+    current = _make_agent(
+        robot_config, {"fk_wrist_pos_weight": 1.0, "fk_global_pos_weight": 0.0}
     )
 
-    assert loss_a.item() == loss_b.item()
-    assert set(log_a) == set(log_b) == {"supervised/action_rate_loss"}
-    assert torch.equal(grad_a, grad_b)
+    la, loga, ga = _extra_loss_with_grad(
+        legacy,
+        _batch(robot_config, actions_a, cur_pos, cur_rot, ref_pos, ref_rot),
+        actions_a,
+    )
+    lb, logb, gb = _extra_loss_with_grad(
+        current,
+        _batch(robot_config, actions_b, cur_pos, cur_rot, ref_pos, ref_rot),
+        actions_b,
+    )
+    assert la.item() == lb.item()
+    assert set(loga) == set(logb) == {"supervised/fk_wrist_pos_loss"}
+    assert torch.equal(ga, gb)
 
 
 # ---------------------------------------------------------------------------
-# 3. loss == 0 when the commanded wrist pose equals the reference
+# 7. gradients and the shared FK pass
 # ---------------------------------------------------------------------------
-
-
-def _commanded_wrist_pose(robot_config, actions, root_rot_mat=None):
-    """FK(action) wrist pose, optionally rotated into the heading-local frame."""
-    action_config = make_pd_action_config(robot_config)
-    params = {k: v for k, v in action_config.items() if k != "fn"}
-    joint_targets = action_config["fn"](actions, **params)["processed_action"]
-    pos, rot = _fk(robot_config.kinematic_info, joint_targets)
-    idx = _wrist_indices(robot_config)
-    pos = pos[:, idx]
-    rot = rot[:, idx]
-    if root_rot_mat is not None:
-        pos = torch.einsum("bij,bwj->bwi", root_rot_mat, pos)
-        rot = torch.einsum("bij,bwjk->bwik", root_rot_mat, rot)
-    tan_norm = torch.cat((rot[..., :, 0], rot[..., :, 2]), dim=-1)
-    return pos, tan_norm
-
-
-def test_loss_is_zero_when_reference_equals_commanded_pose_pelvis_frame(
-    robot_config,
-):
-    """fk_wrist_root_rot_obs_key=None => pure pelvis frame, no obs needed."""
-    torch.manual_seed(2)
-    num_dofs = robot_config.kinematic_info.num_dofs
-    actions = (torch.randn(4, num_dofs) * 0.3).requires_grad_(True)
-
-    with torch.no_grad():
-        ref_pos, ref_tan = _commanded_wrist_pose(robot_config, actions)
-    ref, masks = _pack_reference(robot_config, ref_pos, ref_tan)
-
-    agent = _make_agent(
-        robot_config,
-        {
-            "fk_wrist_pos_weight": 1.0,
-            "fk_wrist_ori_weight": 1.0,
-            "fk_wrist_root_rot_obs_key": None,
-        },
-    )
-    batch = {
-        "privileged_action": actions,
-        "masked_mimic_target_poses": ref,
-        "masked_mimic_target_masks": masks,
-    }
-    pos_loss, ori_loss = agent._calculate_fk_wrist_loss(batch, actions)
-    assert pos_loss.item() < 1e-10
-    assert ori_loss.item() < 1e-10
-
-
-def test_loss_is_zero_under_a_tilted_root(robot_config):
-    """The heading-local correction must be applied, not assumed identity."""
-    torch.manual_seed(3)
-    num_dofs = robot_config.kinematic_info.num_dofs
-    batch_size = 4
-    actions = (torch.randn(batch_size, num_dofs) * 0.3).requires_grad_(True)
-
-    # A genuine pelvis tilt (roll+pitch), the part a heading-only frame keeps.
-    angle = torch.full((batch_size,), 0.25)
-    axis = torch.nn.functional.normalize(
-        torch.tensor([[0.4, 0.9, 0.0]]).repeat(batch_size, 1), dim=-1
-    )
-    root_quat = rotations.quat_from_angle_axis(angle, axis, w_last=True)
-    # Observation first: it defines what the heading-local rotation actually is.
-    max_coords_obs, root_mat = _real_max_coords_obs(robot_config, root_quat)
-
-    with torch.no_grad():
-        ref_pos, ref_tan = _commanded_wrist_pose(robot_config, actions, root_mat)
-    ref, masks = _pack_reference(robot_config, ref_pos, ref_tan)
-
-    agent = _make_agent(
-        robot_config,
-        {"fk_wrist_pos_weight": 1.0, "fk_wrist_ori_weight": 1.0},
-    )
-    batch = {
-        "privileged_action": actions,
-        "masked_mimic_target_poses": ref,
-        "masked_mimic_target_masks": masks,
-        "max_coords_obs": max_coords_obs,
-    }
-    pos_loss, ori_loss = agent._calculate_fk_wrist_loss(batch, actions)
-    assert pos_loss.item() < 1e-8
-    assert ori_loss.item() < 1e-8
-
-    # Ignoring the tilt is NOT free: the same batch scored in the pelvis frame
-    # must be materially wrong (the wrists sit ~0.5 m from the pelvis).
-    naive = _make_agent(
-        robot_config,
-        {
-            "fk_wrist_pos_weight": 1.0,
-            "fk_wrist_ori_weight": 1.0,
-            "fk_wrist_root_rot_obs_key": None,
-        },
-    )
-    naive_pos, naive_ori = naive._calculate_fk_wrist_loss(batch, actions)
-    assert naive_pos.item() > 1e-3
-    assert naive_ori.item() > 1e-3
-
-
-def test_loss_grows_with_reference_offset(robot_config):
-    """Position loss is the squared metric error in the comparison frame."""
-    torch.manual_seed(4)
-    num_dofs = robot_config.kinematic_info.num_dofs
-    actions = torch.randn(3, num_dofs) * 0.2
-
-    with torch.no_grad():
-        ref_pos, ref_tan = _commanded_wrist_pose(robot_config, actions)
-    offset = torch.zeros_like(ref_pos)
-    offset[..., 0] = 0.10  # 10 cm along x, on every scored wrist
-    ref, masks = _pack_reference(robot_config, ref_pos + offset, ref_tan)
-
-    agent = _make_agent(
-        robot_config,
-        {"fk_wrist_pos_weight": 1.0, "fk_wrist_root_rot_obs_key": None},
-    )
-    batch = {
-        "privileged_action": actions,
-        "masked_mimic_target_poses": ref,
-        "masked_mimic_target_masks": masks,
-    }
-    pos_loss, _ = agent._calculate_fk_wrist_loss(batch, actions)
-    assert pos_loss.item() == pytest.approx(0.10**2, rel=1e-4)
-
-
-# ---------------------------------------------------------------------------
-# 4. masking and gradient flow
-# ---------------------------------------------------------------------------
-
-
-def test_masked_out_targets_do_not_contribute(robot_config):
-    torch.manual_seed(5)
-    num_dofs = robot_config.kinematic_info.num_dofs
-    actions = torch.randn(4, num_dofs) * 0.2
-
-    with torch.no_grad():
-        ref_pos, ref_tan = _commanded_wrist_pose(robot_config, actions)
-    bad_ref_pos = ref_pos + 1.0
-    ref, masks = _pack_reference(robot_config, bad_ref_pos, ref_tan)
-
-    agent = _make_agent(
-        robot_config,
-        {
-            "fk_wrist_pos_weight": 1.0,
-            "fk_wrist_ori_weight": 1.0,
-            "fk_wrist_root_rot_obs_key": None,
-        },
-    )
-    batch = {
-        "privileged_action": actions,
-        "masked_mimic_target_poses": ref,
-        "masked_mimic_target_masks": masks,
-    }
-    visible_pos, _ = agent._calculate_fk_wrist_loss(batch, actions)
-    assert visible_pos.item() > 1.0
-
-    batch["masked_mimic_target_masks"] = torch.zeros_like(masks)
-    masked_pos, masked_ori = agent._calculate_fk_wrist_loss(batch, actions)
-    assert masked_pos.item() == 0.0
-    assert masked_ori.item() == 0.0
 
 
 def test_gradient_reaches_the_action_tensor(robot_config):
-    torch.manual_seed(6)
-    num_dofs = robot_config.kinematic_info.num_dofs
-    actions = (torch.randn(4, num_dofs) * 0.2).requires_grad_(True)
-
-    ref_pos = torch.randn(4, 2, 3) * 0.2
-    ref_tan = torch.randn(4, 2, 6) * 0.2
-    ref, masks = _pack_reference(robot_config, ref_pos, ref_tan)
-    root_quat = torch.tensor([[0.0, 0.0, 0.0, 1.0]]).repeat(4, 1)
+    torch.manual_seed(49)
+    ki = robot_config.kinematic_info
+    batch = 4
+    actions = (torch.randn(batch, ki.num_dofs) * 0.2).requires_grad_(True)
+    cur_pos, cur_rot = _random_state(robot_config, batch, seed=52)
+    ref_pos, ref_rot = _random_state(robot_config, batch, seed=53)
 
     agent = _make_agent(
         robot_config,
-        {"fk_wrist_pos_weight": 1.0, "fk_wrist_ori_weight": 0.5},
+        {
+            "fk_wrist_pos_weight": 1.0,
+            "fk_wrist_ori_weight": 0.5,
+            "fk_global_pos_weight": 1.0,
+        },
     )
-    batch = {
-        "privileged_action": actions,
-        "masked_mimic_target_poses": ref,
-        "masked_mimic_target_masks": masks,
-        "max_coords_obs": _real_max_coords_obs(robot_config, root_quat)[0],
-    }
-
-    extra_loss, log_dict = agent.calculate_extra_loss(batch, actions)
-    assert "supervised/fk_wrist_pos_loss" in log_dict
-    assert "supervised/fk_wrist_ori_loss" in log_dict
+    batch_td = _batch(robot_config, actions, cur_pos, cur_rot, ref_pos, ref_rot)
+    extra_loss, log_dict = agent.calculate_extra_loss(batch_td, actions)
+    assert {
+        "supervised/fk_wrist_pos_loss",
+        "supervised/fk_wrist_ori_loss",
+        "supervised/fk_global_pos_loss",
+    } <= set(log_dict)
 
     grad = torch.autograd.grad(extra_loss, actions)[0]
-    assert grad is not None
     assert torch.isfinite(grad).all()
     assert grad.abs().sum() > 0
 
-    # Arm DOFs must carry (most of) the signal: the leg chain has no path to a
-    # wrist, so its gradient is exactly zero.
-    dof_names = list(robot_config.kinematic_info.dof_names)
-    arm = [i for i, n in enumerate(dof_names) if "shoulder" in n or "elbow" in n or "wrist" in n]
-    leg = [i for i, n in enumerate(dof_names) if "hip" in n or "knee" in n or "ankle" in n]
+    dof_names = list(ki.dof_names)
+    leg = [
+        i
+        for i, n in enumerate(dof_names)
+        if "hip" in n or "knee" in n or "ankle" in n
+    ]
+    arm = [
+        i
+        for i, n in enumerate(dof_names)
+        if "shoulder" in n or "elbow" in n or "wrist" in n
+    ]
     assert grad[:, arm].abs().sum() > 0
+    # the all-body term is what puts gradient on the leg chain
+    assert grad[:, leg].abs().sum() > 0
+
+
+def test_wrist_only_puts_no_gradient_on_the_leg_chain(robot_config):
+    torch.manual_seed(54)
+    ki = robot_config.kinematic_info
+    batch = 4
+    actions = (torch.randn(batch, ki.num_dofs) * 0.2).requires_grad_(True)
+    cur_pos, cur_rot = _random_state(robot_config, batch, seed=55)
+    ref_pos, ref_rot = _random_state(robot_config, batch, seed=56)
+
+    agent = _make_agent(robot_config, {"fk_wrist_pos_weight": 1.0})
+    batch_td = _batch(robot_config, actions, cur_pos, cur_rot, ref_pos, ref_rot)
+    extra_loss, _ = agent.calculate_extra_loss(batch_td, actions)
+    grad = torch.autograd.grad(extra_loss, actions)[0]
+
+    leg = [
+        i
+        for i, n in enumerate(ki.dof_names)
+        if "hip" in n or "knee" in n or "ankle" in n
+    ]
     assert grad[:, leg].abs().sum() == 0
 
 
-def test_context_is_built_once_and_reused(robot_config):
-    """Kinematic info must be precomputed, never rebuilt per step."""
-    torch.manual_seed(7)
-    num_dofs = robot_config.kinematic_info.num_dofs
-    actions = torch.randn(3, num_dofs) * 0.2
-    ref, masks = _pack_reference(
-        robot_config, torch.zeros(3, 2, 3), torch.zeros(3, 2, 6)
-    )
+def test_both_terms_share_one_fk_pass(robot_config):
+    torch.manual_seed(57)
+    ki = robot_config.kinematic_info
+    batch = 3
+    actions = (torch.randn(batch, ki.num_dofs) * 0.2).requires_grad_(True)
+    cur_pos, cur_rot = _random_state(robot_config, batch, seed=58)
+    ref_pos, ref_rot = _random_state(robot_config, batch, seed=59)
 
     agent = _make_agent(
         robot_config,
-        {"fk_wrist_pos_weight": 1.0, "fk_wrist_root_rot_obs_key": None},
+        {
+            "fk_wrist_pos_weight": 1.0,
+            "fk_wrist_ori_weight": 1.0,
+            "fk_global_pos_weight": 1.0,
+        },
     )
-    batch = {
-        "privileged_action": actions,
-        "masked_mimic_target_poses": ref,
-        "masked_mimic_target_masks": masks,
-    }
+    calls = {"n": 0}
+    original = SupervisedAgent._fk_commanded_body_poses
+
+    def counting(self, *a, **k):
+        calls["n"] += 1
+        return original(self, *a, **k)
+
+    agent._fk_commanded_body_poses = counting.__get__(agent, SupervisedAgent)
+    agent.calculate_extra_loss(
+        _batch(robot_config, actions, cur_pos, cur_rot, ref_pos, ref_rot), actions
+    )
+    assert calls["n"] == 1
+
+
+def test_context_is_built_once_and_reused(robot_config):
+    torch.manual_seed(60)
+    ki = robot_config.kinematic_info
+    batch = 3
+    actions = torch.randn(batch, ki.num_dofs) * 0.2
+    cur_pos, cur_rot = _random_state(robot_config, batch, seed=61)
+    ref_pos, ref_rot = _random_state(robot_config, batch, seed=62)
+
+    agent = _make_agent(robot_config, {"fk_global_pos_weight": 1.0})
+    batch_td = _batch(robot_config, actions, cur_pos, cur_rot, ref_pos, ref_rot)
     assert agent._fk_wrist_ctx is None
-    agent._calculate_fk_wrist_loss(batch, actions)
+    agent._calculate_fk_global_loss(batch_td, actions)
     first = agent._fk_wrist_ctx
     assert first is not None
-    agent._calculate_fk_wrist_loss(batch, actions)
+    agent._calculate_fk_global_loss(batch_td, actions)
     assert agent._fk_wrist_ctx is first
 
 
 # ---------------------------------------------------------------------------
-# 5. the reference slicing matches the REAL observation kernel
+# 8. the root-rotation reader (2026-08-04 regression: 433 vs 520)
 # ---------------------------------------------------------------------------
-
-
-def test_reference_slice_matches_the_real_masked_mimic_obs_kernel(robot_config):
-    """Guard the layout assumption against compute_target_poses_only itself.
-
-    If build_sparse_target_poses ever reorders its blocks, this fails loudly
-    instead of silently training against the wrong six numbers.
-    """
-    from protomotions.envs.obs.masked_mimic import compute_target_poses_only
-
-    torch.manual_seed(8)
-    body_names = robot_config.kinematic_info.body_names
-    num_bodies = len(body_names)
-    num_envs, num_steps = 3, 4
-    cond = torch.tensor(
-        [body_names.index(n) for n in robot_config.trackable_bodies_subset],
-        dtype=torch.long,
-    )
-
-    cur_pos = torch.randn(num_envs, num_bodies, 3)
-    cur_rot = torch.nn.functional.normalize(
-        torch.randn(num_envs, num_bodies, 4), dim=-1
-    )
-    ref_pos = torch.randn(num_envs, num_steps, num_bodies, 3)
-    ref_rot = torch.nn.functional.normalize(
-        torch.randn(num_envs, num_steps, num_bodies, 4), dim=-1
-    )
-    masks = torch.ones(num_envs, num_steps * len(cond) * 2)
-
-    obs = compute_target_poses_only(
-        current_state_body_pos=cur_pos,
-        current_state_body_rot=cur_rot,
-        masked_mimic_ref_pos=ref_pos,
-        masked_mimic_ref_rot=ref_rot,
-        masked_mimic_target_bodies_masks=masks,
-        conditionable_body_ids=cond,
-        include_root_relative=True,
-    )
-
-    step = 2
-    agent = _make_agent(robot_config, {"fk_wrist_future_step": step})
-    ctx = agent._fk_wrist_context(torch.device("cpu"))
-    got_pos, got_tan, pos_mask, rot_mask = agent._fk_wrist_reference(
-        {"masked_mimic_target_poses": obs, "masked_mimic_target_masks": masks},
-        ctx,
-    )
-
-    # Expected: (ref_wrist - current_root) rotated by the CURRENT root's
-    # inverse heading -- root-relative, heading-local.
-    heading_inv = rotations.calc_heading_quat_inv(cur_rot[:, 0], w_last=True)
-    for w, name in enumerate(WRISTS):
-        b = body_names.index(name)
-        delta = ref_pos[:, step, b] - cur_pos[:, 0]
-        expected_pos = rotations.quat_rotate(heading_inv, delta, w_last=True)
-        expected_tan = rotations.quat_to_tan_norm(
-            rotations.quat_mul(heading_inv, ref_rot[:, step, b], w_last=True),
-            w_last=True,
-        )
-        assert torch.allclose(got_pos[:, w], expected_pos, atol=1e-5)
-        assert torch.allclose(got_tan[:, w], expected_tan, atol=1e-5)
-
-    assert torch.equal(pos_mask, torch.ones_like(pos_mask))
-    assert torch.equal(rot_mask, torch.ones_like(rot_mask))
-
-
-# ---------------------------------------------------------------------------
-# 6. the root-rotation reader against the REAL experiment observation spec
-#
-# REGRESSION (2026-08-05): the live 8-rank run died at its first optimize step
-# with "'max_coords_obs' width 433 is too small ... expected >= 520". The reader
-# validated against 1 + 3*(NB-1) + 15*NB; the kernel emits
-# 1 + 3*(NB-1) + 12*NB (6*NB rotation + 3*NB vel + 3*NB ang_vel). The suite
-# passed anyway because its helper BUILT the tensor from the same wrong formula.
-# These tests take the observation from the real factory + real kernel.
-# ---------------------------------------------------------------------------
-
-
-def _experiment_max_coords_component(use_noisy=False, local_obs=True):
-    """The exact component this experiment's config builds."""
-    from protomotions.envs.component_factories import max_coords_obs_factory
-
-    return max_coords_obs_factory(
-        use_noisy=use_noisy,
-        local_obs=local_obs,
-        root_height_obs=True,
-        observe_contacts=False,
-    )
 
 
 def test_real_max_coords_obs_width_matches_the_readers_expectation(robot_config):
-    """The width the kernel emits must be the width the reader demands."""
-    root_quat = torch.tensor([[0.0, 0.0, 0.0, 1.0]]).repeat(4, 1)
-    obs, _ = _real_max_coords_obs(robot_config, root_quat)
+    batch = 4
+    cur_pos, cur_rot = _random_state(robot_config, batch, seed=63)
+    obs, _ = _real_max_coords_obs(robot_config, cur_pos, cur_rot)
 
     agent = _make_agent(robot_config, {"fk_wrist_pos_weight": 1.0})
     ctx = agent._fk_wrist_context(torch.device("cpu"))
-
-    num_bodies = robot_config.kinematic_info.num_bodies
-    assert obs.shape[-1] == 1 + 3 * (num_bodies - 1) + 12 * num_bodies
+    nb = robot_config.kinematic_info.num_bodies
+    assert obs.shape[-1] == 1 + 3 * (nb - 1) + 12 * nb
     assert obs.shape[-1] == ctx["root_rot_min_width"]
-    assert ctx["root_rot_offset"] == 1 + 3 * (num_bodies - 1)
+    assert ctx["root_rot_offset"] == 1 + 3 * (nb - 1)
 
 
 def test_reader_recovers_root_rotation_from_the_real_observation(robot_config):
-    """End-to-end: real factory + real kernel -> reader returns the tilt."""
-    torch.manual_seed(9)
     batch = 5
-    angle = torch.linspace(0.05, 0.6, batch)
-    axis = torch.nn.functional.normalize(
-        torch.tensor([[0.3, 0.8, 0.0]]).repeat(batch, 1), dim=-1
-    )
-    root_quat = rotations.quat_from_angle_axis(angle, axis, w_last=True)
+    cur_pos, cur_rot = _random_state(robot_config, batch, seed=64)
+    obs, expected = _real_max_coords_obs(robot_config, cur_pos, cur_rot)
 
     agent = _make_agent(robot_config, {"fk_wrist_pos_weight": 1.0})
-    agent.env.config.observation_components = {
-        "max_coords_obs": _experiment_max_coords_component()
-    }
     ctx = agent._fk_wrist_context(torch.device("cpu"))
-
-    obs, expected = _real_max_coords_obs(robot_config, root_quat)
     got = agent._fk_wrist_root_heading_local_rot(
         {"max_coords_obs": obs}, ctx, torch.zeros(batch, 2, 3)
     )
     assert torch.allclose(got, expected, atol=1e-5)
-    # And it is a genuine tilt, not a degenerate identity that would pass anyway.
     assert (expected - torch.eye(3)).abs().max() > 0.02
 
 
-def test_full_loss_runs_against_the_real_observation_spec(robot_config):
-    """The exact path the live run took: nothing hand-rolled but the reference."""
-    torch.manual_seed(10)
-    num_dofs = robot_config.kinematic_info.num_dofs
-    batch = 4
-    actions = (torch.randn(batch, num_dofs) * 0.2).requires_grad_(True)
-
-    angle = torch.full((batch,), 0.3)
-    axis = torch.nn.functional.normalize(
-        torch.tensor([[0.5, 0.7, 0.0]]).repeat(batch, 1), dim=-1
-    )
-    root_quat = rotations.quat_from_angle_axis(angle, axis, w_last=True)
-    max_coords_obs, root_mat = _real_max_coords_obs(robot_config, root_quat)
-
-    with torch.no_grad():
-        ref_pos, ref_tan = _commanded_wrist_pose(robot_config, actions, root_mat)
-    ref, masks = _pack_reference(robot_config, ref_pos, ref_tan)
-
-    agent = _make_agent(
-        robot_config,
-        {"fk_wrist_pos_weight": 1.0, "fk_wrist_ori_weight": 1.0},
-    )
-    agent.env.config.observation_components = {
-        "max_coords_obs": _experiment_max_coords_component()
-    }
-    batch_td = {
-        "privileged_action": actions,
-        "masked_mimic_target_poses": ref,
-        "masked_mimic_target_masks": masks,
-        "max_coords_obs": max_coords_obs,
-    }
-
-    extra_loss, log_dict = agent.calculate_extra_loss(batch_td, actions)
-    assert log_dict["supervised/fk_wrist_pos_loss"].item() < 1e-8
-    assert log_dict["supervised/fk_wrist_ori_loss"].item() < 1e-8
-    assert torch.isfinite(extra_loss)
-
-
 def test_contact_tail_does_not_disturb_the_reader(robot_config):
-    """observe_contacts appends AFTER everything read; must still resolve."""
-    torch.manual_seed(11)
     batch = 3
-    angle = torch.full((batch,), 0.2)
-    axis = torch.nn.functional.normalize(
-        torch.tensor([[1.0, 0.0, 0.0]]).repeat(batch, 1), dim=-1
+    cur_pos, cur_rot = _random_state(robot_config, batch, seed=65)
+    obs, expected = _real_max_coords_obs(
+        robot_config, cur_pos, cur_rot, observe_contacts=True
     )
-    root_quat = rotations.quat_from_angle_axis(angle, axis, w_last=True)
-
     agent = _make_agent(robot_config, {"fk_wrist_pos_weight": 1.0})
     ctx = agent._fk_wrist_context(torch.device("cpu"))
-
-    obs, expected = _real_max_coords_obs(
-        robot_config, root_quat, observe_contacts=True
-    )
     assert obs.shape[-1] > ctx["root_rot_min_width"]
     got = agent._fk_wrist_root_heading_local_rot(
         {"max_coords_obs": obs}, ctx, torch.zeros(batch, 2, 3)
@@ -743,490 +849,34 @@ def test_contact_tail_does_not_disturb_the_reader(robot_config):
 
 
 def test_world_frame_observation_is_rejected_up_front(robot_config):
-    """local_obs=False has the SAME width but the wrong frame -> must raise."""
     agent = _make_agent(robot_config, {"fk_wrist_pos_weight": 1.0})
-    agent.env.config.observation_components = {
-        "max_coords_obs": _experiment_max_coords_component(local_obs=False)
-    }
+    agent.env.config.observation_components = dict(
+        _experiment_components(),
+        max_coords_obs=_experiment_max_coords_component(local_obs=False),
+    )
     with pytest.raises(ValueError, match="local_obs=False"):
         agent._fk_wrist_context(torch.device("cpu"))
-
-
-def test_noisy_root_rotation_source_is_flagged(robot_config, caplog):
-    """This run's max_coords_obs is use_noisy=True; the clean twin is preferred."""
-    import logging
-
-    agent = _make_agent(robot_config, {"fk_wrist_pos_weight": 1.0})
-    agent.env.config.observation_components = {
-        "max_coords_obs": _experiment_max_coords_component(use_noisy=True),
-        "clean_max_coords_obs": _experiment_max_coords_component(use_noisy=False),
-    }
-    with caplog.at_level(logging.WARNING):
-        agent._fk_wrist_context(torch.device("cpu"))
-    assert "clean_max_coords_obs" in caplog.text
-
-    # The clean twin must NOT warn.
-    caplog.clear()
-    clean_agent = _make_agent(
-        robot_config,
-        {
-            "fk_wrist_pos_weight": 1.0,
-            "fk_wrist_root_rot_obs_key": "clean_max_coords_obs",
-        },
-    )
-    clean_agent.env.config.observation_components = (
-        agent.env.config.observation_components
-    )
-    with caplog.at_level(logging.WARNING):
-        clean_agent._fk_wrist_context(torch.device("cpu"))
-    assert "clean_max_coords_obs" not in caplog.text
-
-
-# ---------------------------------------------------------------------------
-# 7. all-body (global) FK tracking term
-#
-# Reference is `mimic_target_poses` (build_max_coords_target_poses) -- the only
-# ALL-BODY reference the recipe carries. Per future step it lays out
-#   target_body_pos(3NB) | target_body_pos_rel(3NB) | target_body_rot(6NB)
-#   | target_rel_body_rot(6NB) | vel(3NB) | ang_vel(3NB)
-# STEP-MAJOR, with target_body_pos always FIRST within a step.
-# ---------------------------------------------------------------------------
-
-
-def _experiment_mimic_target_poses_component(
-    with_velocities=True, with_relative=True, future_steps=1, use_noisy=False
-):
-    """The exact component masked_mimic_trackc_v1.py builds (line ~149)."""
-    from protomotions.envs.component_factories import (
-        mimic_target_poses_max_coords_factory,
-    )
-
-    return mimic_target_poses_max_coords_factory(
-        use_noisy=use_noisy,
-        with_velocities=with_velocities,
-        with_relative=with_relative,
-        future_steps=future_steps,
-    )
-
-
-def _real_mimic_target_poses(
-    robot_config,
-    ref_body_pos,
-    root_world_quat,
-    with_velocities=True,
-    with_relative=True,
-):
-    """Build ``mimic_target_poses`` with the REAL kernel.
-
-    Same anti-circularity rule as ``_real_max_coords_obs``: the observation the
-    reader is tested against comes out of ``build_max_coords_target_poses``
-    itself, never from a hand-rolled tensor laid out to the reader's beliefs.
-
-    Returns ``(obs, root_heading_local_mat)``.
-    """
-    from protomotions.envs.obs.target_poses import build_max_coords_target_poses
-
-    num_bodies = robot_config.kinematic_info.num_bodies
-    batch = ref_body_pos.shape[0]
-
-    cur_pos = torch.zeros(batch, num_bodies, 3)
-    cur_rot = torch.nn.functional.normalize(
-        torch.randn(batch, num_bodies, 4), dim=-1
-    )
-    cur_rot[:, 0] = root_world_quat
-
-    obs = build_max_coords_target_poses(
-        current_state_body_pos=cur_pos,
-        current_state_body_rot=cur_rot,
-        current_state_body_vel=torch.randn(batch, num_bodies, 3),
-        current_state_body_ang_vel=torch.randn(batch, num_bodies, 3),
-        mimic_ref_pos=ref_body_pos.unsqueeze(1),
-        mimic_ref_rot=torch.nn.functional.normalize(
-            torch.randn(batch, 1, num_bodies, 4), dim=-1
-        ),
-        mimic_ref_vel=torch.randn(batch, 1, num_bodies, 3),
-        mimic_ref_ang_vel=torch.randn(batch, 1, num_bodies, 3),
-        with_velocities=with_velocities,
-        with_relative=with_relative,
-        w_last=True,
-    )
-    heading_local_quat = rotations.quat_mul(
-        rotations.calc_heading_quat_inv(root_world_quat, w_last=True),
-        root_world_quat,
-        w_last=True,
-    )
-    return obs, pose_lib.quaternion_to_matrix(heading_local_quat, w_last=True)
-
-
-def test_mimic_target_poses_covers_every_body(robot_config):
-    """The premise of the whole term: this reference is ALL-body, not 6-body."""
-    num_bodies = robot_config.kinematic_info.num_bodies
-    root_quat = torch.tensor([[0.0, 0.0, 0.0, 1.0]]).repeat(2, 1)
-    obs, _ = _real_mimic_target_poses(
-        robot_config, torch.randn(2, num_bodies, 3), root_quat
-    )
-    # 24 features/body/step at with_relative=True + with_velocities=True.
-    assert obs.shape[-1] == 24 * num_bodies
-    assert num_bodies == 29
-    # And the masked-mimic reference genuinely cannot supply this: it carries
-    # only the conditionable bodies.
-    assert len(robot_config.trackable_bodies_subset) < num_bodies
-
-
-@pytest.mark.parametrize(
-    "with_relative,with_velocities,expected_per_body",
-    [(True, True, 24), (True, False, 18), (False, True, 15), (False, False, 9)],
-)
-def test_global_reference_stride_is_derived_not_hardcoded(
-    robot_config, with_relative, with_velocities, expected_per_body
-):
-    """Every layout variant must resolve from the component's static params."""
-    num_bodies = robot_config.kinematic_info.num_bodies
-    root_quat = torch.tensor([[0.0, 0.0, 0.0, 1.0]]).repeat(3, 1)
-    ref_body_pos = torch.randn(3, num_bodies, 3)
-
-    obs, _ = _real_mimic_target_poses(
-        robot_config,
-        ref_body_pos,
-        root_quat,
-        with_velocities=with_velocities,
-        with_relative=with_relative,
-    )
-    assert obs.shape[-1] == expected_per_body * num_bodies
-
-    agent = _make_agent(robot_config, {"fk_global_pos_weight": 1.0})
-    agent.env.config.observation_components = {
-        "mimic_target_poses": _experiment_mimic_target_poses_component(
-            with_velocities=with_velocities, with_relative=with_relative
-        )
-    }
-    ctx = agent._fk_wrist_context(torch.device("cpu"))
-    assert ctx["global_features_per_body"] == expected_per_body
-
-    got = agent._fk_global_reference({"mimic_target_poses": obs}, ctx)
-    # target_body_pos = (ref_body - current_root) in the current heading frame;
-    # here current_root is at the origin with identity heading.
-    assert torch.allclose(got, ref_body_pos, atol=1e-5)
-
-
-def test_global_loss_is_zero_when_reference_equals_commanded_pose(robot_config):
-    """Real factory + real kernel, tilted root, all 29 bodies."""
-    torch.manual_seed(20)
-    num_dofs = robot_config.kinematic_info.num_dofs
-    batch = 4
-    actions = (torch.randn(batch, num_dofs) * 0.25).requires_grad_(True)
-
-    angle = torch.full((batch,), 0.35)
-    axis = torch.nn.functional.normalize(
-        torch.tensor([[0.6, 0.5, 0.0]]).repeat(batch, 1), dim=-1
-    )
-    root_quat = rotations.quat_from_angle_axis(angle, axis, w_last=True)
-    max_coords_obs, _ = _real_max_coords_obs(robot_config, root_quat)
-
-    # The kernel takes WORLD reference positions and rotates them into the
-    # heading frame itself. So build the reference in WORLD: with the root at
-    # the origin, world = R_root_world @ pelvis-frame FK. If the term is
-    # correct, the kernel's heading rotation and the term's heading rotation
-    # cancel and the residual is exactly zero.
-    root_world_mat = pose_lib.quaternion_to_matrix(root_quat, w_last=True)
-    with torch.no_grad():
-        action_config = make_pd_action_config(robot_config)
-        params = {k: v for k, v in action_config.items() if k != "fn"}
-        joint_targets = action_config["fn"](actions, **params)["processed_action"]
-        pos, _ = _fk(robot_config.kinematic_info, joint_targets)
-        ref_world = torch.einsum("bij,bnj->bni", root_world_mat, pos)
-
-    ref_obs, _ = _real_mimic_target_poses(robot_config, ref_world, root_quat)
-
-    agent = _make_agent(robot_config, {"fk_global_pos_weight": 1.0})
-    agent.env.config.observation_components = {
-        "max_coords_obs": _experiment_max_coords_component(),
-        "mimic_target_poses": _experiment_mimic_target_poses_component(),
-    }
-    batch_td = {
-        "privileged_action": actions,
-        "max_coords_obs": max_coords_obs,
-        "mimic_target_poses": ref_obs,
-    }
-    loss = agent._calculate_fk_global_loss(batch_td, actions)
-    assert loss.item() < 1e-8
-
-
-def test_global_loss_equals_mean_squared_offset(robot_config):
-    """Scale check: a uniform d-metre offset on every body scores exactly d^2."""
-    torch.manual_seed(21)
-    num_dofs = robot_config.kinematic_info.num_dofs
-    num_bodies = robot_config.kinematic_info.num_bodies
-    batch = 3
-    actions = torch.randn(batch, num_dofs) * 0.2
-    root_quat = torch.tensor([[0.0, 0.0, 0.0, 1.0]]).repeat(batch, 1)
-    max_coords_obs, root_mat = _real_max_coords_obs(robot_config, root_quat)
-
-    with torch.no_grad():
-        action_config = make_pd_action_config(robot_config)
-        params = {k: v for k, v in action_config.items() if k != "fn"}
-        joint_targets = action_config["fn"](actions, **params)["processed_action"]
-        pos, _ = _fk(robot_config.kinematic_info, joint_targets)
-        commanded = torch.einsum("bij,bnj->bni", root_mat, pos)
-
-    offset = torch.zeros(batch, num_bodies, 3)
-    offset[..., 1] = 0.20  # 20 cm on every body, the current gt_error scale
-    ref_obs, _ = _real_mimic_target_poses(
-        robot_config, commanded + offset, root_quat
-    )
-
-    agent = _make_agent(robot_config, {"fk_global_pos_weight": 1.0})
-    agent.env.config.observation_components = {
-        "max_coords_obs": _experiment_max_coords_component(),
-        "mimic_target_poses": _experiment_mimic_target_poses_component(),
-    }
-    batch_td = {
-        "privileged_action": actions,
-        "max_coords_obs": max_coords_obs,
-        "mimic_target_poses": ref_obs,
-    }
-    loss = agent._calculate_fk_global_loss(batch_td, actions)
-    assert loss.item() == pytest.approx(0.20**2, rel=1e-4)
-
-
-def test_global_weight_zero_is_byte_identical(robot_config):
-    """No-op at zero, for loss AND gradients, against a live wrist term."""
-    torch.manual_seed(22)
-    num_dofs = robot_config.kinematic_info.num_dofs
-    num_bodies = robot_config.kinematic_info.num_bodies
-    batch = 4
-    actions_a = (torch.randn(batch, num_dofs) * 0.2).requires_grad_(True)
-    actions_b = actions_a.detach().clone().requires_grad_(True)
-
-    root_quat = torch.tensor([[0.0, 0.0, 0.0, 1.0]]).repeat(batch, 1)
-    max_coords_obs, _ = _real_max_coords_obs(robot_config, root_quat)
-    ref_obs, _ = _real_mimic_target_poses(
-        robot_config, torch.randn(batch, num_bodies, 3) * 0.3, root_quat
-    )
-    wrist_ref, wrist_masks = _pack_reference(
-        robot_config, torch.randn(batch, 2, 3) * 0.2, torch.randn(batch, 2, 6) * 0.2
-    )
-
-    def make_batch(actions):
-        return {
-            "privileged_action": actions,
-            "masked_mimic_target_poses": wrist_ref,
-            "masked_mimic_target_masks": wrist_masks,
-            "max_coords_obs": max_coords_obs,
-            "mimic_target_poses": ref_obs,
-        }
-
-    # Old pickled config: fk_global_* does not exist at all.
-    legacy = _make_agent(robot_config, {"fk_wrist_pos_weight": 1.0})
-    del legacy.config.fk_global_pos_weight
-    del legacy.config.fk_global_body_names
-    del legacy.config.fk_global_ref_key
-    del legacy.config.fk_global_future_step
-    current = _make_agent(
-        robot_config, {"fk_wrist_pos_weight": 1.0, "fk_global_pos_weight": 0.0}
-    )
-
-    loss_a, log_a, grad_a = _extra_loss_with_grad(
-        legacy, make_batch(actions_a), actions_a
-    )
-    loss_b, log_b, grad_b = _extra_loss_with_grad(
-        current, make_batch(actions_b), actions_b
-    )
-
-    assert loss_a.item() == loss_b.item()
-    assert set(log_a) == set(log_b) == {"supervised/fk_wrist_pos_loss"}
-    assert torch.equal(grad_a, grad_b)
-    assert "supervised/fk_global_pos_loss" not in log_b
-
-
-def test_global_weight_zero_pays_no_fk_cost(robot_config):
-    """All weights off => the FK context is never even built."""
-    agent = _make_agent(robot_config)
-    batch_td = {"privileged_action": torch.zeros(2, 27)}
-    loss, log_dict = agent.calculate_extra_loss(batch_td, torch.zeros(2, 27))
-    assert loss.item() == 0.0
-    assert log_dict == {}
-    assert agent._fk_wrist_ctx is None
-
-
-def test_global_gradient_reaches_the_action_tensor(robot_config):
-    torch.manual_seed(23)
-    num_dofs = robot_config.kinematic_info.num_dofs
-    num_bodies = robot_config.kinematic_info.num_bodies
-    batch = 4
-    actions = (torch.randn(batch, num_dofs) * 0.2).requires_grad_(True)
-
-    root_quat = torch.tensor([[0.0, 0.0, 0.0, 1.0]]).repeat(batch, 1)
-    max_coords_obs, _ = _real_max_coords_obs(robot_config, root_quat)
-    ref_obs, _ = _real_mimic_target_poses(
-        robot_config, torch.randn(batch, num_bodies, 3) * 0.3, root_quat
-    )
-
-    agent = _make_agent(robot_config, {"fk_global_pos_weight": 1.0})
-    agent.env.config.observation_components = {
-        "max_coords_obs": _experiment_max_coords_component(),
-        "mimic_target_poses": _experiment_mimic_target_poses_component(),
-    }
-    batch_td = {
-        "privileged_action": actions,
-        "max_coords_obs": max_coords_obs,
-        "mimic_target_poses": ref_obs,
-    }
-
-    extra_loss, log_dict = agent.calculate_extra_loss(batch_td, actions)
-    assert "supervised/fk_global_pos_loss" in log_dict
-    grad = torch.autograd.grad(extra_loss, actions)[0]
-    assert torch.isfinite(grad).all()
-    assert grad.abs().sum() > 0
-    # Unlike the wrist term, the LEG chain now carries gradient too -- that is
-    # the whole point of going all-body.
-    dof_names = list(robot_config.kinematic_info.dof_names)
-    leg = [
-        i
-        for i, n in enumerate(dof_names)
-        if "hip" in n or "knee" in n or "ankle" in n
-    ]
-    assert grad[:, leg].abs().sum() > 0
-
-
-def test_root_body_contributes_a_constant_with_no_gradient(robot_config):
-    """Documented caveat, pinned: FK cannot move the root."""
-    torch.manual_seed(24)
-    num_dofs = robot_config.kinematic_info.num_dofs
-    num_bodies = robot_config.kinematic_info.num_bodies
-    body_names = robot_config.kinematic_info.body_names
-    batch = 3
-    actions = (torch.randn(batch, num_dofs) * 0.2).requires_grad_(True)
-
-    root_quat = torch.tensor([[0.0, 0.0, 0.0, 1.0]]).repeat(batch, 1)
-    max_coords_obs, _ = _real_max_coords_obs(robot_config, root_quat)
-    ref_pos = torch.randn(batch, num_bodies, 3) * 0.3
-    ref_obs, _ = _real_mimic_target_poses(robot_config, ref_pos, root_quat)
-
-    def loss_for(body_names_subset):
-        agent = _make_agent(
-            robot_config,
-            {
-                "fk_global_pos_weight": 1.0,
-                "fk_global_body_names": body_names_subset,
-            },
-        )
-        agent.env.config.observation_components = {
-            "max_coords_obs": _experiment_max_coords_component(),
-            "mimic_target_poses": _experiment_mimic_target_poses_component(),
-        }
-        return agent._calculate_fk_global_loss(
-            {
-                "privileged_action": actions,
-                "max_coords_obs": max_coords_obs,
-                "mimic_target_poses": ref_obs,
-            },
-            actions,
-        )
-
-    root_only = loss_for([body_names[0]])
-    # FK puts the root at the origin, so its residual is the reference itself.
-    assert torch.allclose(
-        root_only, ref_pos[:, 0].pow(2).sum(dim=-1).mean(), atol=1e-6
-    )
-    # The gradient exists structurally (the root is sliced out of the same
-    # stacked FK tensor as every other body) but is IDENTICALLY zero: no joint
-    # angle can move the root. That is the whole caveat.
-    root_grad = torch.autograd.grad(root_only, actions, allow_unused=True)[0]
-    assert root_grad is None or root_grad.abs().max() == 0.0
-
-    # Excluding the root changes the value (it is not a no-op) but keeps grads.
-    without_root = loss_for(list(body_names[1:]))
-    assert not torch.isclose(without_root, loss_for(list(body_names)))
-    assert torch.autograd.grad(without_root, actions)[0].abs().sum() > 0
-
-
-def test_global_and_wrist_share_one_fk_pass(robot_config):
-    """Both terms on must call the FK exactly once, not twice."""
-    torch.manual_seed(25)
-    num_dofs = robot_config.kinematic_info.num_dofs
-    num_bodies = robot_config.kinematic_info.num_bodies
-    batch = 3
-    actions = (torch.randn(batch, num_dofs) * 0.2).requires_grad_(True)
-
-    root_quat = torch.tensor([[0.0, 0.0, 0.0, 1.0]]).repeat(batch, 1)
-    max_coords_obs, _ = _real_max_coords_obs(robot_config, root_quat)
-    ref_obs, _ = _real_mimic_target_poses(
-        robot_config, torch.randn(batch, num_bodies, 3) * 0.3, root_quat
-    )
-    wrist_ref, wrist_masks = _pack_reference(
-        robot_config, torch.randn(batch, 2, 3) * 0.2, torch.randn(batch, 2, 6) * 0.2
-    )
-
-    agent = _make_agent(
-        robot_config,
-        {
-            "fk_wrist_pos_weight": 1.0,
-            "fk_wrist_ori_weight": 1.0,
-            "fk_global_pos_weight": 1.0,
-        },
-    )
-    agent.env.config.observation_components = {
-        "max_coords_obs": _experiment_max_coords_component(),
-        "mimic_target_poses": _experiment_mimic_target_poses_component(),
-    }
-    batch_td = {
-        "privileged_action": actions,
-        "masked_mimic_target_poses": wrist_ref,
-        "masked_mimic_target_masks": wrist_masks,
-        "max_coords_obs": max_coords_obs,
-        "mimic_target_poses": ref_obs,
-    }
-
-    calls = {"n": 0}
-    original = SupervisedAgent._fk_commanded_body_poses
-
-    def counting(self, *args, **kwargs):
-        calls["n"] += 1
-        return original(self, *args, **kwargs)
-
-    agent._fk_commanded_body_poses = counting.__get__(agent, SupervisedAgent)
-    _, log_dict = agent.calculate_extra_loss(batch_td, actions)
-    assert calls["n"] == 1
-    assert {
-        "supervised/fk_wrist_pos_loss",
-        "supervised/fk_wrist_ori_loss",
-        "supervised/fk_global_pos_loss",
-    } <= set(log_dict)
-
-
-def test_global_reference_missing_key_raises_a_named_error(robot_config):
-    num_dofs = robot_config.kinematic_info.num_dofs
-    actions = torch.zeros(2, num_dofs)
-    agent = _make_agent(
-        robot_config,
-        {"fk_global_pos_weight": 1.0, "fk_wrist_root_rot_obs_key": None},
-    )
-    with pytest.raises(KeyError, match="mimic_target_poses"):
-        agent._calculate_fk_global_loss({"privileged_action": actions}, actions)
 
 
 def test_frame_mismatch_between_reference_and_root_rotation_is_flagged(
     robot_config, caplog
 ):
-    """This recipe's real trap: clean reference + noisy root rotation."""
+    """The live recipe's trap: clean targets + noisy proprioception."""
     import logging
 
-    agent = _make_agent(robot_config, {"fk_global_pos_weight": 1.0})
-    agent.env.config.observation_components = {
-        # exactly masked_mimic_trackc_v1.py: noisy proprioception, clean targets
+    components = {
         "max_coords_obs": _experiment_max_coords_component(use_noisy=True),
         "clean_max_coords_obs": _experiment_max_coords_component(use_noisy=False),
         "mimic_target_poses": _experiment_mimic_target_poses_component(
             use_noisy=False
         ),
     }
+    agent = _make_agent(robot_config, {"fk_global_pos_weight": 1.0})
+    agent.env.config.observation_components = components
     with caplog.at_level(logging.WARNING):
         agent._fk_wrist_context(torch.device("cpu"))
     assert "FRAME MISMATCH" in caplog.text
-    assert "fk_global_ref_key" in caplog.text
 
-    # Pointing at the clean twin silences it.
     caplog.clear()
     fixed = _make_agent(
         robot_config,
@@ -1235,16 +885,14 @@ def test_frame_mismatch_between_reference_and_root_rotation_is_flagged(
             "fk_wrist_root_rot_obs_key": "clean_max_coords_obs",
         },
     )
-    fixed.env.config.observation_components = (
-        agent.env.config.observation_components
-    )
+    fixed.env.config.observation_components = components
     with caplog.at_level(logging.WARNING):
         fixed._fk_wrist_context(torch.device("cpu"))
     assert "FRAME MISMATCH" not in caplog.text
 
 
 # ---------------------------------------------------------------------------
-# 8. config surface
+# 9. config surface
 # ---------------------------------------------------------------------------
 
 
@@ -1253,19 +901,20 @@ def test_config_defaults_are_off():
     assert config.fk_wrist_pos_weight == 0.0
     assert config.fk_wrist_ori_weight == 0.0
     assert config.fk_wrist_body_names is None
-    assert config.fk_wrist_ref_key == "masked_mimic_target_poses"
-    assert config.fk_wrist_ref_mask_key == "masked_mimic_target_masks"
+    assert config.fk_wrist_ref_key == "mimic_target_poses"
     assert config.fk_wrist_root_rot_obs_key == "max_coords_obs"
     assert config.fk_wrist_future_step == 0
     assert config.fk_global_pos_weight == 0.0
     assert config.fk_global_body_names is None
     assert config.fk_global_ref_key == "mimic_target_poses"
     assert config.fk_global_future_step == 0
+    # the masked-reference mask key is gone: that path is structurally invalid
+    assert not hasattr(config, "fk_wrist_ref_mask_key")
 
 
 def test_missing_reference_key_raises_a_named_error(robot_config):
-    num_dofs = robot_config.kinematic_info.num_dofs
-    actions = torch.zeros(2, num_dofs)
+    ki = robot_config.kinematic_info
+    actions = torch.zeros(2, ki.num_dofs)
     agent = _make_agent(robot_config, {"fk_wrist_pos_weight": 1.0})
-    with pytest.raises(KeyError, match="masked_mimic_target_poses"):
+    with pytest.raises(KeyError, match="mimic_target_poses"):
         agent._calculate_fk_wrist_loss({"privileged_action": actions}, actions)

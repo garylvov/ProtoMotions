@@ -151,22 +151,17 @@ class SupervisedAgentConfig(BaseAgentConfig):
         },
     )
     fk_wrist_ref_key: str = field(
-        default="masked_mimic_target_poses",
+        default="mimic_target_poses",
         metadata={
             "help": (
-                "Batch key carrying the masked-mimic sparse target poses "
-                "(build_sparse_target_poses with include_root_relative=True). "
-                "Its root-relative block supplies the reference wrist pose."
-            )
-        },
-    )
-    fk_wrist_ref_mask_key: str = field(
-        default="masked_mimic_target_masks",
-        metadata={
-            "help": (
-                "Batch key carrying the per-(step, body, {pos,rot}) visibility "
-                "masks aligned with fk_wrist_ref_key. Samples whose wrist "
-                "target is masked out contribute nothing to the loss."
+                "Batch key carrying the ALL-BODY reference "
+                "(build_max_coords_target_poses). MUST be all-body: the "
+                "reference is re-anchored to its OWN root, so the root has to "
+                "be present. 'masked_mimic_target_poses' is REJECTED -- it "
+                "carries only the conditionable bodies and the pelvis is not "
+                "among them, so its residual is contaminated by the root's "
+                "displacement over the lookahead (that defect inflated "
+                "fk_wrist_pos_loss to ~7.7 = 2.8 m RMS on mm_canonical_v1)."
             )
         },
     )
