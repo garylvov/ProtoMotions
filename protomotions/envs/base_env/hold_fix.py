@@ -735,6 +735,9 @@ def compute_hold_joint_quiet(
     dof_vel: Tensor,
     dof_indices: Optional[Tensor] = None,
     vel_scale: float = 25.0,
+    kernel: str = "gaussian",
+    fine_weight: float = 0.0,
+    fine_vel_scale: Optional[float] = None,
 ) -> Tensor:
     """Joint-VELOCITY quiet bonus, paid ONLY during reference-still windows.
 
@@ -787,16 +790,101 @@ def compute_hold_joint_quiet(
             where the measured all-DOF pause-window rms (0.06-0.15 rad/s)
             produces a live 10-30% gradient. Scoring a NARROWER joint set needs
             a LARGER c (arms-only rms is ~0.048 rad/s -> c ~ 150).
+        kernel: ``"gaussian"`` (default, byte-identical to the original
+            ``exp(-c * mean_sq)``) or ``"lorentzian"`` (``1/(1 + c*mean_sq)``).
+            See the UNDERFLOW section above -- ``"lorentzian"`` is the shape
+            that survives the measured 6-8 rad/s training distribution.
+        fine_weight: Relative weight of a NARROW companion channel evaluated at
+            ``fine_vel_scale``, mirroring the coarse/fine split
+            ``global_body_pos_rew`` already uses. 0.0 (default) = absent =
+            byte-identical. The sum is renormalized by ``1 + fine_weight`` so
+            the term stays a bounded [0, 1] bonus and ``weight`` keeps its
+            meaning.
+        fine_vel_scale: Coefficient ``c`` of the narrow companion, units
+            (rad/s)^-2. Required when ``fine_weight != 0``.
+
+    UNDERFLOW -- WHY THE SHAPE MATTERS (v57 live forensics, 2026-08-05):
+
+    The c = 25 sizing above was derived from the EXPORTED, EMA-smoothed policy
+    via Rice's formula on DETRENDED POSITION traces -- i.e. it measures ONLY
+    the narrowband ~1.19 Hz postural mode of a SMOOTHED, DETERMINISTIC policy.
+    ``current.dof_vel`` in TRAINING is the raw instantaneous PhysX joint
+    velocity read at the 50 Hz control boundary under a STOCHASTIC policy
+    (v57 ``actor/std_mean`` = 0.374) with no EMA and no export filter, so it
+    carries the full broadband near-Nyquist chatter as well. Same units
+    (rad/s), same reduction (``hold_dof_vel_rms**2`` in the stat writer IS the
+    hold-weighted mean of this function's ``mean_sq``) -- but a ~50x larger
+    number: v57 measured ``hold_dof_vel_rms`` = 6.09 -> 7.57 rad/s.
+
+    At mean_sq = 57.3 the Gaussian pays ``exp(-1432)`` = EXACTLY 0.0 in fp32
+    AND fp64, with an exactly-zero gradient: the term was registered, weighted
+    0.25, and contributed NOTHING for 5267 consecutive logging steps.
+
+    ``exp(-c v^2)`` cannot span this range: its usable gradient covers about
+    one octave around ``1/sqrt(c)``, and the origin (7.6 rad/s) and the
+    destination (0.15 rad/s) are ~1.7 DECADES apart. ``exp(-c|v|)`` decays
+    exponentially too and underflows for the same reason. ``1/(1 + c v^2)``
+    has a POWER-LAW tail: its log-log slope is a constant -2 above the knee,
+    so it degrades gracefully across decades and is finite everywhere.
+
+    Recommended v58 setting -- a DUAL Lorentzian, coarse knee at the origin
+    and fine knee at the destination (``vel_scale=0.25`` i.e. v0 = 2.0 rad/s,
+    ``fine_vel_scale=25.0`` i.e. v0 = 0.20 rad/s, ``fine_weight=0.5``)::
+
+        v (rad/s)   payout      d payout / dv
+        7.5739      0.043689    -0.010789   <- the MEASURED origin (was 0.0)
+        6.0944      0.065174    -0.019320
+        2.00        0.336634    -0.169934
+        0.20        0.826733    -0.898686
+        0.15        0.876271    -1.073442   <- the destination band
+        0.06        0.971878    -0.861644
+        0.00        1.000000     0.000000
+
+    The coarse channel carries all the gradient at the origin; the fine
+    channel is ~100x more sensitive in the destination band, so the term
+    prices the whole trajectory instead of one octave of it.
 
     Returns:
         Bonus in [0, 1] per env [num_envs].
     """
+    if fine_weight and fine_vel_scale is None:
+        raise ValueError(
+            f"hold_joint_quiet fine_weight={fine_weight} requires "
+            "fine_vel_scale (the narrow channel's coefficient c). Refusing to "
+            "guess -- a silently-defaulted second kernel is how the first one "
+            "shipped dead."
+        )
     if reference_still_mask is None:
         return torch.zeros(dof_vel.shape[0], device=dof_vel.device)
 
     dof_vel = select_hold_quiet_dofs(dof_vel, dof_indices)
     mean_sq = (dof_vel * dof_vel).mean(dim=-1)
-    return reference_still_mask.float() * torch.exp(-vel_scale * mean_sq)
+    value = _hold_quiet_kernel(mean_sq, vel_scale, kernel)
+    if fine_weight:
+        fine = _hold_quiet_kernel(mean_sq, float(fine_vel_scale), kernel)
+        value = (value + fine_weight * fine) / (1.0 + fine_weight)
+    return reference_still_mask.float() * value
+
+
+HOLD_QUIET_KERNELS = ("gaussian", "lorentzian")
+
+
+def _hold_quiet_kernel(mean_sq: Tensor, c: float, kernel: str) -> Tensor:
+    """One quiet-bonus channel: ``exp(-c*x)`` or ``1/(1 + c*x)`` on ``x=mean_sq``.
+
+    Both are 1.0 at x=0, monotonically decreasing, and bounded in (0, 1]. The
+    Lorentzian is the underflow-safe one: it is >= 1/(1 + c*x) > 0 for every
+    finite x, where the Gaussian flushes to a hard zero (and a hard-zero
+    gradient) once ``c*x`` passes ~88 in fp32.
+    """
+    if kernel == "gaussian":
+        return torch.exp(-c * mean_sq)
+    if kernel == "lorentzian":
+        return torch.reciprocal(1.0 + c * mean_sq)
+    raise ValueError(
+        f"hold_joint_quiet kernel must be one of {HOLD_QUIET_KERNELS} "
+        f"(got {kernel!r})."
+    )
 
 
 def select_hold_quiet_dofs(

@@ -828,10 +828,15 @@ def resume_inject_reward_components(
                     "start the run fresh so the teacher build gate resolves it."
                 )
             indices, _ = resolve_hold_quiet_dof_indices(list(dof_names), joints_spec)
+        fine_w = env.get("PM_HOLD_JOINT_QUIET_FINE_WEIGHT")
+        fine_c = env.get("PM_HOLD_JOINT_QUIET_FINE_VEL_SCALE")
         return hold_joint_quiet_factory(
             weight=weight,
             vel_scale=float(env.get("PM_HOLD_JOINT_QUIET_VEL_SCALE") or 25.0),
             dof_indices=indices,
+            kernel=(env.get("PM_HOLD_JOINT_QUIET_KERNEL") or "gaussian"),
+            fine_weight=float(fine_w) if fine_w else 0.0,
+            fine_vel_scale=float(fine_c) if fine_c else None,
         )
 
     # (component name, weight env var, {extra env var: static_param key}, builder)
@@ -848,7 +853,10 @@ def resume_inject_reward_components(
         # held references -- the ~1.19 Hz postural limit cycle is invisible to
         # every existing term. See hold_fix.compute_hold_joint_quiet.
         ("hold_joint_quiet", "PM_HOLD_JOINT_QUIET_WEIGHT",
-         {"PM_HOLD_JOINT_QUIET_VEL_SCALE": "vel_scale"},
+         {"PM_HOLD_JOINT_QUIET_VEL_SCALE": "vel_scale",
+          "PM_HOLD_JOINT_QUIET_KERNEL": ("kernel", str),
+          "PM_HOLD_JOINT_QUIET_FINE_WEIGHT": "fine_weight",
+          "PM_HOLD_JOINT_QUIET_FINE_VEL_SCALE": "fine_vel_scale"},
          _build_hold_joint_quiet),
     )
 
@@ -869,15 +877,24 @@ def resume_inject_reward_components(
                     f"(was {old_weight}, from {weight_var}; already present, "
                     f"patched not injected)"
                 )
-            for extra_var, extra_key in (extra_vars or {}).items():
+            for extra_var, extra_spec in (extra_vars or {}).items():
+                # An extra may declare its own caster as (key, caster); the
+                # bare-string form keeps the historical float() behaviour.
+                # Needed since 2026-08-05: PM_HOLD_JOINT_QUIET_KERNEL is a
+                # STRING, and float()-ing it raised ValueError on every resume
+                # that set it.
+                if isinstance(extra_spec, tuple):
+                    extra_key, caster = extra_spec
+                else:
+                    extra_key, caster = extra_spec, float
                 extra_val = env.get(extra_var)
-                if extra_val and sp.get(extra_key) != float(extra_val):
+                if extra_val and sp.get(extra_key) != caster(extra_val):
                     old_t = sp.get(extra_key)
-                    sp[extra_key] = float(extra_val)
+                    sp[extra_key] = caster(extra_val)
                     changed = True
                     log_fn(
                         f"RESUME override {name}.{extra_key} = "
-                        f"{float(extra_val)} (was {old_t}, from {extra_var})"
+                        f"{caster(extra_val)} (was {old_t}, from {extra_var})"
                     )
             continue
         component = builder(weight, env)
@@ -2005,6 +2022,9 @@ def hold_joint_quiet_factory(
     vel_scale: float = 25.0,
     dof_indices=None,
     zero_during_grace_period: bool = True,
+    kernel: str = "gaussian",
+    fine_weight: float = 0.0,
+    fine_vel_scale: Optional[float] = None,
 ) -> MdpComponent:
     """Factory for the held-reference JOINT-VELOCITY quiet bonus (dormant).
 
@@ -2031,16 +2051,31 @@ def hold_joint_quiet_factory(
         zero_during_grace_period: Zero the bonus during the post-reset /
             post-perturbation grace period (default True) -- a shoved robot
             must be free to move to recover without losing hold income.
+        kernel: ``"gaussian"`` (default, byte-identical) or ``"lorentzian"``.
+            The v57 live run measured a hold-window rms of 6-8 rad/s, at which
+            the Gaussian underflows to an EXACT 0 with an EXACT 0 gradient --
+            see ``compute_hold_joint_quiet``'s UNDERFLOW section. Any run whose
+            hold rms is more than ~3x the ``1/sqrt(vel_scale)`` e-folding point
+            must use ``"lorentzian"``.
+        fine_weight: Relative weight of a narrow companion channel (0.0 =
+            absent = byte-identical). Renormalized by ``1 + fine_weight``.
+        fine_vel_scale: The companion channel's ``c``; required when
+            ``fine_weight != 0``.
 
     Returns:
         MdpComponent configured for the held-reference joint-quiet bonus.
 
     Raises:
-        ValueError: on a negative weight or a non-positive ``vel_scale``.
+        ValueError: on a negative weight, a non-positive ``vel_scale`` or
+            ``fine_vel_scale``, an unknown ``kernel``, a negative
+            ``fine_weight``, or ``fine_weight`` without ``fine_vel_scale``.
     """
     import torch
 
-    from protomotions.envs.base_env.hold_fix import compute_hold_joint_quiet
+    from protomotions.envs.base_env.hold_fix import (
+        HOLD_QUIET_KERNELS,
+        compute_hold_joint_quiet,
+    )
 
     if weight < 0.0:
         raise ValueError(
@@ -2054,12 +2089,35 @@ def hold_joint_quiet_factory(
             "the coefficient c in exp(-c * mean_j v^2), so c <= 0 turns the "
             "kernel into a constant (c=0) or an unbounded blow-up (c<0)."
         )
+    if kernel not in HOLD_QUIET_KERNELS:
+        raise ValueError(
+            f"hold_joint_quiet kernel must be one of {HOLD_QUIET_KERNELS} "
+            f"(got {kernel!r})."
+        )
+    if fine_weight < 0.0:
+        raise ValueError(
+            f"hold_joint_quiet fine_weight must be >= 0 (got {fine_weight}); "
+            "a negative companion channel would PAY for joint speed."
+        )
+    if fine_weight and (fine_vel_scale is None or float(fine_vel_scale) <= 0.0):
+        raise ValueError(
+            f"hold_joint_quiet fine_weight={fine_weight} requires a positive "
+            f"fine_vel_scale (got {fine_vel_scale!r})."
+        )
 
     static_params: Dict[str, Any] = {
         "weight": weight,
         "vel_scale": float(vel_scale),
         "zero_during_grace_period": zero_during_grace_period,
     }
+    # Rule 10: the non-default kernel keys stay OUT of static_params when they
+    # are at their defaults, so an unset config resolves byte-identically (and
+    # an old checkpoint's component pickles round-trip unchanged).
+    if kernel != "gaussian":
+        static_params["kernel"] = kernel
+    if fine_weight:
+        static_params["fine_weight"] = float(fine_weight)
+        static_params["fine_vel_scale"] = float(fine_vel_scale)
     if dof_indices is not None:
         # Normalize a list/tuple to a Long tensor here so the kernel and the
         # stat writer never have to care which shape the caller used.
