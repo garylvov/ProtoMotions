@@ -111,6 +111,133 @@ class SupervisedAgentConfig(BaseAgentConfig):
             )
         },
     )
+    # --- FK Cartesian wrist loss (default OFF; see
+    # SupervisedAgent._calculate_fk_wrist_loss for the full contract). ---
+    fk_wrist_pos_weight: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "Weight of the FK Cartesian wrist POSITION loss. FK is applied "
+                "to the predicted action (a PD joint-position target), giving "
+                "the COMMANDED wrist position in the anchor-relative, "
+                "heading-local frame -- the same frame the teacher's "
+                "relative_body_pos_rew_factory reward uses. 0.0 (default) = "
+                "term absent, zero FK cost paid."
+            )
+        },
+    )
+    fk_wrist_ori_weight: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "Weight of the FK Cartesian wrist ORIENTATION loss (MSE over "
+                "the 6D tan-norm encoding of the heading-local wrist rotation, "
+                "the same encoding the reference observation carries). Student "
+                "twin of relative_body_ori_rew_factory. 0.0 (default) = off."
+            )
+        },
+    )
+    fk_wrist_body_names: Optional[list] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Bodies scored by the FK wrist loss. None (default) resolves "
+                "to the robot's hand bodies "
+                "(common_naming_to_robot_body_names all_left/right_hand_bodies, "
+                "i.e. left/right_wrist_yaw_link on H1_2). Every name must also "
+                "be in the masked-mimic conditionable set, since the reference "
+                "target comes from that observation."
+            )
+        },
+    )
+    fk_wrist_ref_key: str = field(
+        default="mimic_target_poses",
+        metadata={
+            "help": (
+                "Batch key carrying the ALL-BODY reference "
+                "(build_max_coords_target_poses). MUST be all-body: the "
+                "reference is re-anchored to its OWN root, so the root has to "
+                "be present. 'masked_mimic_target_poses' is REJECTED -- it "
+                "carries only the conditionable bodies and the pelvis is not "
+                "among them, so its residual is contaminated by the root's "
+                "displacement over the lookahead (that defect inflated "
+                "fk_wrist_pos_loss to ~7.7 = 2.8 m RMS on mm_canonical_v1)."
+            )
+        },
+    )
+    fk_wrist_root_rot_obs_key: Optional[str] = field(
+        default="max_coords_obs",
+        metadata={
+            "help": (
+                "Batch key of the max-coords humanoid observation, used to read "
+                "the root's heading-local rotation (its roll/pitch) so the FK "
+                "output can be rotated from the pelvis body frame into the "
+                "heading-local frame the reference lives in. Set to None to "
+                "skip that rotation (assumes an upright pelvis -- a real "
+                "approximation, only for robots/tasks with no root tilt)."
+            )
+        },
+    )
+    # --- FK ALL-BODY (global) Cartesian tracking loss (default OFF). Shares the
+    # wrist term's FK pass and context; see
+    # SupervisedAgent._calculate_fk_global_loss. ---
+    fk_global_pos_weight: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "Weight of the all-body FK Cartesian position loss: mean over "
+                "bodies of the squared root-relative, heading-local position "
+                "residual (metres^2). Targets the gating eval criterion "
+                "mean_body_pos_error, which the BC action-MSE never sees and "
+                "the 2-body wrist term barely touches. 0.0 (default) = term "
+                "absent, zero FK cost paid."
+            )
+        },
+    )
+    fk_global_body_names: Optional[list] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Bodies scored by the all-body FK loss. None (default) = EVERY "
+                "robot body, matching the eval metric's body set. Note that "
+                "the ROOT body contributes a constant with zero gradient (FK "
+                "always places it at the origin while its reference is the "
+                "root tracking error), so listing every body EXCEPT the root "
+                "makes the logged value purely the quantity being optimized."
+            )
+        },
+    )
+    fk_global_ref_key: str = field(
+        default="mimic_target_poses",
+        metadata={
+            "help": (
+                "Batch key carrying the ALL-BODY reference "
+                "(build_max_coords_target_poses). Its first block, "
+                "target_body_pos, is the root-relative heading-local reference "
+                "position for every body. NOTE: masked_mimic_target_poses "
+                "cannot be used here -- it only carries the conditionable "
+                "bodies."
+            )
+        },
+    )
+    fk_global_future_step: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Which future frame of fk_global_ref_key to score against "
+                "(0 = the first buffered step)."
+            )
+        },
+    )
+    fk_wrist_future_step: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Which masked-mimic future frame to score against (0 = the "
+                "nearest sampled future frame)."
+            )
+        },
+    )
     action_dim_weights: Optional[list] = field(
         default=None,
         metadata={

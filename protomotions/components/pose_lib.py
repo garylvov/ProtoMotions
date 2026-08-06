@@ -1045,9 +1045,9 @@ def compute_forward_kinematics_from_transforms(
 
     B = root_pos.shape[0]
     Nb = kinematic_info.num_bodies
-    parent_indices = torch.tensor(
-        kinematic_info.parent_indices, dtype=torch.long, device=device
-    )
+    # Plain python ints: they index the per-body result LISTS below (a tensor
+    # index would not work on a list) and avoid a host sync per body.
+    parent_indices = [int(p) for p in kinematic_info.parent_indices]
     local_pos = (
         kinematic_info.local_pos[None, ...].expand(B, -1, -1).to(device).to(dtype)
     )
@@ -1058,19 +1058,29 @@ def compute_forward_kinematics_from_transforms(
         .to(dtype)
     )
 
-    world_pos = torch.zeros(B, Nb, 3, device=device, dtype=dtype)
-    world_rot_mat = torch.zeros(B, Nb, 3, 3, device=device, dtype=dtype)
+    # AUTOGRAD NOTE: accumulate per-body results in Python lists and stack once
+    # at the end, instead of writing slices into two pre-allocated buffers.
+    # The buffer form was NOT differentiable: every ``world_rot_mat[:, i] = ...``
+    # bumped the version counter of the same tensor that the *parent* read was
+    # taken from, so backward raised
+    #   "one of the variables needed for gradient computation has been modified
+    #    by an inplace operation ... AsStridedBackward0 ... version 29".
+    # The list form is mathematically identical (bodies are in DFS order, so a
+    # parent is always finished before its children) and lets gradients flow
+    # back through the chain to ``joint_rot_mats`` / ``root_pos``.
+    world_pos_list: List[torch.Tensor] = []
+    world_rot_list: List[torch.Tensor] = []
 
     # FK Loop using matrices
     for i in range(Nb):
         if parent_indices[i] == -1:  # Root body
-            world_pos[:, i, :] = root_pos
+            world_pos_list.append(root_pos)
             # Get root rotation from the combined tensor
-            world_rot_mat[:, i, :, :] = joint_rot_mats[:, 0, :, :]
+            world_rot_list.append(joint_rot_mats[:, 0, :, :])
         else:
             parent_idx = parent_indices[i]
-            parent_pos_world = world_pos[:, parent_idx, :]
-            parent_rot_mat_world = world_rot_mat[:, parent_idx, :, :]
+            parent_pos_world = world_pos_list[parent_idx]
+            parent_rot_mat_world = world_rot_list[parent_idx]
 
             ref_rot_mat = local_rot_ref_mat[:, i, :, :]
             # Get the compounded hinge joint rotation for this body
@@ -1080,15 +1090,18 @@ def compute_forward_kinematics_from_transforms(
             effective_local_rot = torch.matmul(ref_rot_mat, joint_rot_mat)
 
             # Calculate world orientation: ParentWorld * EffectiveLocal
-            world_rot_mat[:, i, :, :] = torch.matmul(
-                parent_rot_mat_world, effective_local_rot
+            world_rot_list.append(
+                torch.matmul(parent_rot_mat_world, effective_local_rot)
             )
 
             # Calculate world position: ParentPos + ParentRot * LocalPosOffset
             offset_in_world = torch.matmul(
                 parent_rot_mat_world, local_pos[:, i, :, None]
             ).squeeze(-1)
-            world_pos[:, i, :] = parent_pos_world + offset_in_world
+            world_pos_list.append(parent_pos_world + offset_in_world)
+
+    world_pos = torch.stack(world_pos_list, dim=1)
+    world_rot_mat = torch.stack(world_rot_list, dim=1)
 
     return world_pos, world_rot_mat
 
