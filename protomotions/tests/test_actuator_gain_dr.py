@@ -679,6 +679,60 @@ def test_gate_per_group_knobs_stiff_legs_soft_upper(monkeypatch):
     assert out["stiffness_scales"][:, out["group_columns"]["legs"]].min() >= 0.7 - 1e-6
 
 
+def test_gate_arms_only_knobs_leave_legs_and_waist_randomized(monkeypatch):
+    """LIVE-RUN GUARD (mm_canonical_v1): the launcher exports ONLY the two
+    arm knobs -- no global PM_GAIN_DR_LOW/HIGH at all.
+
+    This is the bug the per-group feature exists to prevent: widening the arms
+    must NOT silently drop legs/waist out of gain DR. The sibling test above
+    also sets the global knobs, so ``base`` there comes from the env; here it
+    must come from the CONFIG's own global band (gain_dr_env_gates.py:208
+    ``base = tuple(old)``), which is the path a real resume takes.
+    """
+    _clear_gain_env(monkeypatch)
+    monkeypatch.setenv("PM_GAIN_DR_LOW_ARMS", "0.7")
+    monkeypatch.setenv("PM_GAIN_DR_HIGH_ARMS", "3.0")
+    cfg = _h1_2_group_cfg(
+        stiffness_scale_range=(0.7, 1.3), damping_scale_range=(0.7, 1.3)
+    )
+    changed, lines = _gate(cfg, label="RESUME")
+    assert changed is True
+
+    # All THREE groups are written; the two unmentioned ones inherit the
+    # config's global band rather than dropping out.
+    assert cfg.group_stiffness_scale_ranges == {
+        "legs": (0.7, 1.3), "waist": (0.7, 1.3), "arms": (0.7, 3.0),
+    }
+    # The arm knob has no _KD_ twin, so damping falls back to it: arm damping
+    # is widened to 3.0x too, legs/waist stay at the global band.
+    assert cfg.group_damping_scale_ranges == {
+        "legs": (0.7, 1.3), "waist": (0.7, 1.3), "arms": (0.7, 3.0),
+    }
+    # Global bands are untouched, and the effort axis stays OFF.
+    assert cfg.stiffness_scale_range == (0.7, 1.3)
+    assert cfg.damping_scale_range == (0.7, 1.3)
+    assert cfg.effort_limit_scale_range is None
+    assert cfg.group_effort_limit_scale_ranges is None
+    assert cfg.constant_damping_ratio is False
+    for group in ("legs", "waist", "arms"):
+        assert any(f"GROUP '{group}'" in ln for ln in lines), group
+
+    # End to end through the sampler, per DOF.
+    out = _process(cfg, H1_2_DOF_NAMES)
+    k, d = out["stiffness_scales"], out["damping_scales"]
+    for group in ("legs", "waist"):
+        cols = out["group_columns"][group]
+        assert k[:, cols].max() <= 1.3 + 1e-6, group
+        assert d[:, cols].max() <= 1.3 + 1e-6, group
+        # Still genuinely randomized -- not collapsed to 1.0.
+        assert k[:, cols].std() > 0.05, group
+    arms = out["group_columns"]["arms"]
+    assert k[:, arms].max() > 1.3  # the widened band is actually explored
+    assert d[:, arms].max() > 1.3
+    assert k[:, arms].min() >= 0.7 - 1e-6
+    assert out["effort_limit_scales"] is None
+
+
 def test_gate_constant_zeta_and_scale_source_knobs(monkeypatch):
     _clear_gain_env(monkeypatch)
     monkeypatch.setenv("PM_GAIN_DR_CONSTANT_ZETA", "1")
