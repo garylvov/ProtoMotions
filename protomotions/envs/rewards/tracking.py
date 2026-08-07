@@ -28,7 +28,7 @@ Includes:
 
 import torch
 from torch import Tensor
-from typing import Optional
+from typing import Optional, Tuple
 
 from protomotions.utils.rotations import (
     quat_angle_diff_norm,
@@ -459,6 +459,69 @@ def compute_global_anchor_ori_rew(
     return compute_global_orientation_error_exp(current_anchor_rot, ref_anchor_rot, sigma)
 
 
+def compute_anchor_relative_local_body_pos(
+    current_rigid_body_pos: Tensor,
+    ref_rigid_body_pos: Tensor,
+    current_anchor_rot: Tensor,
+    ref_rigid_body_rot: Tensor,
+    current_anchor_pos: Tensor,
+    anchor_idx: int,
+) -> Tuple[Tensor, Tensor]:
+    """Put current and reference body positions in the ANCHOR-RELATIVE,
+    HEADING-LOCAL frame -- the frame ``wrist_relative_body_pos`` scores in.
+
+    Extracted VERBATIM out of ``compute_relative_body_pos_rew`` (2026-08-07) so
+    that the reward and the new ``env/wrist_relative_body_pos/err_m_mean`` stat
+    read the SAME arithmetic, in the same order, and can never drift. Not one
+    operation was reordered, retyped or vectorised in the move: the stat must
+    measure the error the reward actually prices, and a "harmless" rewrite is
+    exactly how a metric silently stops describing its term.
+    ``test_wrist_relative_body_pos_stat.py`` pins the reward's output as
+    bitwise-equal to an inline copy of the pre-refactor expression.
+
+    Args:
+        current_rigid_body_pos: Current body positions [num_envs, num_bodies, 3].
+        ref_rigid_body_pos: Reference body positions [num_envs, num_bodies, 3].
+        current_anchor_rot: Current anchor rotation [num_envs, 4] (w-last).
+        ref_rigid_body_rot: Reference body rotations [num_envs, num_bodies, 4].
+        current_anchor_pos: Current anchor position [num_envs, 3].
+        anchor_idx: Index of anchor body.
+
+    Returns:
+        ``(current_rel_pos_local, ref_rel_pos_local)``, each
+        [num_envs, num_bodies, 3].
+    """
+    # Extract reference anchor pos and rot
+    ref_anchor_pos = ref_rigid_body_pos[:, anchor_idx, :]
+    ref_anchor_rot = ref_rigid_body_rot[:, anchor_idx, :]
+    
+    # Compute heading rotations (yaw-only)
+    current_heading_rot_inv = calc_heading_quat_inv(current_anchor_rot, w_last=True)
+    ref_heading_rot_inv = calc_heading_quat_inv(ref_anchor_rot, w_last=True)
+    
+    # Compute relative positions in world frame
+    current_rel_pos = current_rigid_body_pos - current_anchor_pos.unsqueeze(1)
+    ref_rel_pos = ref_rigid_body_pos - ref_anchor_pos.unsqueeze(1)
+    
+    # Rotate to anchor's local frame
+    current_rel_pos_flat = current_rel_pos.reshape(-1, 3)
+    current_heading_rot_inv_exp = current_heading_rot_inv.unsqueeze(1).expand(
+        -1, current_rigid_body_pos.shape[1], -1
+    ).reshape(-1, 4)
+    current_rel_pos_local = quat_rotate(
+        current_heading_rot_inv_exp, current_rel_pos_flat, w_last=True
+    ).reshape(current_rigid_body_pos.shape)
+    
+    ref_rel_pos_flat = ref_rel_pos.reshape(-1, 3)
+    ref_heading_rot_inv_exp = ref_heading_rot_inv.unsqueeze(1).expand(
+        -1, ref_rigid_body_pos.shape[1], -1
+    ).reshape(-1, 4)
+    ref_rel_pos_local = quat_rotate(
+        ref_heading_rot_inv_exp, ref_rel_pos_flat, w_last=True
+    ).reshape(ref_rigid_body_pos.shape)
+    return current_rel_pos_local, ref_rel_pos_local
+
+
 def compute_relative_body_pos_rew(
     current_rigid_body_pos: Tensor,
     ref_rigid_body_pos: Tensor,
@@ -503,35 +566,16 @@ def compute_relative_body_pos_rew(
         Reward: exp(-||rel_pos - ref_rel_pos||^2 / sigma^2), plus the optional
         narrow companion.
     """
-    # Extract reference anchor pos and rot
-    ref_anchor_pos = ref_rigid_body_pos[:, anchor_idx, :]
-    ref_anchor_rot = ref_rigid_body_rot[:, anchor_idx, :]
-    
-    # Compute heading rotations (yaw-only)
-    current_heading_rot_inv = calc_heading_quat_inv(current_anchor_rot, w_last=True)
-    ref_heading_rot_inv = calc_heading_quat_inv(ref_anchor_rot, w_last=True)
-    
-    # Compute relative positions in world frame
-    current_rel_pos = current_rigid_body_pos - current_anchor_pos.unsqueeze(1)
-    ref_rel_pos = ref_rigid_body_pos - ref_anchor_pos.unsqueeze(1)
-    
-    # Rotate to anchor's local frame
-    current_rel_pos_flat = current_rel_pos.reshape(-1, 3)
-    current_heading_rot_inv_exp = current_heading_rot_inv.unsqueeze(1).expand(
-        -1, current_rigid_body_pos.shape[1], -1
-    ).reshape(-1, 4)
-    current_rel_pos_local = quat_rotate(
-        current_heading_rot_inv_exp, current_rel_pos_flat, w_last=True
-    ).reshape(current_rigid_body_pos.shape)
-    
-    ref_rel_pos_flat = ref_rel_pos.reshape(-1, 3)
-    ref_heading_rot_inv_exp = ref_heading_rot_inv.unsqueeze(1).expand(
-        -1, ref_rigid_body_pos.shape[1], -1
-    ).reshape(-1, 4)
-    ref_rel_pos_local = quat_rotate(
-        ref_heading_rot_inv_exp, ref_rel_pos_flat, w_last=True
-    ).reshape(ref_rigid_body_pos.shape)
-    
+    current_rel_pos_local, ref_rel_pos_local = (
+        compute_anchor_relative_local_body_pos(
+            current_rigid_body_pos,
+            ref_rigid_body_pos,
+            current_anchor_rot,
+            ref_rigid_body_rot,
+            current_anchor_pos,
+            anchor_idx,
+        )
+    )
     return compute_global_position_error_exp(
         current_rel_pos_local,
         ref_rel_pos_local,

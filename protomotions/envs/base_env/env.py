@@ -1146,6 +1146,14 @@ class BaseEnv:
         # not HOLD-FIX is on.
         self._log_global_wrist_pos_extras(self._current_context)
 
+        # ANCHOR-RELATIVE wrist position error in METRES (no-op unless the
+        # wrist_relative_body_pos reward component is registered). This is the
+        # v59 go/no-go stat: global_wrist_pos above is WORLD frame and is
+        # dominated by root drift, so it cannot gate a run whose objective is
+        # anchor-relative wrist tracking. Same placement rationale as the two
+        # stats around it.
+        self._log_wrist_relative_body_pos_extras(self._current_context)
+
         # Held-reference joint-quiet observability in rad/s (no-op unless the
         # hold_joint_quiet reward component is registered). Same reason it sits
         # outside _log_hold_fix_extras as the stat above.
@@ -1660,6 +1668,72 @@ class BaseEnv:
         distance = (current - reference).pow(2).sum(dim=-1).sqrt()
         self.extras["global_wrist_pos/err_m"] = distance.mean(dim=-1)
         self.extras["global_wrist_pos/err_max_m"] = distance.max(dim=-1).values
+
+    def _log_wrist_relative_body_pos_extras(self, ctx):
+        """ANCHOR-RELATIVE wrist position error, in METRES -- the v59 go/no-go.
+
+        ``wrist_relative_body_pos`` (w 1.3, sigma 0.3) is the term that actually
+        governs hand placement, and until 2026-08-07 it had **no error stat at
+        all**. The only wrist number logged was
+        ``env/global_wrist_pos/err_m_mean``, which is WORLD frame: with
+        ``realign_motion_with_humanoid_on_each_step=False`` the robot and the
+        reference are free to separate up to the 0.4 m ``anchor_pos_drift``
+        termination threshold, so that stat is dominated by root drift and
+        cannot gate a run whose objective is anchor-relative wrist tracking
+        (SUBCM_WRIST_PLAN.md 1a/5e: root drift contributes 0 mm to the
+        anchor-relative error).
+
+        Like the reward itself, the value is Gaussian-flat near zero, so the
+        term's own value is a poor progress read. This logs the RAW error the
+        term is built on, in metres, in the SAME frame the MuJoCo evaluator's
+        ``wrist_err_local_m`` reports -- so the training curve and the offline
+        eval are finally the same quantity and can be compared directly.
+
+        Frame comes from ``compute_anchor_relative_local_body_pos``, the block
+        lifted verbatim out of ``compute_relative_body_pos_rew``, so the stat
+        and the reward can never drift.
+
+        Written ONLY when the reward component is registered, so unset configs
+        emit no new keys (Rule 10) and pay no cost. Values are Tensors (a
+        python float is silently dropped by the agent's extras aggregator) and
+        avoid the ``raw/`` prefix (which the aggregator skips). Both TB
+        surfaces enumerate ``extras`` dynamically, so no hardcoded stat list
+        needs a new entry for these to appear.
+
+        TB tags: ``env/wrist_relative_body_pos/err_m_mean`` (primary, mean over
+        the two wrist bodies), ``env/wrist_relative_body_pos/err_max_m_mean``.
+        """
+        component = (self.config.reward_components or {}).get(
+            "wrist_relative_body_pos"
+        )
+        if component is None:
+            return
+        mimic = getattr(ctx, "mimic", None)
+        if mimic is None or mimic.ref_state is None:
+            return
+        ref_state = mimic.ref_state
+        from protomotions.envs.rewards import (
+            compute_anchor_relative_local_body_pos,
+        )
+
+        current, reference = compute_anchor_relative_local_body_pos(
+            ctx.current.rigid_body_pos,
+            ref_state.rigid_body_pos,
+            ctx.current.anchor_rot,
+            ref_state.rigid_body_rot,
+            ctx.current.anchor_pos,
+            mimic.anchor_idx,
+        )
+        body_indices = component.static_params.get("body_indices")
+        if body_indices is not None:
+            current = current[:, body_indices]
+            reference = reference[:, body_indices]
+        # Per-body Euclidean distance [num_envs, num_bodies], then reduce.
+        distance = (current - reference).pow(2).sum(dim=-1).sqrt()
+        self.extras["wrist_relative_body_pos/err_m"] = distance.mean(dim=-1)
+        self.extras["wrist_relative_body_pos/err_max_m"] = distance.max(
+            dim=-1
+        ).values
 
     def _log_hold_joint_quiet_extras(self, ctx):
         """Held-reference joint velocity in rad/s -- the FIX A go/no-go stat.

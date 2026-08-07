@@ -1005,6 +1005,28 @@ def main():
             label="RESUME",
         )
 
+        # PM_ACTION_NOISE_SCALE / PM_OBS_NOISE_SCALE / PM_ANCHOR_ROT_NOISE_SCALE
+        # (env-gated, resume-safe): training observation/action noise magnitude
+        # scaling (2026-08-07). Same shape and the SAME shared implementation as
+        # the GAIN-DR gate above, so the fresh-build twin in teacher.py and this
+        # resume row can never drift. simulator_config is frozen from the
+        # pickle, so teacher.py's fresh-build gate never runs on a resume --
+        # re-apply here. Action noise is resampled at every simulator build and
+        # observation noise is read live off
+        # simulator.config.domain_randomization every step, so mutating the
+        # config is sufficient on both paths. GUARD: fires only when a var is
+        # EXPLICITLY PRESENT, and a scale that resolves to exactly 1.0 writes
+        # nothing -- unset (or 1.0) = frozen config byte-identical.
+        from protomotions.simulator.base_simulator.noise_scale_env_gates import (
+            apply_noise_scale_env_overrides,
+        )
+
+        apply_noise_scale_env_overrides(
+            getattr(simulator_config, "domain_randomization", None),
+            log_fn=log.warning,
+            label="RESUME",
+        )
+
         # v5.4 COMPONENT INJECTION (env-gated, resume-safe): reward components
         # are env-side -- adding one changes no obs/network shape -- but the
         # re-apply family above can only PATCH components already present in
