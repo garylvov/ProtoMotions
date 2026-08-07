@@ -35,11 +35,13 @@ from protomotions.simulator.base_simulator.config import (
 from protomotions.simulator.base_simulator.noise_scale_env_gates import (
     ANCHOR_ROT_NOISE_SCALE_VAR,
     ACTION_NOISE_SCALE_VAR,
+    NOISE_SCALE_BASELINE_ATTR,
     NOISE_SCALE_ENV_VARS,
     OBS_NOISE_FIELDS,
     OBS_NOISE_SCALE_VAR,
     apply_noise_scale_env_overrides,
     noise_scale_env_gate_requested,
+    noise_scale_nominal_baseline,
 )
 
 
@@ -317,3 +319,230 @@ def test_fresh_build_and_resume_share_one_implementation():
         assert "noise_scale_env_gates import" in text
         assert "apply_noise_scale_env_overrides" in text
         assert 'label="FRESH-BUILD"' in text
+
+
+# =============================================================================
+# 6. IDEMPOTENCE ACROSS RESUMES (2026-08-07 compounding defect)
+# =============================================================================
+#
+# THE DEFECT. The knobs are multipliers and the gate runs on EVERY resume, so
+# it used to compound against the already-scaled frozen config. Observed live
+# on v59:
+#
+#     first launch : action_noise_range (-0.05, 0.05) -> (-0.01,  0.01)
+#     after resume : action_noise_range (-0.01, 0.01) -> (-0.002, 0.002)
+#
+# 25x below nominal instead of the intended 5x, and a third resume would have
+# made it 125x -- with log lines byte-indistinguishable from a correct first
+# application. These tests are the mandatory guard.
+
+
+_V57_NOMINAL_ACTION_RANGE = (-0.05, 0.05)
+_V59_ENV = {ACTION_NOISE_SCALE_VAR: "0.2", OBS_NOISE_SCALE_VAR: "0.25"}
+
+
+def _apply_n(dr, env, n):
+    """Apply the gate ``n`` times, returning the per-call (changed, lines)."""
+    return [_collect(dr, env) for _ in range(n)]
+
+
+def test_double_apply_is_a_no_op__the_v59_compounding_regression():
+    """MANDATORY REGRESSION. Applying the SAME environment a second time must
+    write nothing and leave the config bit-for-bit where the first application
+    left it.
+
+    Pre-fix, the second call produced action_noise_range (-0.002, 0.002) and
+    dof_pos_noise 0.00125. Post-fix both stay at the first application's values
+    because the scale is applied to the recorded NOMINAL, not to the current
+    value.
+    """
+    dr = _v57_dr()
+
+    changed_1, lines_1 = _collect(dr, _V59_ENV)
+    assert changed_1 is True, "the first application must actually move the config"
+    after_first = pickle.dumps(dr)
+
+    # The intended v59 magnitudes, stated explicitly so a future refactor that
+    # silently changes the scaling target fails here and not on the fleet.
+    assert dr.action_noise.action_noise_range == pytest.approx((-0.01, 0.01))
+    assert dr.observation_noise.dof_pos_noise == pytest.approx(0.005)
+    assert dr.observation_noise.anchor_rot_noise == pytest.approx(0.025)
+
+    changed_2, lines_2 = _collect(dr, _V59_ENV)
+
+    assert changed_2 is False, (
+        "the SECOND application reported a mutation -- the gate is compounding "
+        "again (this is the v59 defect: 0.2 applied twice = 25x below nominal)"
+    )
+    assert pickle.dumps(dr) == after_first, (
+        "the second application changed the config. action_noise_range="
+        f"{dr.action_noise.action_noise_range}, dof_pos_noise="
+        f"{dr.observation_noise.dof_pos_noise} (expected (-0.01, 0.01) / 0.005)"
+    )
+    assert dr.action_noise.action_noise_range == pytest.approx((-0.01, 0.01))
+    assert dr.observation_noise.dof_pos_noise == pytest.approx(0.005)
+
+
+def test_third_and_fourth_apply_are_also_no_ops():
+    """Idempotence must hold for N applications, not just two -- a run can be
+    auto-resumed every 12600 s for days."""
+    dr = _v57_dr()
+    _collect(dr, _V59_ENV)
+    settled = pickle.dumps(dr)
+
+    for changed, _lines in _apply_n(dr, _V59_ENV, 3):
+        assert changed is False
+        assert pickle.dumps(dr) == settled
+
+
+def test_re_apply_logs_loudly_that_it_is_scaling_from_nominal():
+    """A silent no-op is not enough: the resume log is the only artifact anyone
+    reads, so it must SAY that the scale was measured against nominal."""
+    dr = _v57_dr()
+    _collect(dr, _V59_ENV)
+    _changed, lines = _collect(dr, _V59_ENV)
+
+    joined = "\n".join(lines)
+    assert "IDEMPOTENT RE-APPLY" in joined, joined
+    assert "nominal" in joined.lower(), joined
+
+
+def test_changed_scale_across_resumes_lands_on_nominal_times_new_scale():
+    """Not just idempotent -- CORRECT. Re-launching with a different scale must
+    give ``nominal * new_scale``, not ``current * new_scale`` and not a lossy
+    divide-out of the previous factor."""
+    dr = _v57_dr()
+    _collect(dr, {ACTION_NOISE_SCALE_VAR: "0.2", OBS_NOISE_SCALE_VAR: "0.25"})
+    _collect(dr, {ACTION_NOISE_SCALE_VAR: "0.5", OBS_NOISE_SCALE_VAR: "0.5"})
+
+    assert dr.action_noise.action_noise_range == pytest.approx((-0.025, 0.025))
+    assert dr.observation_noise.dof_pos_noise == pytest.approx(0.01)
+    # EXACT, not approx: 0.05 * 0.5 must be the same double as the direct
+    # product, i.e. computed from the stored nominal rather than by dividing
+    # the previous 0.2 back out.
+    assert dr.action_noise.action_noise_range == (
+        _V57_NOMINAL_ACTION_RANGE[0] * 0.5,
+        _V57_NOMINAL_ACTION_RANGE[1] * 0.5,
+    )
+
+
+def test_scale_back_to_one_restores_the_exact_nominal():
+    """A resume with the knob explicitly at 1.0 must return the run to nominal,
+    not freeze it at whatever the last scaled value was."""
+    fresh = _v57_dr()
+    nominal_bytes = pickle.dumps(fresh)
+
+    dr = _v57_dr()
+    _collect(dr, _V59_ENV)
+    _collect(dr, {ACTION_NOISE_SCALE_VAR: "1.0", OBS_NOISE_SCALE_VAR: "1.0"})
+
+    assert dr.action_noise.action_noise_range == _V57_NOMINAL_ACTION_RANGE
+    assert dr.observation_noise.dof_pos_noise == 0.02
+    assert dr.observation_noise.anchor_rot_noise == 0.1
+    # The baseline stamp is the ONE intended difference from a never-gated
+    # config; strip it and the bytes must match nominal exactly.
+    delattr(dr, NOISE_SCALE_BASELINE_ATTR)
+    assert pickle.dumps(dr) == nominal_bytes
+
+
+def test_baseline_stamp_is_only_written_when_the_gate_writes():
+    """Rule 10 survives the fix: an unset or all-1.0 environment must not even
+    add the baseline attribute."""
+    for env in ({}, {ACTION_NOISE_SCALE_VAR: "1.0", OBS_NOISE_SCALE_VAR: "1.0"}):
+        dr = _v57_dr()
+        _collect(dr, env)
+        assert noise_scale_nominal_baseline(dr) is None
+        assert not hasattr(dr, NOISE_SCALE_BASELINE_ATTR)
+
+
+def test_action_noise_removal_at_scale_zero_is_idempotent_and_reversible():
+    """``PM_ACTION_NOISE_SCALE=0`` sets ``action_noise = None``, which destroys
+    the block. Re-applying must not warn "stripped/absent" (the config is in
+    the state WE put it in), and a later non-zero scale must restore it from
+    the recorded nominal rather than losing the range forever."""
+    dr = _v57_dr()
+
+    changed_1, _ = _collect(dr, {ACTION_NOISE_SCALE_VAR: "0"})
+    assert changed_1 is True
+    assert dr.action_noise is None
+    settled = pickle.dumps(dr)
+
+    changed_2, lines_2 = _collect(dr, {ACTION_NOISE_SCALE_VAR: "0"})
+    assert changed_2 is False
+    assert pickle.dumps(dr) == settled
+    joined = "\n".join(lines_2)
+    assert "ALREADY REMOVED" in joined, joined
+    assert "NO effect" not in joined, (
+        "re-applying scale 0 must not claim the env var has no effect -- the "
+        "block is absent because THIS gate removed it\n" + joined
+    )
+
+    changed_3, _ = _collect(dr, {ACTION_NOISE_SCALE_VAR: "0.5"})
+    assert changed_3 is True
+    assert dr.action_noise is not None
+    assert dr.action_noise.action_noise_range == pytest.approx((-0.025, 0.025))
+
+
+def test_baseline_records_the_pre_gate_nominal_not_the_scaled_value():
+    dr = _v57_dr()
+    _collect(dr, _V59_ENV)
+
+    stamp = noise_scale_nominal_baseline(dr)
+    assert stamp is not None
+    assert stamp["action_noise"]["range"] == _V57_NOMINAL_ACTION_RANGE
+    assert stamp["observation_noise"]["dof_pos_noise"] == 0.02
+    assert stamp["observation_noise"]["anchor_rot_noise"] == 0.1
+
+
+def test_baseline_survives_a_pickle_round_trip_like_a_real_resume():
+    """The real resume path goes THROUGH ``resolved_configs.pt``. Idempotence
+    must hold across that pickle round trip, not just in-process."""
+    dr = _v57_dr()
+    _collect(dr, _V59_ENV)
+
+    reloaded = pickle.loads(pickle.dumps(dr))
+    settled = pickle.dumps(reloaded)
+
+    changed, _ = _collect(reloaded, _V59_ENV)
+    assert changed is False
+    assert pickle.dumps(reloaded) == settled
+    assert reloaded.action_noise.action_noise_range == pytest.approx((-0.01, 0.01))
+
+
+def test_corrupt_baseline_stamp_is_a_hard_error_not_a_guess():
+    dr = _v57_dr()
+    setattr(dr, NOISE_SCALE_BASELINE_ATTR, {"version": 999})
+    with pytest.raises(ValueError, match="baseline stamp"):
+        apply_noise_scale_env_overrides(
+            dr, log_fn=lambda _: None, label="TEST", env=_V59_ENV
+        )
+
+
+def test_anchor_rot_composition_is_idempotent_too():
+    """The composed PM_OBS_NOISE_SCALE x PM_ANCHOR_ROT_NOISE_SCALE path had the
+    worst compounding (two multipliers per resume)."""
+    env = {OBS_NOISE_SCALE_VAR: "0.25", ANCHOR_ROT_NOISE_SCALE_VAR: "0.4"}
+    dr = _v57_dr()
+
+    _collect(dr, env)
+    assert dr.observation_noise.anchor_rot_noise == pytest.approx(0.1 * 0.25 * 0.4)
+    settled = pickle.dumps(dr)
+
+    changed, _ = _collect(dr, env)
+    assert changed is False
+    assert pickle.dumps(dr) == settled
+
+
+def test_per_axis_list_magnitudes_are_idempotent():
+    """Per-axis lists are mutated by rebinding a NEW list; make sure the stored
+    nominal is a value copy so a second pass cannot read the scaled one."""
+    dr = _v57_dr()
+    dr.observation_noise.root_pos_noise = [0.01, 0.02, 0.03]
+
+    _collect(dr, {OBS_NOISE_SCALE_VAR: "0.5"})
+    assert dr.observation_noise.root_pos_noise == pytest.approx([0.005, 0.01, 0.015])
+    settled = pickle.dumps(dr)
+
+    changed, _ = _collect(dr, {OBS_NOISE_SCALE_VAR: "0.5"})
+    assert changed is False
+    assert pickle.dumps(dr) == settled

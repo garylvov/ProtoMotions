@@ -1054,6 +1054,38 @@ def main():
             # _rc may be a fresh dict when the frozen config had None.
             env_config.reward_components = _rc
 
+        # PM_BODY_WEIGHTS / PM_BODY_WEIGHTS_DEFAULT / PM_BODY_WEIGHTS_COMPONENTS
+        # (env-gated, resume-safe): PER-BODY weights on the all-body tracking
+        # reduction. Same shape and the SAME shared implementation as the
+        # fresh-build twin in imprint's teacher.py::env_config, so the two paths
+        # can never drift. Runs AFTER the injection pass so a component created
+        # on this very resume can still be weighted. body_names comes from the
+        # FROZEN robot config, so patterns resolve against the same body
+        # ordering the run was built with; an absent/empty list is a hard error
+        # inside the gate, never a silent misalignment.
+        #
+        # IDEMPOTENT BY CONSTRUCTION: the gate stores an ABSOLUTE weight vector
+        # derived only from the spec and the body-name list, so re-applying it
+        # on every autoresume is a no-op -- unlike the NOISE-DR scale knobs,
+        # which are multipliers and had to be given a nominal baseline stamp
+        # (noise_scale_env_gates.NOISE_SCALE_BASELINE_ATTR) after they were
+        # found compounding across v59's resumes.
+        from protomotions.envs.body_weight_env_gates import (
+            apply_body_weight_env_overrides,
+        )
+
+        # _rc, not env_config.reward_components: it is the same dict once the
+        # injection pass has run, and it is the shape the rest of this block
+        # already uses (a frozen config may legitimately carry no attribute).
+        apply_body_weight_env_overrides(
+            _rc,
+            getattr(
+                getattr(robot_config, "kinematic_info", None), "body_names", None
+            ),
+            log_fn=log.warning,
+            label="RESUME",
+        )
+
         args.checkpoint = checkpoint_path
         experiment_module = (
             None  # Intentionally skip loading - frozen config from pickle
