@@ -15,6 +15,7 @@ Covers (CPU-only):
   default gains; envs differ from each other.
 """
 
+import pickle
 from types import SimpleNamespace
 
 import pytest
@@ -731,6 +732,56 @@ def test_gate_tolerates_pre_field_pickled_config(monkeypatch):
     assert changed is True
     assert cfg.group_stiffness_scale_ranges["arms"] == (0.2, 1.3)
     assert _process(cfg, H1_2_DOF_NAMES)["env_gain_scale_source"] == "legs"
+
+
+def test_sampler_resumes_from_real_pre_field_pickle():
+    """RESUME GUARD: a config pickled BEFORE the per-group fields existed must
+    sample byte-identically to the modern single-config form.
+
+    The gate-side twin above pokes ``__dict__``; this one does a real
+    ``pickle`` round-trip of an old-shape instance and drives the SAMPLER,
+    which is the path a ``resolved_configs.pt`` resume actually takes.
+    ``_process`` reads ``group_stiffness_scale_ranges`` /
+    ``group_damping_scale_ranges`` as plain attributes, so it survives only
+    because those fields carry immutable ``default=None`` CLASS defaults.
+    Converting any of them to ``default_factory`` would move the default off
+    the class and break every in-flight checkpoint with an AttributeError --
+    this test is the tripwire for that refactor.
+    """
+    modern = ActuatorGainDomainRandomizationConfig(
+        dof_names=[".*"],
+        stiffness_scale_range=(0.7, 1.3),
+        damping_scale_range=(0.7, 1.3),
+    )
+    old = ActuatorGainDomainRandomizationConfig(
+        dof_names=[".*"],
+        stiffness_scale_range=(0.7, 1.3),
+        damping_scale_range=(0.7, 1.3),
+    )
+    per_group_fields = [
+        "group_dof_patterns",
+        "group_stiffness_scale_ranges",
+        "group_damping_scale_ranges",
+        "group_effort_limit_scale_ranges",
+        "constant_damping_ratio",
+        "env_gain_scale_group",
+    ]
+    for attr in per_group_fields:
+        old.__dict__.pop(attr, None)
+    old = pickle.loads(pickle.dumps(old))
+    # The pickled payload really is pre-field: no per-group instance state.
+    assert not (set(per_group_fields) & set(old.__dict__))
+
+    torch.manual_seed(1234)
+    expected = _process(modern, H1_2_DOF_NAMES)
+    torch.manual_seed(1234)
+    got = _process(old, H1_2_DOF_NAMES)
+
+    assert got["dof_indices"] == expected["dof_indices"]
+    assert got["group_columns"] == {}
+    for key in ("stiffness_scales", "damping_scales", "env_gain_scale"):
+        assert torch.equal(got[key], expected[key]), key
+    assert got["effort_limit_scales"] is None
 
 
 # ---------------------------------------------------------------------------
