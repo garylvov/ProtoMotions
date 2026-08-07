@@ -19,8 +19,11 @@ import torch
 from protomotions.components.motion_lib import (
     MotionLib,
     MotionLibConfig,
+    _FP16_MANTISSA_BITS,
     _FP16_QUANTIZE_FIELDS,
 )
+
+_FP16_MANTISSA_ULP_SCALE = 2.0 ** -_FP16_MANTISSA_BITS
 
 # Fields quantized to fp16; contacts/weights/indexing fields must stay put.
 _UNTOUCHED_FIELDS = ("contacts", "motion_weights", "motion_num_frames",
@@ -149,3 +152,106 @@ def test_gate_off_keeps_fp32(monkeypatch, mini_pack):
     # bit-exact with what we wrote (no quantization at all).
     assert torch.equal(ml.gts, fp32["gts"])
     assert torch.equal(ml.grs, fp32["grs"])
+
+
+# ---------------------------------------------------------------------------
+# fp16 x ABSOLUTE world magnitude safety net (GTS_CONSISTENCY_AUDIT 2026-08-06)
+#
+# gts is cast at absolute magnitude, BEFORE the per-env re-origining at reset,
+# so fp16's relative ulp (2^-10) scales the error with the coordinate: ~1 mm at
+# 1 m but ~1 m at 1 km. 640 clips (0.89%) of the live corpus sit beyond 10 m.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def far_origin_pack(tmp_path):
+    """Same mini pack, translated 1.3 km in +x (the LocoMuJoCo walk_chunk case)."""
+    clips = [_synth_clip(5 + i, seed=i) for i in range(3)]
+    for c in clips:
+        c["gts"][:, :, 0] += 1300.0
+    path = tmp_path / "far.pt"
+    fp32 = _write_pack(str(path), clips)
+    return str(path), fp32
+
+
+def test_ulp_table_matches_the_documented_derivation():
+    """fp16 grid spacing at |x| is in [|x|*2^-11, |x|*2^-10]; that bound is the
+    whole basis for the 10 m threshold and for the message's ulp figure."""
+    for magnitude in (1.0, 10.0, 128.0, 1024.0, 1300.0):
+        x = torch.tensor([magnitude], dtype=torch.float32)
+        nxt = torch.nextafter(x.half(), torch.tensor([float("inf")]).half())
+        ulp = float(nxt.float() - x.half().float())
+        assert magnitude * _FP16_MANTISSA_ULP_SCALE / 2.0 <= ulp <= \
+            magnitude * _FP16_MANTISSA_ULP_SCALE * 1.001, magnitude
+    # exact powers of two hit the upper bound the code reports.
+    for magnitude in (1.0, 1024.0):
+        x = torch.tensor([magnitude], dtype=torch.float32)
+        nxt = torch.nextafter(x.half(), torch.tensor([float("inf")]).half())
+        assert float(nxt.float() - x.half().float()) == pytest.approx(
+            magnitude * _FP16_MANTISSA_ULP_SCALE)
+    # 1 km -> a ~1 m grid: the whole 29-body skeleton collapses onto one cell.
+    assert 1300.0 * _FP16_MANTISSA_ULP_SCALE > 1.0
+    # 10 m -> ~1e-2 m upper bound, ~4e-3 m half-ulp: the measured knee.
+    assert 10.0 * _FP16_MANTISSA_ULP_SCALE < 1.1e-2
+
+
+def test_near_origin_pack_passes_the_magnitude_check(monkeypatch, mini_pack,
+                                                     capsys):
+    path, _ = mini_pack
+    monkeypatch.setenv("PM_MOTIONLIB_FP16", "1")
+    monkeypatch.delenv("PM_MOTIONLIB_FP16_STRICT", raising=False)
+
+    MotionLib(MotionLibConfig(motion_file=path), device="cpu")
+
+    out = capsys.readouterr().out
+    assert "world-magnitude check OK" in out
+    assert "UNSAFE WORLD MAGNITUDE" not in out
+
+
+def test_far_origin_pack_warns_loudly_but_still_loads(monkeypatch,
+                                                      far_origin_pack, capsys):
+    """Default = WARN: v58's live corpus has far-origin clips and must load."""
+    path, _ = far_origin_pack
+    monkeypatch.setenv("PM_MOTIONLIB_FP16", "1")
+    monkeypatch.delenv("PM_MOTIONLIB_FP16_STRICT", raising=False)
+
+    ml = MotionLib(MotionLibConfig(motion_file=path), device="cpu")
+
+    out = capsys.readouterr().out
+    assert "UNSAFE WORLD MAGNITUDE" in out
+    assert "--reorigin-xy" in out
+    assert ml.gts.dtype == torch.float16  # still quantized; warning only
+
+
+def test_far_origin_pack_hard_errors_under_strict(monkeypatch,
+                                                  far_origin_pack):
+    path, _ = far_origin_pack
+    monkeypatch.setenv("PM_MOTIONLIB_FP16", "1")
+    monkeypatch.setenv("PM_MOTIONLIB_FP16_STRICT", "1")
+
+    with pytest.raises(ValueError, match="UNSAFE WORLD MAGNITUDE"):
+        MotionLib(MotionLibConfig(motion_file=path), device="cpu")
+
+
+def test_check_is_silent_and_value_preserving_when_fp16_is_off(
+        monkeypatch, far_origin_pack, capsys):
+    """Rule 10: unset PM_MOTIONLIB_FP16 -> byte-identical, no new output."""
+    path, fp32 = far_origin_pack
+    monkeypatch.delenv("PM_MOTIONLIB_FP16", raising=False)
+    monkeypatch.setenv("PM_MOTIONLIB_FP16_STRICT", "1")  # must not fire
+
+    ml = MotionLib(MotionLibConfig(motion_file=path), device="cpu")
+
+    out = capsys.readouterr().out
+    assert "world-magnitude check" not in out
+    assert torch.equal(ml.gts, fp32["gts"])
+
+
+def test_threshold_is_configurable(monkeypatch, mini_pack, capsys):
+    path, _ = mini_pack
+    monkeypatch.setenv("PM_MOTIONLIB_FP16", "1")
+    monkeypatch.setenv("PM_MOTIONLIB_FP16_MAX_COORD_M", "0.001")
+
+    MotionLib(MotionLibConfig(motion_file=path), device="cpu")
+
+    assert "UNSAFE WORLD MAGNITUDE" in capsys.readouterr().out

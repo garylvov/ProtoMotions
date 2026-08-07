@@ -91,6 +91,90 @@ def _motionlib_fp16_enabled() -> bool:
     return os.environ.get(_MOTIONLIB_FP16_ENV, "0") == "1"
 
 
+# --- fp16 x absolute world magnitude: the safety net ------------------------
+#
+# gts is cast to fp16 at ABSOLUTE world magnitude, i.e. BEFORE the per-env
+# re-origining that env.py/mimic_control.py apply at reset -- so the
+# quantization is baked in and re-origining cannot recover it. fp16 keeps 10
+# explicit mantissa bits, so for |x| in [2^e, 2^(e+1)) the grid spacing is
+# ulp = 2^(e-10) and the worst-case round-to-nearest error is 2^(e-11), i.e.
+# bounded by |x| * 2^-11 and at most |x| * 2^-10 in the ulp sense:
+#
+#     |x|      ulp        half-ulp (max round error)
+#     1 m      0.98 mm    0.49 mm
+#     10 m     7.8 mm     3.9 mm
+#     100 m    125 mm     62 mm
+#     1 km     1.0 m      0.5 m
+#
+# THRESHOLD = 10 m. Derivation: it is the magnitude at which the half-ulp
+# reaches ~4 mm, and it is exactly where the MEASURED reward-frame wrist error
+# knees (GTS_CONSISTENCY_AUDIT 2026-08-06 sec.6, job 4755972): clips inside
+# 10 m carry 0.72-0.92 mm rms -- already comparable to the ~0.5 mm generator
+# defect and tolerable against the 51.4 mm wrist budget -- while the 10-100 m
+# bucket jumps to 4-12 mm rms and >1 km reaches 0.34-0.42 m rms (max 0.99 m).
+#
+# WARN, not raise, by default: 640 of the 71,688 clips in the corpus that is
+# live on teacher v58 (0.89%) are beyond 10 m, and hard-failing would break
+# every resume of an in-flight run for a defect that is 1% of corpus mass.
+# Set PM_MOTIONLIB_FP16_STRICT=1 to escalate to a hard error (recommended for
+# any NEW campaign, once packs are built with build_canonical_corpus.py
+# --reorigin-xy). Unset, this check changes no tensor value: it only reads.
+_FP16_MAX_COORD_ENV = "PM_MOTIONLIB_FP16_MAX_COORD_M"
+_FP16_STRICT_ENV = "PM_MOTIONLIB_FP16_STRICT"
+_FP16_DEFAULT_MAX_COORD_M = 10.0
+_FP16_MANTISSA_BITS = 10
+
+
+def _fp16_max_coord_m() -> float:
+    try:
+        return float(
+            os.environ.get(_FP16_MAX_COORD_ENV, _FP16_DEFAULT_MAX_COORD_M)
+        )
+    except (TypeError, ValueError):
+        return _FP16_DEFAULT_MAX_COORD_M
+
+
+def _fp16_coord_magnitude_check(motion_lib) -> None:
+    """Loud warning (or hard error) when fp16 meets far-from-origin motions.
+
+    Reads only. Runs BEFORE the cast so the reported magnitudes are the true
+    fp32 ones. See the block comment above for the threshold derivation.
+    """
+    gts = getattr(motion_lib, "gts", None)
+    if gts is None or not torch.is_tensor(gts) or gts.numel() == 0:
+        return
+    limit = _fp16_max_coord_m()
+    if limit <= 0.0:
+        return
+    max_coord = float(gts.detach().float().abs().max())
+    ulp = max_coord * (2.0 ** -_FP16_MANTISSA_BITS)
+    if max_coord <= limit:
+        print(
+            f"[motionlib-fp16] world-magnitude check OK: max |gts| = "
+            f"{max_coord:.2f} m <= {limit:.2f} m (fp16 ulp there is "
+            f"<= {ulp * 1e3:.2f} mm)"
+        )
+        return
+    msg = (
+        f"[motionlib-fp16] UNSAFE WORLD MAGNITUDE: {_MOTIONLIB_FP16_ENV}=1 but "
+        f"max |gts| = {max_coord:.1f} m > {limit:.1f} m. fp16 keeps "
+        f"{_FP16_MANTISSA_BITS} mantissa bits, so the grid spacing THERE is "
+        f"{ulp:.4f} m ({ulp * 1e3:.1f} mm) and the quantization is applied at "
+        f"ABSOLUTE magnitude, BEFORE the per-env re-origining at reset -- it "
+        f"cannot be recovered downstream. Reference body positions for those "
+        f"clips are degraded by up to ~{ulp * 1e3:.0f} mm in the reward frame. "
+        f"FIX: rebuild the pack with build_canonical_corpus.py --reorigin-xy "
+        f"(first-frame root xy -> origin), or drop the far-origin clips, or "
+        f"unset {_MOTIONLIB_FP16_ENV}. Raise the bar with "
+        f"{_FP16_MAX_COORD_ENV}; escalate this warning to a hard error with "
+        f"{_FP16_STRICT_ENV}=1."
+    )
+    if os.environ.get(_FP16_STRICT_ENV, "0") == "1":
+        raise ValueError(msg)
+    log.warning(msg)
+    print(msg)
+
+
 def _quantize_motion_tensors_fp16(motion_lib) -> None:
     """In-place fp16 downcast of the big static per-frame pose tensors.
 
@@ -100,6 +184,7 @@ def _quantize_motion_tensors_fp16(motion_lib) -> None:
     """
     if not _motionlib_fp16_enabled():
         return
+    _fp16_coord_magnitude_check(motion_lib)
     freed_cuda = False
     for lib_field in _FP16_QUANTIZE_FIELDS:
         tensor = getattr(motion_lib, lib_field, None)
