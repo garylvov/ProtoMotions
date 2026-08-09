@@ -1154,6 +1154,14 @@ class BaseEnv:
         # stats around it.
         self._log_wrist_relative_body_pos_extras(self._current_context)
 
+        # ANCHOR-RELATIVE FULL-BODY position error in METRES (no-op unless the
+        # relative_body_pos reward component is registered). The owner's target
+        # is "full body to <2 cm with wrists"; until 2026-08-08 the full-body
+        # number was invisible during training (only the term's Gaussian VALUE
+        # was logged) and could not be read without an offline eval. Same
+        # placement rationale as the stats around it.
+        self._log_relative_body_pos_extras(self._current_context)
+
         # Held-reference joint-quiet observability in rad/s (no-op unless the
         # hold_joint_quiet reward component is registered). Same reason it sits
         # outside _log_hold_fix_extras as the stat above.
@@ -1734,6 +1742,118 @@ class BaseEnv:
         self.extras["wrist_relative_body_pos/err_max_m"] = distance.max(
             dim=-1
         ).values
+
+    def _log_relative_body_pos_extras(self, ctx):
+        """ANCHOR-RELATIVE **FULL-BODY** position error, in METRES.
+
+        THE OWNER'S TARGET IS "full body to <2 cm with wrists". Until
+        2026-08-08 the full-body number was **not observable during training**
+        at all: ``relative_body_pos`` (w 1.0, sigma 0.3, ~29 H1-2 bodies) logged
+        only its REWARD value (``env/raw_r/relative_body_pos_mean``), which is a
+        Gaussian of a *squared, weighted, normalized* error and therefore reads
+        ~1.0 across the whole sub-decimetre range the target lives in. The
+        physical metre number had to wait for an offline MuJoCo eval. This is
+        the sibling of ``env/wrist_relative_body_pos/err_m_mean`` for the whole
+        body, in the SAME frame (anchor-relative, heading-local) via the SAME
+        helper ``compute_anchor_relative_local_body_pos``, so the stat and the
+        reward it accompanies can never drift apart.
+
+        UNWEIGHTED IS THE HEADLINE (this is the whole reason this is not a
+        copy-paste of the wrist writer). Since v60 the reward's reduction is a
+        NORMALIZED WEIGHTED mean -- ``PM_BODY_WEIGHTS`` puts 4.0 on the wrist
+        yaw links and 1.5 on the wrist pitch/roll/elbow links, so ``sum(w)=38``
+        over 29 bodies and an unweighted body sees 29/38 = 0.76x its uniform
+        gradient share. A weighted stat would therefore IMPROVE merely because
+        we re-weighted, which is exactly the "looks like it worked" failure the
+        owner's target must not be measurable in:
+
+        - ``relative_body_pos/err_m``          UNWEIGHTED mean over bodies.
+          **This is the number the <2 cm target refers to** and the number
+          comparable with the MuJoCo evaluator's all-body ``pos_err``.
+        - ``relative_body_pos/err_max_m``      worst single body, unweighted.
+        - ``relative_body_pos/err_m_weighted`` present ONLY when the component
+          actually carries ``body_weights``. This is the attention-weighted
+          metre error ``sum(w_i * ||e_i||) / sum(w_i)`` -- a diagnostic for
+          "where is the weighting pointing", NOT the reward's own quantity
+          (the reward weights the SQUARED error and then exponentiates). It is
+          deliberately named ``_weighted`` so it can never be mistaken for the
+          headline; a gap between the two IS the dilution the weighting bought.
+
+        ANCHOR EXCLUSION. In the anchor-relative frame the anchor body's error
+        is IDENTICALLY zero on both sides. The reward tolerates that (the
+        pelvis contributes 0 to the numerator and its weight to the
+        denominator, pure dilution -- see ``body_weight_env_gates`` ANCHOR
+        NOTE), but a MEAN OF METRES cannot: including a structural zero biases
+        the headline down by (N-1)/N, ~3.4% at 29 bodies, and would let us
+        report 1.93 cm for a true 2.00 cm. So the anchor is dropped here, and
+        dropped **by ``mimic.anchor_idx``, never by the literal 0** -- a
+        sibling lane found exactly this hardcoded, a no-op today and wrong the
+        day the anchor moves off the pelvis.
+
+        Written ONLY when the reward component is registered, so unset configs
+        emit no new keys (Rule 10) and pay no cost. Values are Tensors (a
+        python float is silently dropped by the agent's extras aggregator) and
+        avoid the ``raw/`` prefix (which the aggregator skips). Both TB
+        surfaces enumerate ``extras`` dynamically, so no hardcoded stat list
+        needs a new entry for these to appear.
+
+        TB tags: ``env/relative_body_pos/err_m_mean`` (primary) and
+        ``env/relative_body_pos/err_m_std``, ``env/relative_body_pos/
+        err_max_m_mean``, and -- weighted runs only --
+        ``env/relative_body_pos/err_m_weighted_mean``.
+        """
+        component = (self.config.reward_components or {}).get("relative_body_pos")
+        if component is None:
+            return
+        mimic = getattr(ctx, "mimic", None)
+        if mimic is None or mimic.ref_state is None:
+            return
+        ref_state = mimic.ref_state
+        from protomotions.envs.rewards import (
+            compute_anchor_relative_local_body_pos,
+        )
+
+        anchor_idx = int(mimic.anchor_idx)
+        current, reference = compute_anchor_relative_local_body_pos(
+            ctx.current.rigid_body_pos,
+            ref_state.rigid_body_pos,
+            ctx.current.anchor_rot,
+            ref_state.rigid_body_rot,
+            ctx.current.anchor_pos,
+            mimic.anchor_idx,
+        )
+        body_indices = component.static_params.get("body_indices")
+        body_weights = component.static_params.get("body_weights")
+        if body_indices is None:
+            selected = list(range(current.shape[1]))
+        else:
+            selected = [int(i) for i in body_indices]
+        # ANCHOR EXCLUSION by index. ``keep`` indexes into ``selected`` (and
+        # therefore into ``body_weights``, which the gate aligns to
+        # ``body_indices`` element-for-element).
+        keep = [k for k, body in enumerate(selected) if body != anchor_idx]
+        if not keep:
+            # Every scored body IS the anchor: the mean would be 0/0. Emit
+            # nothing rather than a NaN that reads as a perfect score.
+            return
+        kept_bodies = [selected[k] for k in keep]
+        current = current[:, kept_bodies]
+        reference = reference[:, kept_bodies]
+        # Per-body Euclidean distance [num_envs, num_bodies], then reduce.
+        distance = (current - reference).pow(2).sum(dim=-1).sqrt()
+        self.extras["relative_body_pos/err_m"] = distance.mean(dim=-1)
+        self.extras["relative_body_pos/err_max_m"] = distance.max(dim=-1).values
+        if body_weights is not None:
+            weights = torch.as_tensor(
+                [float(body_weights[k]) for k in keep],
+                dtype=distance.dtype,
+                device=distance.device,
+            )
+            total = weights.sum()
+            if total > 0:
+                self.extras["relative_body_pos/err_m_weighted"] = (
+                    distance * weights
+                ).sum(dim=-1) / total
 
     def _log_hold_joint_quiet_extras(self, ctx):
         """Held-reference joint velocity in rad/s -- the FIX A go/no-go stat.
