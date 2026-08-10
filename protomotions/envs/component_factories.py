@@ -3196,11 +3196,19 @@ def anchor_ori_metric_factory(threshold: float = None) -> MdpComponent:
     )
 
 
-def relative_body_pos_metric_factory(threshold: float = None) -> MdpComponent:
+def relative_body_pos_metric_factory(
+    threshold: float = None, body_indices=None
+) -> MdpComponent:
     """Factory for max relative body position error metric.
 
     Args:
         threshold: If set, fail when max error > threshold.
+        body_indices: Optional body subset to reduce the max over (v64). None
+            (default) = all bodies = byte-identical to the pre-v64 metric, so
+            every existing evaluation_components entry is unaffected. Pass a
+            subset to get a per-group eval surface for a body-restricted reward
+            term (READER/WRITER LAW: a reward channel must ship with the metric
+            that lets us read it per category).
 
     Returns:
         MdpComponent configured for relative body position error evaluation.
@@ -3210,6 +3218,8 @@ def relative_body_pos_metric_factory(threshold: float = None) -> MdpComponent:
     static_params = {}
     if threshold is not None:
         static_params["threshold"] = threshold
+    if body_indices is not None:
+        static_params["body_indices"] = body_indices
     return MdpComponent(
         compute_func=relative_body_pos_max_error,
         dynamic_vars={

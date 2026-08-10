@@ -201,6 +201,7 @@ def relative_body_pos_max_error(
     current_anchor_rot: Tensor,
     ref_rigid_body_rot: Tensor,
     anchor_idx: int,
+    body_indices: Optional[Tensor] = None,
 ) -> Tensor:
     """Maximum relative body position error in heading-aligned frame.
 
@@ -211,6 +212,15 @@ def relative_body_pos_max_error(
         current_anchor_rot: Current anchor rotation [num_envs, 4] (w-last).
         ref_rigid_body_rot: Reference body rotations [num_envs, num_bodies, 4] (w-last).
         anchor_idx: Index of anchor body.
+        body_indices: Optional body subset to reduce the max over (v64). None
+            (default) = all bodies = byte-identical to the pre-v64 kernel. The
+            frame construction is UNCHANGED and still uses the full body set --
+            only the final max() is restricted -- so a subset metric is directly
+            comparable to the whole-body one. This exists so that a body-
+            restricted REWARD term (e.g. foot_relative_body_pos) can ship with a
+            matching per-category EVAL surface in the same commit; a reward
+            channel we cannot read per category is how v63's status stayed
+            ambiguous for 200 epochs.
 
     Returns:
         Max body error per env [num_envs] in meters.
@@ -241,6 +251,8 @@ def relative_body_pos_max_error(
     ).reshape(num_envs, num_bodies, 3)
 
     per_body_error = (rel_pos - ref_rel_pos).pow(2).sum(dim=-1).sqrt()
+    if body_indices is not None:
+        per_body_error = per_body_error[:, body_indices]
     return per_body_error.max(dim=-1)[0]
 
 
