@@ -3,6 +3,27 @@
 
 """Env-var gate for MARIONETTE actuator-gain / effort-limit DR (GAIN-DR).
 
+.. warning::
+
+   **The MARIONETTE direction is DEAD as of 2026-08-10.** Soft/low-stiffness
+   gains, a compliant or backdrivable upper body, kinesthetic teaching, and
+   gain-tied easing of perturbations are all abandoned: they are *opposed* to
+   the campaign's tight-tracking goal (sub-2cm full-body-with-wrists), not
+   merely deprioritized.
+
+   This module is NOT dead. It is live, and it is what holds actuator gain DR
+   at the tight-tracking band **0.7-1.3** on both the fresh-build and resume
+   paths. Gain DR survives strictly as **sim2real robustness** -- the real
+   plant is not the sim plant -- and must not be widened downward toward
+   compliance. Dead are the SOFT uses of it: ``PM_GAIN_DR_LOW=0.2``, the
+   per-group waist/arm soft bands, the effort-limit axis, and
+   ``PM_PERTURB_GAIN_EXP != 0``. None of those has ever run on a shipped run.
+
+   The knobs are documented rather than deleted because live code reads them.
+   Authoritative note: imprint ``docs/curric-dawn/DAWN2.md`` section
+   *DEAD DIRECTIONS*. Guard:
+   ``protomotions/tests/test_actuator_gain_dr.py::test_marionette_gain_floor_is_dead``.
+
 ONE implementation shared by BOTH wiring paths, so the fresh-build gate and
 the resume re-apply row can never drift apart:
 

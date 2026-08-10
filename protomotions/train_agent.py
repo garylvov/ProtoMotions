@@ -982,6 +982,12 @@ def main():
 
         # PM_GAIN_DR_LOW / PM_GAIN_DR_HIGH (env-gated, resume-safe):
         # MARIONETTE-mode actuator-gain DR range widening (2026-08-04).
+        # DIRECTION DEAD 2026-08-10: soft/compliant gains are abandoned (they
+        # oppose the tight-tracking goal). This re-apply row is STILL LIVE --
+        # it is what holds the band at the tight-tracking 0.7-1.3 across a
+        # resume. Dead are the SOFT settings: LOW=0.2, per-group waist/arm
+        # bands, the effort axis, PM_PERTURB_GAIN_EXP != 0. Authoritative note:
+        # imprint docs/curric-dawn/DAWN2.md, section DEAD DIRECTIONS.
         # simulator_config is frozen from the pickle, so teacher.py's
         # fresh-build gate never runs on a resume -- re-apply the sampled
         # gain-scale range here. The simulator is rebuilt from

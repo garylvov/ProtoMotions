@@ -695,6 +695,13 @@ class Simulator(RecordingMixin, ABC):
         """MARIONETTE coupling (2026-08-04): per-env perturbation scale tied
         to the episode's sampled actuator-gain scale.
 
+        DEAD DIRECTION (2026-08-10). Easing perturbations on soft-plant envs
+        is part of the abandoned marionette/compliance line, which is opposed
+        to the tight-tracking goal. ``PM_PERTURB_GAIN_EXP`` is 0 on every live
+        run, so this returns None and the whole coupling is inert. Kept, not
+        deleted, because the call sites still reference it. Authoritative
+        note: imprint ``docs/curric-dawn/DAWN2.md`` section DEAD DIRECTIONS.
+
         ``multiplier_e = clamp(g_e ** PM_PERTURB_GAIN_EXP,
         PM_PERTURB_SCALE_MIN, 1.0)`` where ``g_e`` is the per-env geometric
         mean of the GAIN-DR stiffness scales (``env_gain_scale``, stamped by
@@ -2482,6 +2489,11 @@ class Simulator(RecordingMixin, ABC):
         else:
             damping_scales = _sample(d_lo, d_hi, group_damping)
 
+        # EFFORT-LIMIT axis -- DEAD DIRECTION (2026-08-10). It exists only to
+        # serve the abandoned KINESTHETIC TEACHING / compliance line and has
+        # NEVER been enabled on any run: no config sets effort_limit_scale_range
+        # and the launcher never exports PM_EFFORT_DR_*. Do not enable it as a
+        # compliance knob. See imprint docs/curric-dawn/DAWN2.md, DEAD DIRECTIONS.
         # EFFORT-LIMIT axis (KINESTHETIC TEACHING 2026-08-04): long-existing
         # field, first wired to env knobs today. A per-group range turns the
         # axis on even when the global range is None, with (1.0, 1.0) as the

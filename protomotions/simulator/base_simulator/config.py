@@ -374,6 +374,13 @@ class MassScaleDomainRandomizationConfig:
                 raise ValueError(f"{name} must satisfy 0 < min <= max, got {rng}.")
 
 
+# PER-GROUP GAIN-DR -- DEAD DIRECTION (2026-08-10). The marionette / compliant
+# upper body / kinesthetic-teaching line is ABANDONED: it is opposed to the
+# campaign's tight-tracking goal (sub-2cm full-body-with-wrists). These fields
+# are kept because the gain-DR gate still reads them and a dangling reference is
+# worse than a documented dead one, but per-group SOFT bands must not be
+# configured. Global gain DR survives ONLY as sim2real robustness at 0.7-1.3.
+# Authoritative note: imprint docs/curric-dawn/DAWN2.md, section DEAD DIRECTIONS.
 # PER-GROUP GAIN-DR (2026-08-04, marionette upper body): default joint-group
 # regex patterns for the Unitree H1-2 27-DOF actuated set. Used when per-group
 # stiffness/damping ranges are configured and ``group_dof_patterns`` is left
@@ -525,7 +532,9 @@ class ActuatorGainDomainRandomizationConfig:
                 "Per-group EFFORT-LIMIT scale ranges {group_name: (min, max)}; "
                 "groups omitted fall back to effort_limit_scale_range, or to "
                 "the no-op (1.0, 1.0) when that is None. Setting this turns "
-                "the effort axis ON (KINESTHETIC TEACHING 2026-08-04: capping "
+                "the effort axis ON. DEAD DIRECTION 2026-08-10 -- this axis "
+                "exists only for the abandoned KINESTHETIC TEACHING line "
+                "(2026-08-04: capping "
                 "arm torque bounds how hard the robot can fight a human hand "
                 "regardless of kp). None = OFF."
             )
@@ -552,7 +561,9 @@ class ActuatorGainDomainRandomizationConfig:
             "help": (
                 "Which group's geometric-mean stiffness scale becomes the "
                 "per-env aggregate 'env_gain_scale' consumed by the "
-                "MARIONETTE perturbation coupling. None = AUTO: the 'legs' "
+                "MARIONETTE perturbation coupling -- a DEAD DIRECTION as of "
+                "2026-08-10; the coupling is off (PM_PERTURB_GAIN_EXP=0) on "
+                "every live run. None = AUTO: the 'legs' "
                 "group when per-group ranges are active (balance authority "
                 "lives in the legs), else all randomized DOFs (today's "
                 "behavior). 'all' forces the all-DOF geometric mean; any "

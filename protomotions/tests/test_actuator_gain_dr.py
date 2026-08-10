@@ -889,3 +889,146 @@ def test_isaaclab_apply_path_wires_the_effort_axis():
     assert "write_joint_effort_limit_to_sim(new_effort)" in src
     assert "new_effort[:, lab_dof_ids] *= effort_scales" in src
     assert "default_effort_limit_mean" in src  # proof line
+
+
+# ---------------------------------------------------------------------------
+# MARIONETTE IS DEAD (2026-08-10)
+# ---------------------------------------------------------------------------
+# The marionette / compliance / soft-gain / kinesthetic-teaching direction is
+# ABANDONED: it is opposed to the campaign's tight-tracking goal (sub-2cm
+# full-body-with-wrists), not merely deprioritized. Gain DR survives ONLY as
+# sim2real robustness at the tight-tracking bands. The marionette-era floor was
+# 0.2 and it must never come back silently -- a reintroduction would retrain a
+# compliant policy while every dashboard still said "gain DR".
+#
+# Authoritative note: imprint ``docs/curric-dawn/DAWN2.md`` section
+# DEAD DIRECTIONS.
+#
+# These are SOURCE guards, not behavior guards, deliberately: the failure mode
+# is a human editing a value back down, and a source guard fails on the edit
+# itself rather than on the eleventh hour of a compliant training run.
+
+#: Live gain-DR bands, by stage, in imprint's ``stages_night13.py``.
+TIGHT_TRACKING_GAIN_BANDS = {0: (0.9, 1.1), 1: (0.8, 1.2), 2: (0.7, 1.3)}
+
+#: The marionette-era stiffness-scale floor. Never shipped. Must not return.
+MARIONETTE_GAIN_FLOOR = 0.2
+
+
+def _repo_relative(*parts):
+    """Find a file that lives OUTSIDE this package (run tree / imprint repo).
+
+    Mirrors ``test_launcher_no_scratch._launcher``: this package is vendored, so
+    walk up a few levels and take the nearest hit. Skips (does not fail) in a
+    bare ProtoMotions clone, where the imprint-side files simply are not there.
+    """
+    from pathlib import Path
+
+    here = Path(__file__).resolve()
+    for depth in (2, 3, 4, 5):
+        candidate = here.parents[depth].joinpath(*parts)
+        if candidate.is_file():
+            return candidate
+    pytest.skip(
+        f"{'/'.join(parts)} not found next to this checkout (bare ProtoMotions "
+        "clone); this guard runs where the imprint tree actually lives."
+    )
+
+
+def _uncommented(text):
+    """Shell/python source lines with whole-line comments dropped.
+
+    A guard must be able to NAME the value it forbids, and this file's own
+    prose plus the launcher's DEAD-DIRECTION banner both mention 0.2. Only a
+    line that could actually SET the value is a failure.
+    """
+    out = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        out.append(line.split("#", 1)[0] if "#" in line else line)
+    return out
+
+
+def test_marionette_gain_floor_is_dead():
+    """The live gain-DR bands are the tight-tracking values, not marionette's.
+
+    Guards three surfaces at once:
+
+    1. imprint's stage table still carries 0.9-1.1 / 0.8-1.2 / 0.7-1.3.
+    2. The launcher still exports PM_GAIN_DR_LOW=0.7 / HIGH=1.3.
+    3. No live (non-comment) line anywhere in either file sets a gain floor to
+       the marionette 0.2, per-group soft waist/arm bands, or the effort axis.
+
+    If this fails, someone is reintroducing soft gains. That is a decision for
+    the owner, who has reversed it twice -- not a test to update.
+    """
+    stages = _repo_relative(
+        "src", "imprint", "integrations", "wbc", "training", "stages_night13.py"
+    )
+    stages_text = stages.read_text()
+    for stage, (lo, hi) in sorted(TIGHT_TRACKING_GAIN_BANDS.items()):
+        assert f"{stage}: ({lo}, {hi})" in stages_text, (
+            f"stages_night13.py no longer carries the tight-tracking gain band "
+            f"{stage}: ({lo}, {hi}). Soft gains are a DEAD DIRECTION "
+            f"(DAWN2.md, DEAD DIRECTIONS) -- do not lower this."
+        )
+
+    launcher = _repo_relative("launch_protomotions_ddp.sh")
+    launcher_live = _uncommented(launcher.read_text())
+    joined = "\n".join(launcher_live)
+    assert 'export PM_GAIN_DR_LOW="${PM_GAIN_DR_LOW:-0.7}"' in joined, (
+        "launcher no longer pins PM_GAIN_DR_LOW at the tight-tracking 0.7"
+    )
+    assert 'export PM_GAIN_DR_HIGH="${PM_GAIN_DR_HIGH:-1.3}"' in joined, (
+        "launcher no longer pins PM_GAIN_DR_HIGH at 1.3"
+    )
+    assert 'export PM_PERTURB_GAIN_EXP="${PM_PERTURB_GAIN_EXP:-0}"' in joined, (
+        "the gain/perturbation coupling is a DEAD marionette knob and must stay "
+        "at PM_PERTURB_GAIN_EXP=0 (easing pushes on soft envs trains yielding, "
+        "not tracking)"
+    )
+
+    floor = str(MARIONETTE_GAIN_FLOOR)
+    for path, lines in ((stages, _uncommented(stages_text)), (launcher, launcher_live)):
+        for lineno, line in enumerate(lines, 1):
+            for var in ("PM_GAIN_DR_LOW", "PM_GAIN_DR_KD_LOW", "stiffness_scale_range"):
+                assert not (var in line and floor in line), (
+                    f"{path.name}:{lineno} sets {var} to the marionette-era "
+                    f"{floor}: {line.strip()!r}. The marionette / compliance / "
+                    "soft-gain direction is DEAD (2026-08-10) -- it opposes the "
+                    "tight-tracking goal. See DAWN2.md, DEAD DIRECTIONS."
+                )
+
+
+def test_marionette_soft_knobs_are_not_exported_by_the_launcher():
+    """No per-group soft band and no effort-limit DR is live in the launcher.
+
+    Those knobs exist only to serve kinesthetic teaching / a backdrivable upper
+    body. They are kept in the tree (live code reads their names) but must
+    never be exported. Comment lines are exempt -- the launcher documents them
+    as dead on purpose, and documenting a dead knob is the whole point.
+    """
+    launcher = _repo_relative("launch_protomotions_ddp.sh")
+    dead_prefixes = (
+        "PM_GAIN_DR_LOW_LEGS",
+        "PM_GAIN_DR_HIGH_LEGS",
+        "PM_GAIN_DR_LOW_WAIST",
+        "PM_GAIN_DR_HIGH_WAIST",
+        "PM_GAIN_DR_LOW_ARMS",
+        "PM_GAIN_DR_HIGH_ARMS",
+        "PM_GAIN_DR_KD_",
+        "PM_EFFORT_DR_",
+        "PM_GAIN_DR_CONSTANT_ZETA",
+        "PM_GAIN_DR_ENV_SCALE_SOURCE",
+    )
+    for lineno, line in enumerate(_uncommented(launcher.read_text()), 1):
+        if not line.strip().startswith("export "):
+            continue
+        for knob in dead_prefixes:
+            assert knob not in line, (
+                f"launch_protomotions_ddp.sh:{lineno} exports {knob}, a DEAD "
+                f"marionette/kinesthetic-teaching knob: {line.strip()!r}. "
+                "See DAWN2.md, DEAD DIRECTIONS."
+            )
