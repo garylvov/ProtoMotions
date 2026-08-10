@@ -207,6 +207,7 @@ def test_resume_reapply_accepts_the_string_kernel_knob():
     comp = factories.hold_joint_quiet_factory(weight=0.25)
     components = {"hold_joint_quiet": comp}
     env = {
+        "PM_RESUME_INJECT_COMPONENTS": "1",
         "PM_HOLD_JOINT_QUIET_WEIGHT": "0.25",
         "PM_HOLD_JOINT_QUIET_KERNEL": "lorentzian",
         "PM_HOLD_JOINT_QUIET_VEL_SCALE": "0.25",
@@ -229,6 +230,7 @@ def test_resume_reapply_accepts_the_string_kernel_knob():
 def test_resume_reapply_injects_a_tuned_component_from_scratch():
     components = {}
     env = {
+        "PM_RESUME_INJECT_COMPONENTS": "1",
         "PM_HOLD_JOINT_QUIET_WEIGHT": "0.25",
         "PM_HOLD_JOINT_QUIET_KERNEL": "lorentzian",
         "PM_HOLD_JOINT_QUIET_VEL_SCALE": "0.25",

@@ -811,9 +811,15 @@ def main():
                 # artifact anyone reads to confirm what the reward became.
                 from protomotions.envs.component_factories import (
                     RESUME_INJECTABLE_COMPONENTS as _INJECTABLE,
+                    resume_inject_gate_requested as _inject_armed,
                 )
 
-                if _comp in _INJECTABLE:
+                # READER/WRITER LAW: "the pass below will create it" is only
+                # true when the injection pass is actually ARMED. With
+                # PM_RESUME_INJECT_COMPONENTS unset the pass is a hard no-op,
+                # so promising a later RESUME INJECT line would be a lie in the
+                # one artifact anyone reads to confirm what the reward became.
+                if _comp in _INJECTABLE and _inject_armed():
                     log.warning(
                         f"RESUME override DEFERRED: {_var}={_val} is set and "
                         f"reward component '{_comp}' is absent from the frozen "
@@ -1036,6 +1042,13 @@ def main():
         # component is absent. hold_balance / root_gain need no row here: the
         # HOLD-FIX boot path reads HOLD_BALANCE_BONUS / ROOT_GAIN_REWARD live
         # at env construction, which is rebuilt on every resume.
+        #
+        # OPT-IN SINCE 2026-08-10: the whole pass is a hard no-op unless
+        # PM_RESUME_INJECT_COMPONENTS is armed. Before that gate, any lane that
+        # sourced launch_protomotions_ddp.sh (which exports the three weight
+        # defaults) inherited injection by omission -- the 2026-08-10 smoke ate
+        # 12 RESUME INJECT lines into a student whose frozen config had no
+        # reward components at all.
         from protomotions.envs.component_factories import (
             resume_inject_reward_components,
         )

@@ -433,6 +433,7 @@ def test_resume_inject_reward_components_v54_dormant_activation():
     frozen = {"some_existing": factories.pow_rew_factory(weight=-1e-4)}
     lines = []
     env = {
+        "PM_RESUME_INJECT_COMPONENTS": "1",
         "PM_CONTACT_MATCH_WEIGHT": "0.1",
         "PM_CONTACT_MATCH_REF_THRESHOLD": "0.6",
         "PM_LIFTOFF_PENALTY_WEIGHT": "-0.5",
@@ -1117,11 +1118,12 @@ def test_resume_inject_hold_joint_quiet_is_byte_identical_when_unset():
     lines = []
 
     # Neither the weight knob nor its companions may do anything on their own.
+    _G = {"PM_RESUME_INJECT_COMPONENTS": "1"}
     for env in (
-        {},
-        {"PM_HOLD_JOINT_QUIET_WEIGHT": ""},
-        {"PM_HOLD_JOINT_QUIET_VEL_SCALE": "150"},
-        {"PM_HOLD_JOINT_QUIET_JOINTS": "arms"},
+        dict(_G),
+        dict(_G, PM_HOLD_JOINT_QUIET_WEIGHT=""),
+        dict(_G, PM_HOLD_JOINT_QUIET_VEL_SCALE="150"),
+        dict(_G, PM_HOLD_JOINT_QUIET_JOINTS="arms"),
     ):
         assert (
             factories.resume_inject_reward_components(
@@ -1141,7 +1143,7 @@ def test_resume_inject_hold_joint_quiet_activates_patches_and_fails_loud():
     lines = []
     assert factories.resume_inject_reward_components(
         frozen,
-        env={"PM_HOLD_JOINT_QUIET_WEIGHT": "0.25"},
+        env={"PM_RESUME_INJECT_COMPONENTS": "1", "PM_HOLD_JOINT_QUIET_WEIGHT": "0.25"},
         log_fn=lines.append,
     )
     comp = frozen["hold_joint_quiet"]
@@ -1159,6 +1161,7 @@ def test_resume_inject_hold_joint_quiet_activates_patches_and_fails_loud():
     assert factories.resume_inject_reward_components(
         frozen,
         env={
+            "PM_RESUME_INJECT_COMPONENTS": "1",
             "PM_HOLD_JOINT_QUIET_WEIGHT": "0.15",
             "PM_HOLD_JOINT_QUIET_VEL_SCALE": "150",
         },
@@ -1178,6 +1181,7 @@ def test_resume_inject_hold_joint_quiet_activates_patches_and_fails_loud():
         factories.resume_inject_reward_components(
             frozen,
             env={
+                "PM_RESUME_INJECT_COMPONENTS": "1",
                 "PM_HOLD_JOINT_QUIET_WEIGHT": "0.15",
                 "PM_HOLD_JOINT_QUIET_VEL_SCALE": "150",
             },
@@ -1192,6 +1196,7 @@ def test_resume_inject_hold_joint_quiet_activates_patches_and_fails_loud():
     factories.resume_inject_reward_components(
         frozen2,
         env={
+            "PM_RESUME_INJECT_COMPONENTS": "1",
             "PM_HOLD_JOINT_QUIET_WEIGHT": "0.25",
             "PM_HOLD_JOINT_QUIET_JOINTS": "legs,waist",
         },
@@ -1209,6 +1214,7 @@ def test_resume_inject_hold_joint_quiet_activates_patches_and_fails_loud():
         factories.resume_inject_reward_components(
             {},
             env={
+                "PM_RESUME_INJECT_COMPONENTS": "1",
                 "PM_HOLD_JOINT_QUIET_WEIGHT": "0.25",
                 "PM_HOLD_JOINT_QUIET_JOINTS": "arms",
             },
@@ -1225,6 +1231,7 @@ def test_resume_inject_hold_joint_quiet_activates_patches_and_fails_loud():
     factories.resume_inject_reward_components(
         frozen3,
         env={
+            "PM_RESUME_INJECT_COMPONENTS": "1",
             "PM_CONTACT_MATCH_WEIGHT": "0.1",
             "PM_CONTACT_MATCH_REF_THRESHOLD": "0.6",
         },

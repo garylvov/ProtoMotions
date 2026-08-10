@@ -721,6 +721,79 @@ RESUME_INJECTABLE_COMPONENTS = (
     "hold_joint_quiet",
 )
 
+#: The ONE explicit opt-in that lets a RESUME mutate the frozen reward
+#: composition at all. See ``resume_inject_gate_requested`` for the full
+#: rationale.
+RESUME_INJECT_GATE_VAR = "PM_RESUME_INJECT_COMPONENTS"
+
+#: The weight env var that arms each injectable component. Enumerated here (not
+#: derived from the local ``specs`` table inside the function) so the SKIPPED
+#: proof line can name a set-but-inert var even on the path that returns before
+#: ``specs`` is ever built. ``test_resume_inject_gate.py`` pins the two tables
+#: against each other so they cannot drift.
+RESUME_INJECTABLE_WEIGHT_VARS = {
+    "contact_match": "PM_CONTACT_MATCH_WEIGHT",
+    "liftoff_penalty": "PM_LIFTOFF_PENALTY_WEIGHT",
+    "action_smooth_lme": "PM_ACTION_SMOOTH_LME_WEIGHT",
+    "hold_joint_quiet": "PM_HOLD_JOINT_QUIET_WEIGHT",
+}
+
+_RESUME_INJECT_GATE_TRUE = frozenset({"1", "true", "yes", "on"})
+_RESUME_INJECT_GATE_FALSE = frozenset({"", "0", "false", "no", "off"})
+
+
+def resume_inject_gate_requested(env=None) -> bool:
+    """Is resume-time reward-component mutation EXPLICITLY opted into?
+
+    WHY THIS GATE EXISTS (2026-08-10)
+    ---------------------------------
+    ``resume_inject_reward_components`` CREATES reward components that the
+    frozen config does not have, purely because a ``PM_*_WEIGHT`` env var
+    happens to be set. ``launch_protomotions_ddp.sh`` exports defaults for
+    three of them (``PM_CONTACT_MATCH_WEIGHT=0.1``,
+    ``PM_LIFTOFF_PENALTY_WEIGHT=-0.5``, ``PM_ACTION_SMOOTH_LME_WEIGHT=-0.1``),
+    so EVERY lane that sources that launcher and then resumes anything used to
+    inherit injection *by omission*. The only thing suppressing it was
+    ``launch_mm_v2.sh`` exporting the three vars as empty strings -- a trick no
+    other caller performs. The 2026-08-10 4-rank masked-mimic smoke proved the
+    leak: 12 ``RESUME INJECT`` lines (3 components x 4 ranks) added teacher
+    reward terms to a pure-supervision student whose frozen config had none.
+    That is the "correct-looking logs, wrong run" failure class: a resumed run
+    whose reward composition silently differs from the config it claims to
+    continue.
+
+    So injection is now OPT-IN and nothing else. Set
+    ``PM_RESUME_INJECT_COMPONENTS=1`` to arm it; absent (or ``0``/``false``/
+    ``no``/``off``/empty) means the whole pass is a HARD NO-OP -- not one key
+    written, not one component created, not one weight patched.
+
+    WHY THE GATE ALSO COVERS THE "RESUME override" PATCH PATH. Patching the
+    weight of an already-present component looks safer than creating one, but
+    it is the same defect wearing a different hat: a lane that never asked to
+    touch rewards must not silently re-price the frozen ones just because a
+    launcher it sourced exports a default. One gate, one meaning: "this resume
+    is allowed to change the frozen reward composition".
+
+    Anything other than a recognized true/false spelling is a hard ``ValueError``
+    -- a gate you can typo into silence is not a gate.
+    """
+    import os
+
+    if env is None:
+        env = os.environ
+    raw = (env.get(RESUME_INJECT_GATE_VAR) or "").strip().lower()
+    if raw in _RESUME_INJECT_GATE_TRUE:
+        return True
+    if raw in _RESUME_INJECT_GATE_FALSE:
+        return False
+    raise ValueError(
+        f"{RESUME_INJECT_GATE_VAR}={env.get(RESUME_INJECT_GATE_VAR)!r} is not a "
+        "recognized boolean: use one of "
+        f"{sorted(_RESUME_INJECT_GATE_TRUE)} to ARM resume-time reward-component "
+        f"injection, or one of {sorted(_RESUME_INJECT_GATE_FALSE - {''})}/unset to "
+        "leave the frozen reward composition alone."
+    )
+
 
 def resume_inject_reward_components(
     reward_components,
@@ -789,6 +862,28 @@ def resume_inject_reward_components(
 
     if env is None:
         env = os.environ
+
+    # ---- EXPLICIT OPT-IN GATE (2026-08-10) ---------------------------------
+    # Hard no-op unless PM_RESUME_INJECT_COMPONENTS is armed, so no lane can
+    # inherit reward-composition surgery from a launcher default it merely
+    # sourced. A set-but-inert weight var is never silent: it earns ONE loud
+    # SKIPPED line naming every var it disarmed. See
+    # ``resume_inject_gate_requested`` for the full rationale.
+    if not resume_inject_gate_requested(env):
+        inert = [
+            v for v in RESUME_INJECTABLE_WEIGHT_VARS.values() if env.get(v)
+        ]
+        if inert:
+            log_fn(
+                "RESUME INJECT SKIPPED: "
+                + ", ".join(f"{v}={env.get(v)!r}" for v in inert)
+                + f" set, but {RESUME_INJECT_GATE_VAR} is not armed -- NO reward "
+                "component was injected or re-weighted; this resume keeps the "
+                "frozen reward composition exactly. Set "
+                f"{RESUME_INJECT_GATE_VAR}=1 if you really meant to change the "
+                "reward of a resumed run."
+            )
+        return False
 
     def _build_contact_match(weight, env):
         return contact_match_rew_factory(
@@ -3260,6 +3355,9 @@ __all__ = [
     "reference_contact_liftoff_penalty_factory",
     "graced_action_smoothness_lme_factory",
     "resume_inject_reward_components",
+    "resume_inject_gate_requested",
+    "RESUME_INJECT_GATE_VAR",
+    "RESUME_INJECTABLE_WEIGHT_VARS",
     "contact_force_change_rew_factory",
     "target_reward_factory",
     "steering_reward_factory",
