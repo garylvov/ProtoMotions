@@ -594,9 +594,10 @@ class SupervisedAgent(BaseAgent):
             # Untouched stock path: delegate so the unweighted loss value stays
             # bit-identical to F.mse_loss, and only ADD the reader.
             loss, metrics = compute_supervision_loss(batch_td, loss_config)
-            metrics.update(
-                self._dof_group_mse_metrics((prediction - target).pow(2), prefix)
-            )
+            squared_error = (prediction - target).pow(2)
+            with torch.no_grad():
+                metrics[f"{prefix}/mse_unweighted"] = squared_error.mean().detach()
+            metrics.update(self._dof_group_mse_metrics(squared_error, prefix))
             return loss, metrics
 
         weights = torch.as_tensor(
@@ -620,6 +621,16 @@ class SupervisedAgent(BaseAgent):
             f"{prefix}/mse": raw_loss.detach(),
             f"{prefix}/loss": weighted_loss.detach(),
         }
+        # CONTINUITY: `{prefix}/mse` is the objective actually minimized, so it
+        # CHANGES MEANING the moment weights go active -- a reader comparing it
+        # against a pre-weighting run would see a step at the resume boundary
+        # that is a redefinition, not a regression. `{prefix}/mse_unweighted` is
+        # the flat mean over all DOFs, logged on BOTH paths, so it stays
+        # directly comparable to every epoch of history logged before this
+        # change existed (e.g. mm_canonical_v1, whose tfevents carry only the
+        # aggregate `masked_mimic/mse` and no per-group breakdown at all).
+        with torch.no_grad():
+            metrics[f"{prefix}/mse_unweighted"] = squared_error.mean().detach()
         metrics.update(self._dof_group_mse_metrics(squared_error, prefix))
         return weighted_loss, metrics
 

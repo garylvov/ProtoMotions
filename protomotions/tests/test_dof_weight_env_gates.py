@@ -381,6 +381,34 @@ def test_per_group_mse_is_logged_even_when_weights_are_absent():
         assert torch.allclose(stock_log[key], weighted_log[key])
 
 
+def test_unweighted_aggregate_mse_is_logged_on_both_paths_for_continuity():
+    """`{prefix}/mse` changes meaning when weights go active; this tag does not.
+
+    mm_canonical_v1's tfevents carry ONLY the aggregate `masked_mimic/mse` and
+    no per-group breakdown, so `masked_mimic/mse_unweighted` is the single tag
+    that stays comparable across the weighting boundary. Without it the one
+    recoverable piece of pre-change history would be unreadable.
+    """
+    batch = _batch(seed=21)
+    expected = F.mse_loss(batch["raw_action"], batch["expert_actions"])
+
+    _, stock_log = _make_agent(_IdentityPolicy()).supervised_step(dict(batch))
+    weights = resolve_dof_weights("default", H1_2_DOF_NAMES)
+    _, weighted_log = _make_agent(
+        _IdentityPolicy(), action_dim_weights=weights
+    ).supervised_step(dict(batch))
+
+    for log_dict in (stock_log, weighted_log):
+        assert torch.allclose(
+            log_dict["masked_mimic/mse_unweighted"], expected, rtol=0.0, atol=1e-6
+        )
+
+    # ...while `{prefix}/mse` legitimately differs, because it IS the objective.
+    assert not torch.allclose(
+        weighted_log["masked_mimic/mse"], stock_log["masked_mimic/mse"]
+    )
+
+
 def test_per_group_mse_matches_a_hand_computed_group_mean():
     batch = _batch(seed=9)
     agent = _make_agent(_IdentityPolicy())
@@ -604,6 +632,22 @@ def test_stage_resume_config_can_bake_weights_into_the_frozen_pickle():
     assert "resolve_dof_weights" in text
     assert "validate_dof_weights" in text
     assert "action_dim_weights did not survive the round-trip" in text
+    # Same trap, same tool: config.yaml's saved ngpu is written back onto args
+    # on resume, so --ngpu on the train_agent command line is inert too.
+    assert "--ngpu" in text
+    assert "ngpu did not survive the round-trip" in text
+
+
+def test_saved_args_restore_on_resume_covers_ngpu_and_num_envs():
+    """Pin WHY --ngpu must be staged: resume restores it from config.yaml.
+
+    ``detect_checkpoint_mode`` skips only wandb_id / create_config_only /
+    checkpoint; every other saved key -- ngpu and num_envs included -- is
+    written back onto args, overwriting the command line.
+    """
+    text = _read("protomotions", "train_agent.py")
+    assert '_SKIP_RESTORE = {"wandb_id", "create_config_only", "checkpoint"}' in text
+    assert "if key not in _SKIP_RESTORE:" in text
 
 
 def test_weights_survive_a_resolved_configs_round_trip(tmp_path):
