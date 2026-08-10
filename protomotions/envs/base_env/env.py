@@ -1175,6 +1175,11 @@ class BaseEnv:
         # outside _log_hold_fix_extras as the stat above.
         self._log_hold_joint_quiet_extras(self._current_context)
 
+        # PER-DOF JOINT ERROR in RADIANS for the DOF-restricted joint-space term
+        # (no-op unless leg_dof_pos_track is registered). Same placement
+        # rationale as the stats around it.
+        self._log_leg_dof_pos_track_extras(self._current_context)
+
         # FALL-PENALTY visibility (2026-07-10 convene follow-up): the per-env
         # raw_r mean dilutes rare falls to 0.000 at TB precision; log the raw
         # firing COUNT per step across the batch so the tag is visibly alive.
@@ -1862,6 +1867,84 @@ class BaseEnv:
                 self.extras["relative_body_pos/err_m_weighted"] = (
                     distance * weights
                 ).sum(dim=-1) / total
+
+    def _log_leg_dof_pos_track_extras(self, ctx):
+        """PER-DOF joint error in RADIANS for ``leg_dof_pos_track`` -- the v67
+        go/no-go stat, and the fix for a reader that silently did not exist.
+
+        WHAT WENT WRONG IN v66'. The term shipped with an EVAL surface
+        (``eval/leg_dof_pos_track/{mean,min,max}``, registered unconditionally in
+        ``evaluation_components``) and that surface works: it read 0.21393 rad at
+        epoch 100 and 0.20089 by epoch 250. But the evaluator only runs every
+        ``eval_metrics_every`` epochs -- FOUR points across 297 epochs -- so the
+        term's physical error was not readable during training at all, and
+        nothing was ever written under ``env/leg_dof_pos_track/err_rad_mean``,
+        which lives in this per-epoch ``extras`` namespace instead. Querying that
+        tag returned nan. The metric was not dead; the READER and the WRITER were
+        in two different namespaces, which is the same class of defect the
+        reader/writer law exists to prevent and is why this stat now exists.
+
+        WHY IT IS NEEDED AT ALL. The reward is ``exp(-e/sigma^2)`` with ``e`` the
+        mean squared per-DOF error, so its own value is a poor progress read and
+        an ambiguous one: a rise can mean the knee tracking improved OR that the
+        clip mix shifted. This logs the RAW error the term is built on, in
+        radians, per epoch, which is the quantity the crouch-depth argument is
+        actually about (knee error -0.3756 rad at the deepest frames).
+
+        Four stats, because the mean alone hides the thing we care about:
+        - ``leg_dof_pos_track/err_rad``      MEAN |error| over the scored DOFs.
+        - ``leg_dof_pos_track/err_max_rad``  WORST single scored DOF -- the knee,
+          on the frames that decide crouch depth.
+        - ``leg_dof_pos_track/err_sq_rad2``  the mean SQUARED error, i.e. exactly
+          the ``e`` the kernel exponentiates. Logged so the reward value and the
+          physical error can be reconciled without inverting a Gaussian by hand,
+          and so a sigma re-derivation can be done from the run's own data.
+        - ``leg_dof_pos_track/knee_err_rad`` SIGNED mean error of the first
+          scored DOF pair (the knees). Sign matters and magnitude destroys it:
+          the whole finding is that the knee is UNDER-flexed (-0.3756 rad), and
+          an absolute value cannot distinguish that from over-flexion.
+
+        The DOF subset is read from the REWARD COMPONENT's own ``indices``, never
+        re-derived here, so the stat and the reward can never drift apart.
+
+        Written ONLY when the reward component is registered, so unset configs
+        emit no new keys (Rule 10) and pay no cost; the UNCONDITIONAL baseline
+        surface remains ``eval/leg_dof_pos_track/*``. Values are Tensors (a
+        python float is silently dropped by the agent's extras aggregator) and
+        avoid the ``raw/`` prefix (which the aggregator skips).
+
+        TB tags: ``env/leg_dof_pos_track/err_rad_mean`` (primary),
+        ``env/leg_dof_pos_track/err_max_rad_mean``,
+        ``env/leg_dof_pos_track/err_sq_rad2_mean``,
+        ``env/leg_dof_pos_track/knee_err_rad_mean``.
+        """
+        component = (self.config.reward_components or {}).get("leg_dof_pos_track")
+        if component is None:
+            return
+        mimic = getattr(ctx, "mimic", None)
+        if mimic is None or mimic.ref_state is None:
+            return
+        ref_dof_pos = getattr(mimic.ref_state, "dof_pos", None)
+        if ref_dof_pos is None:
+            return
+        current = ctx.current.dof_pos
+        indices = component.static_params.get("indices")
+        if indices is not None:
+            indices = [int(i) for i in indices]
+            current = current[:, indices]
+            reference = ref_dof_pos[:, indices]
+        else:
+            reference = ref_dof_pos
+        signed = current - reference
+        error = signed.abs()
+        self.extras["leg_dof_pos_track/err_rad"] = error.mean(dim=-1)
+        self.extras["leg_dof_pos_track/err_max_rad"] = error.max(dim=-1).values
+        self.extras["leg_dof_pos_track/err_sq_rad2"] = signed.pow(2).mean(dim=-1)
+        # The teacher orders the subset knees-first (LEG_DOF_NAMES), so the
+        # leading pair is the knee pair. Guarded by name on the teacher side;
+        # here we only take what the component actually scored.
+        if signed.shape[-1] >= 2:
+            self.extras["leg_dof_pos_track/knee_err_rad"] = signed[:, :2].mean(dim=-1)
 
     def _log_hold_joint_quiet_extras(self, ctx):
         """Held-reference joint velocity in rad/s -- the FIX A go/no-go stat.
