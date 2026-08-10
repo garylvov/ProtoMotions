@@ -267,6 +267,14 @@ class BaseEnv:
 
         if self.motion_lib.num_motions() > 0:
             self._validate_motion_lib_compatibility()
+            # Boot-time consistency pass (a): does the REFERENCE enter a band
+            # that limits_dof_pos penalises? Log-only, never raises. See
+            # DAWN2.md "PATTERN: silent config contradictions".
+            from protomotions.envs.utils.reference_penalty_overlap import (
+                check_from_env as _check_reference_penalty_overlap,
+            )
+
+            _check_reference_penalty_overlap(self, print)
             self.create_motion_manager()
             self._init_mirror_maps()
         else:

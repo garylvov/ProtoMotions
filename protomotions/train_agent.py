@@ -603,6 +603,13 @@ def main():
     global parser, args
     torch.set_float32_matmul_precision("high")
 
+    # Default-provenance report: which PM_* config the OPERATOR chose vs which
+    # the launcher defaulted, and which of those defaults shadow a documented
+    # curriculum. Read-only; see protomotions/utils/default_provenance.py.
+    from protomotions.utils.default_provenance import report as _provenance_report
+
+    _provenance_report(log.info)
+
     # ===================================================================
     # 1. Setup: Detect Checkpoint Mode
     # ===================================================================
