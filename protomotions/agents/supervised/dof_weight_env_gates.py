@@ -28,7 +28,7 @@ Interface
 ---------
 ``PM_MM_DOF_WEIGHTS`` -- comma-separated ``glob=weight`` pairs, e.g.::
 
-    PM_MM_DOF_WEIGHTS='*_wrist_*=4.0,*_elbow_*=2.0,*_shoulder_*=1.5'
+    PM_MM_DOF_WEIGHTS='torso_joint=4.0,*_shoulder_*=3.0,*_elbow_*=1.5'
 
 The literal value ``default`` expands to :data:`DEFAULT_DOF_WEIGHT_SPEC`, which
 is exactly the profile above. Any DOF matched by no pattern keeps weight 1.0.
@@ -101,33 +101,63 @@ DOF_WEIGHT_SPEC_VAR = "PM_MM_DOF_WEIGHTS"
 
 #: Recommended starting profile, also what ``PM_MM_DOF_WEIGHTS=default`` means.
 #:
-#: Sizing (H1-2, 27 DOFs: 12 leg, 1 waist, 6 shoulder, 2 elbow, 6 wrist):
-#: sum(w) = 6*4.0 + 2*2.0 + 6*1.5 + 13*1.0 = 50.0, so the normalized gradient
-#: share moves wrists 22.2% -> 48.0%, elbows 7.4% -> 8.0%, shoulders 22.2% ->
-#: 18.0%, and legs+waist 48.1% -> 26.0%. That roughly inverts the DOF-count and
-#: variance imbalance behind the 10%-vs-88% wrist-capture gap without starving
-#: locomotion, which currently WORKS (backward_locomotion 7.71 cm, static_hold
-#: 8.25 cm) and must not regress -- the lower body keeps a quarter of the
-#: gradient, and this lands on a RESUME from an already-competent policy rather
-#: than on a cold start. A more aggressive wrist weight (8.0 puts wrists at 65%
-#: and legs at 18%) is deliberately NOT the default: the per-group readout
-#: below is the instrument that makes the next step data-driven instead of
-#: another guess.
+#: CORRECTED 2026-08-10 by direct measurement. READ THE TABLE BEFORE EDITING.
 #:
-#: MEASURED CORRECTION (2026-08-10, ws4 smoke at ep7902): those percentages
-#: assume EQUAL per-DOF error and the real errors are not equal -- wrists sit at
-#: mse 0.0089 against 0.0392 for legs. Realized shares are therefore wrists
-#: 7.3% -> 21.1% and legs 63.9% -> 46.5%. The flat loss was starving the wrists
-#: 3x harder than the DOF-count argument suggested, and this profile is
-#: correspondingly LESS aggressive than it looks. Read mse_group/* before
-#: concluding it is enough.
+#: The obvious profile -- upweight the wrists, because the campaign metric is
+#: called "wrist error" -- is WRONG, and the group name is what makes it look
+#: right. An exact Jacobian decomposition on the real H1-2 kinematics
+#: (``hinge_axes_map`` axes + the canonical_eval_v1 reference body poses, all
+#: 284 clips) attributes the metric's error variance like this:
 #:
-#: ``torso_joint`` stays at 1.0 on purpose. The wrist reaches partly THROUGH
-#: the waist, so upweighting it is tempting, but it is also the single joint
-#: whose posture the locomotion and static-hold categories are most sensitive
-#: to, and it is one DOF against six wrists -- poor return for the regression
-#: risk.
-DEFAULT_DOF_WEIGHT_SPEC = "*_wrist_*=4.0,*_elbow_*=2.0,*_shoulder_*=1.5"
+#:   group      n   lever arm (m/rad)   share of wrist-POSITION error variance
+#:   ---------  --  -----------------   --------------------------------------
+#:   shoulders   6        0.2600                     70.2%
+#:   waist       1        0.4157                     24.4%
+#:   elbows      2        0.1504                      4.9%
+#:   wrists      6        0.0202                      0.4%
+#:   legs       12        0.0000                      0.0%
+#:
+#: Two facts drive it:
+#:
+#: 1. The eval metric is PELVIS-ANCHORED and YAW-ALIGNED (mj_metrics.local_frame
+#:    subtracts pelvis position and removes pelvis yaw). From ``parent_indices``
+#:    the pelvis->wrist chain is torso, shoulder p/r/y, elbow, wrist r/p/y --
+#:    the twelve LEG DOFs are not on it and contribute EXACTLY ZERO. Their only
+#:    route is pelvis pitch/roll, and at the measured 0.332 m mean wrist radius
+#:    that would need ~20 deg of sustained pelvis lean to explain even half the
+#:    error, on a policy with a 97.5% success rate. Ruled out.
+#: 2. The scored body is ``*_wrist_yaw_link``, which sits ~2 cm from the wrist
+#:    joints themselves. The wrist DOFs barely move it; the shoulders (0.26 m
+#:    lever) and the single torso joint (0.42 m lever, the largest of any joint)
+#:    place the whole arm.
+#:
+#: The split is GEOMETRY, not error magnitude: recomputing it with an identical
+#: radian error on every joint gives 65.6 / 26.7 / 7.0 / 0.8 / 0.0 -- the same
+#: answer. That agreement is why this is a measurement and not a story.
+#:
+#: So what the campaign calls "wrist error" is an ARM-PLACEMENT metric governed
+#: by shoulders and waist. The profile below targets those. Sizing: sum(w) =
+#: 1*4.0 + 6*3.0 + 2*1.5 + 6*1.0 + 12*1.0 = 43.0. Against the MEASURED per-DOF
+#: errors this moves the realized gradient share of shoulders 20.8% -> 40.9% and
+#: waist 2.7% -> 7.1%, i.e. the two groups carrying 94.6% of the metric's error
+#: go from 23.5% to 48.0% of the gradient, while legs fall 63.9% -> 42.0% and
+#: keep enough to hold locomotion (backward_locomotion 7.71 cm, static_hold 8.25
+#: cm must not regress -- watch mse_group/legs).
+#:
+#: WHY WRISTS STAY AT 1.0 AND MUST NOT BE DRIVEN LOWER. Their 0.4% is a
+#: statement about POSITION only. The recipe conditions on wrist position AND
+#: ORIENTATION, and hand orientation is almost entirely the wrist DOFs -- the
+#: headline metric simply cannot see it. A future reader optimizing the position
+#: number alone will find these six DOFs "useless" and zero them; that would
+#: silently destroy hand orientation while every logged number improved. 1.0
+#: means "no special emphasis", not "unimportant".
+#:
+#: torso_joint is named explicitly rather than by glob: it is a single DOF with
+#: the largest lever on the robot, and it must not be captured by a broad
+#: pattern someone adds later.
+DEFAULT_DOF_WEIGHT_SPEC = (
+    "torso_joint=4.0,*_shoulder_*=3.0,*_elbow_*=1.5,*_wrist_*=1.0"
+)
 
 #: Weight given to a DOF that no pattern matches.
 BASE_DOF_WEIGHT = 1.0

@@ -225,13 +225,19 @@ def test_zero_weight_on_a_group_removes_that_groups_gradient_entirely():
     assert grad[other].abs().sum().item() > 0.0
 
 
-def test_upweighting_wrists_raises_their_share_of_the_gradient():
+def test_profile_raises_the_share_of_the_groups_that_place_the_hand():
     """The default profile really does move gradient toward the hands.
 
     The batch is built with an IDENTICAL per-DOF error so that every DOF's
     gradient magnitude is equal under the stock loss. The measured shares are
-    then exactly the design numbers -- wrists 22.22% -> 48.00% -- rather than
-    an artifact of which DOFs happened to be noisier in this batch.
+    then exactly the design numbers rather than an artifact of which DOFs
+    happened to be noisier in this batch.
+
+    The profile targets SHOULDERS and WAIST, not wrists: an exact Jacobian
+    decomposition attributes 70.2% of wrist-POSITION error variance to the
+    shoulders and 24.4% to the single torso joint, against 0.4% for the wrist
+    DOFs themselves (the scored body sits ~2 cm from them) and 0.0% for the
+    legs (structurally off the pelvis->wrist chain).
     """
     groups = resolve_dof_groups(H1_2_DOF_NAMES)
     batch = _batch(seed=11)
@@ -253,13 +259,21 @@ def test_upweighting_wrists_raises_their_share_of_the_gradient():
     stock = grad_shares(None)
     weighted = grad_shares(resolve_dof_weights(DEFAULT_DOF_WEIGHT_SPEC, H1_2_DOF_NAMES))
 
-    assert stock["wrists"] == pytest.approx(6 / 27, abs=1e-4)
-    assert weighted["wrists"] == pytest.approx(24 / 50, abs=1e-4)
-    assert weighted["elbows"] == pytest.approx(4 / 50, abs=1e-4)
-    assert weighted["shoulders"] == pytest.approx(9 / 50, abs=1e-4)
-    # Locomotion must not be starved: the lower body keeps ~26% of the gradient.
-    assert weighted["lower"] == pytest.approx(13 / 50, abs=1e-4)
-    assert weighted["lower"] > 0.25
+    assert stock["shoulders"] == pytest.approx(6 / 27, abs=1e-4)
+    assert stock["waist"] == pytest.approx(1 / 27, abs=1e-4)
+    # sum(w) = 1*4.0 + 6*3.0 + 2*1.5 + 6*1.0 + 12*1.0 = 43.0
+    assert weighted["shoulders"] == pytest.approx(18 / 43, abs=1e-4)
+    assert weighted["waist"] == pytest.approx(4 / 43, abs=1e-4)
+    assert weighted["elbows"] == pytest.approx(3 / 43, abs=1e-4)
+    # The wrist DOFs are deliberately NOT upweighted -- they move the scored
+    # body by ~2 cm/rad. Their share rises only because sum(w) shrank.
+    assert weighted["wrists"] == pytest.approx(6 / 43, abs=1e-4)
+    # Locomotion must not be starved: the legs keep ~28% of the gradient.
+    assert weighted["legs"] == pytest.approx(12 / 43, abs=1e-4)
+    assert weighted["legs"] > 0.25
+    # The two groups that actually place the hand gain the most.
+    assert weighted["shoulders"] > stock["shoulders"]
+    assert weighted["waist"] > stock["waist"]
 
 
 # ------------------------------------------------------------------- resolution
@@ -289,13 +303,16 @@ def test_default_spec_resolves_to_the_documented_profile():
     assert len(weights) == NUM_ACTIONS
 
     by_name = dict(zip(H1_2_DOF_NAMES, weights))
-    assert by_name["left_wrist_yaw_joint"] == 4.0
-    assert by_name["right_wrist_roll_joint"] == 4.0
-    assert by_name["left_elbow_joint"] == 2.0
-    assert by_name["right_shoulder_pitch_joint"] == 1.5
-    assert by_name["torso_joint"] == BASE_DOF_WEIGHT
+    assert by_name["torso_joint"] == 4.0
+    assert by_name["right_shoulder_pitch_joint"] == 3.0
+    assert by_name["left_elbow_joint"] == 1.5
+    # Wrists at exactly 1.0: no special emphasis, and explicitly NOT lower --
+    # their 0.4% share is a statement about POSITION only, while hand
+    # ORIENTATION is almost entirely these six DOFs and the metric cannot see it.
+    assert by_name["left_wrist_yaw_joint"] == BASE_DOF_WEIGHT
+    assert by_name["right_wrist_roll_joint"] == BASE_DOF_WEIGHT
     assert by_name["left_knee_joint"] == BASE_DOF_WEIGHT
-    assert sum(weights) == pytest.approx(50.0)
+    assert sum(weights) == pytest.approx(43.0)
 
 
 def test_weights_follow_names_not_indices_when_dof_order_changes():
@@ -307,7 +324,8 @@ def test_weights_follow_names_not_indices_when_dof_order_changes():
     reordered = list(reversed(H1_2_DOF_NAMES))
     weights = resolve_dof_weights("default", reordered)
     by_name = dict(zip(reordered, weights))
-    assert by_name["left_wrist_yaw_joint"] == 4.0
+    assert by_name["torso_joint"] == 4.0
+    assert by_name["right_shoulder_roll_joint"] == 3.0
     assert by_name["left_knee_joint"] == BASE_DOF_WEIGHT
 
 
@@ -535,10 +553,10 @@ def test_proof_line_reports_the_shifted_share_and_flags_its_own_caveat():
     text = "\n".join(
         format_dof_weight_proof(weights, H1_2_DOF_NAMES, "LOSS", "test")
     )
-    # wrists: 24/50 = 48.00%, uniform 6/27 = 22.22%
-    assert "48.00%" in text
+    # shoulders: 18/43 = 41.86%, unweighted 6/27 = 22.22%
+    assert "41.86%" in text
     assert "22.22%" in text
-    assert "sum(w)=50.0000" in text
+    assert "sum(w)=43.0000" in text
     # The share is computed from WEIGHTS alone at startup, before any data
     # exists. Measured per-DOF errors are wildly unequal (H1-2 ep7902: wrists
     # mse 0.0089 vs legs 0.0392), so the realized share is ~21%, not 48%. The
