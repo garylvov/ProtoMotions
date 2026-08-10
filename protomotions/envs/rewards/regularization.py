@@ -269,6 +269,9 @@ def compute_soft_pos_limit_rew(
         dof_limits_upper: Upper joint limits [num_dofs].
         soft_margin_frac: Fraction of each joint's range forming the soft
             band at each limit. 0.0 (default) disables the proximity term.
+            May also be a PER-DOF sequence/tensor [num_dofs] (v66) so the band
+            can be tightened on individual joints without unguarding the rest;
+            a scalar behaves exactly as before.
         proximity_scale: Scale on the proximity term (at-limit cost in
             equivalent radians of violation). Ignored when
             ``soft_margin_frac == 0``.
@@ -279,7 +282,24 @@ def compute_soft_pos_limit_rew(
     out_of_limits = -(dof_pos - dof_limits_lower).clip(max=0.0)
     out_of_limits += (dof_pos - dof_limits_upper).clip(min=0.0)
     penalty = torch.sum(out_of_limits, dim=1)
-    if soft_margin_frac > 0.0:
+    # v66: soft_margin_frac may be a PER-DOF sequence/tensor [num_dofs] as well as
+    # a scalar. Scalar path below is untouched and byte-identical. The per-DOF form
+    # exists because this term contradicted the tracking terms on ONE category:
+    # deep_hinge_crouch references sit AT ankle_pitch's -0.897 limit on 10.5% of
+    # (frame,ankle) pairs and inside the 0.05-fraction band (0.0710 rad for that
+    # joint's 1.421 rad range) on 14.0%. Tracking said "go to -0.897"; this term
+    # taxed the last 0.0710 rad, at weight -10. A global margin cannot resolve that
+    # without also unguarding all 27 joints, hence per-DOF.
+    if not isinstance(soft_margin_frac, float):
+        soft_margin_frac = torch.as_tensor(
+            soft_margin_frac, dtype=dof_pos.dtype, device=dof_pos.device
+        )
+    _margin_active = (
+        bool((soft_margin_frac > 0.0).any())
+        if torch.is_tensor(soft_margin_frac)
+        else soft_margin_frac > 0.0
+    )
+    if _margin_active:
         joint_range = dof_limits_upper - dof_limits_lower
         margin = soft_margin_frac * joint_range
         # Fixed joints (upper == lower) have margin 0 -> mask out (div0 guard).
