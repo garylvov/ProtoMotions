@@ -114,6 +114,14 @@ DOF_WEIGHT_SPEC_VAR = "PM_MM_DOF_WEIGHTS"
 #: below is the instrument that makes the next step data-driven instead of
 #: another guess.
 #:
+#: MEASURED CORRECTION (2026-08-10, ws4 smoke at ep7902): those percentages
+#: assume EQUAL per-DOF error and the real errors are not equal -- wrists sit at
+#: mse 0.0089 against 0.0392 for legs. Realized shares are therefore wrists
+#: 7.3% -> 21.1% and legs 63.9% -> 46.5%. The flat loss was starving the wrists
+#: 3x harder than the DOF-count argument suggested, and this profile is
+#: correspondingly LESS aggressive than it looks. Read mse_group/* before
+#: concluding it is enough.
+#:
 #: ``torso_joint`` stays at 1.0 on purpose. The wrist reaches partly THROUGH
 #: the waist, so upweighting it is tempting, but it is also the single joint
 #: whose posture the locomotion and static-hold categories are most sensitive
@@ -340,10 +348,19 @@ def format_dof_weight_proof(
     """Build the loud startup proof lines showing the weights actually in force.
 
     Reports, per group: the weight(s), the DOF count, and the group's share of
-    total gradient BEFORE and AFTER weighting. The share is the number that
-    matters -- it is what the optimizer sees -- and printing the uniform
-    baseline next to it makes an inert gate obvious at a glance (every
-    ``share`` would equal its ``uniform``).
+    the loss AT EQUAL PER-DOF ERROR, against the unweighted baseline. Printing
+    the baseline next to it makes an inert gate obvious at a glance (every
+    ``share`` would equal its ``unweighted``).
+
+    "At equal per-DOF error" is not a hedge, it is the honest caveat: this runs
+    at startup, before any data exists, so it can only report the share implied
+    by the WEIGHTS. The REALIZED share is ``w_d * mse_d`` normalized, and the
+    per-DOF errors are wildly unequal. Measured on H1-2 at ep7902, the six wrist
+    DOFs sit at mse 0.0089 against 0.0392 for the twelve leg DOFs -- so under
+    the old flat loss the wrists earned **7.3%** of the gradient, not the 22.2%
+    their DOF count implies, and the default profile moves them to ~21%, not to
+    48%. That gap is the whole reason the ``mse_group/*`` reader exists: only
+    measurement closes it.
     """
     names = list(dof_names)
     values = [float(w) for w in weights]
@@ -368,14 +385,16 @@ def format_dof_weight_proof(
         kind = "rollup" if group in rollup_names else "group "
         lines.append(
             f"[DOF-WEIGHTS] {label}:   {kind} {group:<10s} n={len(idx):<3d} "
-            f"w={shown:<12s} gradient share {share:6.2f}%  "
-            f"(uniform would be {uniform:6.2f}%)"
+            f"w={shown:<12s} loss share@equal-err {share:6.2f}%  "
+            f"(unweighted would be {uniform:6.2f}%)"
         )
     lines.append(
         f"[DOF-WEIGHTS] {label}: sum(w)={total:.4f} mean(w)={total / n:.4f} "
         f"over {n} DOFs; loss is (((pred-target)**2)*w).sum(-1)/w.sum(), "
         "batch-meaned -- uniform w reproduces F.mse_loss exactly, so loss "
-        "scale and LR meaning are unchanged."
+        "scale and LR meaning are unchanged. NOTE: the shares above assume "
+        "EQUAL per-DOF error; the REALIZED share is w_d*mse_d normalized, and "
+        "per-DOF errors are far from equal -- read mse_group/* for the truth."
     )
     lines.append(
         f"[DOF-WEIGHTS] {label}: per-DOF vector = "

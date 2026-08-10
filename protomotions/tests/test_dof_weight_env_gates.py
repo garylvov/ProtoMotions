@@ -473,7 +473,7 @@ def test_gate_writes_the_resolved_vector_and_a_loud_proof():
     assert "[DOF-WEIGHTS] RESUME" in text
     for group in ("wrists", "elbows", "shoulders", "waist", "legs"):
         assert group in text
-    assert "gradient share" in text
+    assert "loss share@equal-err" in text
     assert "mse_group" in text  # the proof names its own reader
 
 
@@ -530,7 +530,7 @@ def test_gate_raises_on_action_dim_mismatch():
     assert "number_of_actions=42" in str(error.value)
 
 
-def test_proof_line_reports_the_shifted_gradient_share():
+def test_proof_line_reports_the_shifted_share_and_flags_its_own_caveat():
     weights = resolve_dof_weights("default", H1_2_DOF_NAMES)
     text = "\n".join(
         format_dof_weight_proof(weights, H1_2_DOF_NAMES, "LOSS", "test")
@@ -539,6 +539,12 @@ def test_proof_line_reports_the_shifted_gradient_share():
     assert "48.00%" in text
     assert "22.22%" in text
     assert "sum(w)=50.0000" in text
+    # The share is computed from WEIGHTS alone at startup, before any data
+    # exists. Measured per-DOF errors are wildly unequal (H1-2 ep7902: wrists
+    # mse 0.0089 vs legs 0.0392), so the realized share is ~21%, not 48%. The
+    # proof line must say so rather than imply a number it cannot know.
+    assert "EQUAL per-DOF error" in text
+    assert "mse_group" in text
 
 
 # ---------------------------------------------------- non-MSE branches untouched
