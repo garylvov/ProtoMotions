@@ -2682,6 +2682,7 @@ def dof_pos_track_rew_factory(
     sigma: float = 0.35,
     fine_weight: float = 0.0,
     fine_sigma: Optional[float] = None,
+    dof_indices: Optional[List[int]] = None,
 ) -> MdpComponent:
     """Factory for the joint-space (DOF) position tracking reward.
 
@@ -2703,6 +2704,21 @@ def dof_pos_track_rew_factory(
             absent = byte-identical single-sigma term.
         fine_sigma: Narrow companion width (rad); required when
             ``fine_weight`` != 0.
+        dof_indices: Optional DOF subset (v66'). None (default) = ALL dofs =
+            byte-identical to every run before v66', so the shared
+            ``dof_pos_track`` term is untouched. Passed straight through to the
+            kernel's ``indices`` argument, which restricts BOTH the current and
+            the reference side before the mean, so ``e`` becomes the mean
+            squared error over the SUBSET only.
+
+            Why a subset term exists at all: the kernel's argument is
+            ``e / sigma^2`` with ``e`` the MEAN squared per-DOF error, so a
+            27-DOF mean buries any single joint. Measured on v62_ep7200 over 25
+            non-fallen deep_hinge_crouch clips, restricting to the four leg DOFs
+            makes ``e`` 17.6x larger (0.167 vs 0.0095) -- which moves the term
+            off the Gaussian's flat top and multiplies the per-knee gradient by
+            2.2x (0.414 vs 0.189). Tightening sigma on the shared 27-DOF term
+            cannot do this; only a DOF-restricted term can.
 
     Returns:
         MdpComponent configured for the joint-space DOF position tracking reward.
@@ -2711,6 +2727,11 @@ def dof_pos_track_rew_factory(
 
     static_params: Dict[str, Any] = {"weight": weight, "sigma": sigma}
     static_params.update(_dual_sigma_static_params(fine_weight, fine_sigma))
+    if dof_indices is not None:
+        # The kernel's parameter is named ``indices``; keep the factory-level
+        # name explicit (``dof_indices``) so it can never be confused with the
+        # BODY-index kwarg the Cartesian factories in this module take.
+        static_params["indices"] = [int(i) for i in dof_indices]
 
     return MdpComponent(
         compute_func=compute_dof_pos_track_rew,
@@ -3198,6 +3219,42 @@ def relative_body_pos_metric_factory(threshold: float = None) -> MdpComponent:
             "current_anchor_rot": EnvContext.current.anchor_rot,
             "ref_rigid_body_rot": EnvContext.mimic.ref_state.rigid_body_rot,
             "anchor_idx": EnvContext.mimic.anchor_idx,
+        },
+        static_params=static_params,
+    )
+
+
+def dof_pos_metric_factory(
+    threshold: float = None, dof_indices=None
+) -> MdpComponent:
+    """Factory for the max per-DOF position error metric, in RADIANS (v66').
+
+    THE EVAL SURFACE for the joint-space tracking terms. READER/WRITER LAW: a
+    reward channel that cannot be read per category is what left v63's status
+    ambiguous for 200 epochs, so this ships in the same commit as the reward
+    term it measures and is registered UNCONDITIONALLY -- on runs where the
+    reward term is OFF it is the baseline measurement.
+
+    Args:
+        threshold: If set, fail when max joint error > threshold (rad).
+        dof_indices: Optional DOF subset to reduce the max over. None (default)
+            = all DOFs.
+
+    Returns:
+        MdpComponent configured for max per-DOF position error evaluation.
+    """
+    from protomotions.envs.terminations import dof_pos_max_error
+
+    static_params = {}
+    if threshold is not None:
+        static_params["threshold"] = threshold
+    if dof_indices is not None:
+        static_params["dof_indices"] = [int(i) for i in dof_indices]
+    return MdpComponent(
+        compute_func=dof_pos_max_error,
+        dynamic_vars={
+            "current_dof_pos": EnvContext.current.dof_pos,
+            "ref_dof_pos": EnvContext.mimic.ref_state.dof_pos,
         },
         static_params=static_params,
     )

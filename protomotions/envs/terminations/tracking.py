@@ -28,6 +28,8 @@ Includes:
 - Value functions for evaluation metrics
 """
 
+from typing import Optional
+
 import torch
 from torch import Tensor
 
@@ -159,6 +161,37 @@ def anchor_yaw_error_value(
     ref_yaw = calc_heading(ref_anchor_rot, w_last=True)
     wrapped = torch.atan2(torch.sin(cur_yaw - ref_yaw), torch.cos(cur_yaw - ref_yaw))
     return torch.abs(wrapped)
+
+
+def dof_pos_max_error(
+    current_dof_pos: Tensor,
+    ref_dof_pos: Tensor,
+    dof_indices: Optional[Tensor] = None,
+) -> Tensor:
+    """Maximum absolute per-DOF position error, in RADIANS.
+
+    The joint-space sibling of ``relative_body_pos_max_error``. Exists because
+    the reward it accompanies (``dof_pos_track`` and, under v66', the DOF-
+    restricted ``leg_dof_pos_track``) is a Gaussian of a MEAN SQUARED error and
+    therefore reads ~1 across the whole range we care about: at the measured
+    deep-crouch leg error the shared 27-DOF term sits at 0.92, so its own value
+    cannot tell a working run from a stalled one. This returns the raw physical
+    quantity in radians instead.
+
+    Args:
+        current_dof_pos: Current joint positions [num_envs, num_dofs] (rad).
+        ref_dof_pos: Reference joint positions [num_envs, num_dofs] (rad).
+        dof_indices: Optional DOF subset to reduce the max over. None (default)
+            = all DOFs. A subset here is directly comparable with the whole-body
+            number because nothing but the final max() is restricted.
+
+    Returns:
+        Max absolute joint error per env [num_envs] in radians.
+    """
+    error = (current_dof_pos - ref_dof_pos).abs()
+    if dof_indices is not None:
+        error = error[:, dof_indices]
+    return error.max(dim=-1)[0]
 
 
 def relative_body_pos_max_error(
