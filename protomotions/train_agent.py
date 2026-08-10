@@ -1054,38 +1054,6 @@ def main():
             # _rc may be a fresh dict when the frozen config had None.
             env_config.reward_components = _rc
 
-        # PM_BODY_WEIGHTS / PM_BODY_WEIGHTS_DEFAULT / PM_BODY_WEIGHTS_COMPONENTS
-        # (env-gated, resume-safe): PER-BODY weights on the all-body tracking
-        # reduction. Same shape and the SAME shared implementation as the
-        # fresh-build twin in imprint's teacher.py::env_config, so the two paths
-        # can never drift. Runs AFTER the injection pass so a component created
-        # on this very resume can still be weighted. body_names comes from the
-        # FROZEN robot config, so patterns resolve against the same body
-        # ordering the run was built with; an absent/empty list is a hard error
-        # inside the gate, never a silent misalignment.
-        #
-        # IDEMPOTENT BY CONSTRUCTION: the gate stores an ABSOLUTE weight vector
-        # derived only from the spec and the body-name list, so re-applying it
-        # on every autoresume is a no-op -- unlike the NOISE-DR scale knobs,
-        # which are multipliers and had to be given a nominal baseline stamp
-        # (noise_scale_env_gates.NOISE_SCALE_BASELINE_ATTR) after they were
-        # found compounding across v59's resumes.
-        from protomotions.envs.body_weight_env_gates import (
-            apply_body_weight_env_overrides,
-        )
-
-        # _rc, not env_config.reward_components: it is the same dict once the
-        # injection pass has run, and it is the shape the rest of this block
-        # already uses (a frozen config may legitimately carry no attribute).
-        apply_body_weight_env_overrides(
-            _rc,
-            getattr(
-                getattr(robot_config, "kinematic_info", None), "body_names", None
-            ),
-            log_fn=log.warning,
-            label="RESUME",
-        )
-
         args.checkpoint = checkpoint_path
         experiment_module = (
             None  # Intentionally skip loading - frozen config from pickle
@@ -1176,6 +1144,46 @@ def main():
                     motion_lib_config=motion_lib_config,
                     scene_lib_config=scene_lib_config,
                 )
+
+    # ===================================================================
+    # 2a-bis. PM_MM_DOF_WEIGHTS (env-gated, resume-safe): PER-DOF weighting of
+    # the distillation MSE.
+    # ===================================================================
+    # Deliberately placed AFTER the fresh/resume branches converge, so ONE call
+    # serves BOTH wiring paths and they cannot drift:
+    #
+    #   * fresh build -- agent_config is the object the experiment file just
+    #     built, and save_configs() below pickles it, so the resolved vector is
+    #     stamped into resolved_configs.pt for free.
+    #   * resume      -- detect_checkpoint_mode never re-executes the experiment
+    #     file (results/<EXP>/config.yaml is written back onto args and
+    #     resolved_configs.pt supplies the config objects), so environment knobs
+    #     are otherwise INERT on a resume. agent_config here is the UNPICKLED
+    #     frozen object and robot_config is the FROZEN robot config, so the
+    #     name->index resolution uses the DOF ordering the run was built with.
+    #     Configs are not re-saved on resume; the gate re-applies at every boot.
+    #     `stage_resume_config.py --dof-weights` bakes it in permanently.
+    #
+    # GUARD: hard no-op -- not one field written, not one line logged -- unless
+    # PM_MM_DOF_WEIGHTS is EXPLICITLY PRESENT, so an unset environment leaves a
+    # frozen config byte-identical. When it IS present, everything that could
+    # make it silently inert (agent config without action_dim_weights, missing
+    # dof_names, a glob matching nothing, a length mismatch) is a hard error:
+    # a weighting knob that quietly does nothing is the exact defect this
+    # change exists to fix.
+    from protomotions.agents.supervised.dof_weight_env_gates import (
+        apply_dof_weight_env_overrides,
+    )
+
+    apply_dof_weight_env_overrides(
+        agent_config,
+        dof_names=getattr(
+            getattr(robot_config, "kinematic_info", None), "dof_names", None
+        ),
+        log_fn=log.warning,
+        label="RESUME" if mode == "resume" else "FRESH-BUILD",
+        number_of_actions=getattr(robot_config, "number_of_actions", None),
+    )
 
     # ===================================================================
     # 2b. Create Config Only Mode: Save configs and exit early

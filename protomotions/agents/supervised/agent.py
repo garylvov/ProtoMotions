@@ -432,29 +432,173 @@ class SupervisedAgent(BaseAgent):
 
         return loss, log_dict
 
-    def _compute_supervision_loss(self, batch_td: TensorDict) -> Tuple[Tensor, Dict]:
-        """Configured supervision loss, with optional per-dim MSE weighting.
+    # -----------------------------
+    # Per-DOF supervision weighting (PM_MM_DOF_WEIGHTS) and its reader
+    # -----------------------------
+    def _supervision_dof_names(self):
+        """Ordered robot DOF names, or None when the agent has no robot config.
 
-        Track C: ``action_dim_weights`` (getattr: old pickles predate the
-        field) re-weights the imitation MSE per action dim (robot dof order),
-        normalized by the mean weight so the total loss scale matches the
-        unweighted MSE. Uniform weights reproduce F.mse_loss exactly.
+        Read through getattr chains because the unit tests construct agents via
+        ``object.__new__`` without an env, and because the latent-BC recipes
+        run this same loss path with no action-space prediction at all.
+        """
+        kinematic_info = getattr(
+            getattr(getattr(self, "env", None), "robot_config", None),
+            "kinematic_info",
+            None,
+        )
+        dof_names = getattr(kinematic_info, "dof_names", None)
+        return list(dof_names) if dof_names else None
+
+    def _dof_group_indices(self, action_dim: int):
+        """Cached ``{group_name: LongTensor(indices)}`` for the per-group readout.
+
+        Empty dict (logged once) when DOF names are unavailable or when the
+        supervised prediction is not the action vector -- e.g. the latent-BC
+        recipes supervise a latent, whose dims have no anatomy. Never silently
+        mismatched: the action-dim equality check is what makes that safe.
+        """
+        cache = getattr(self, "_dof_group_index_cache", None)
+        if cache is not None and cache.get("action_dim") == action_dim:
+            return cache["groups"]
+
+        from protomotions.agents.supervised.dof_weight_env_gates import (
+            resolve_dof_groups,
+        )
+
+        groups: Dict[str, Tensor] = {}
+        dof_names = self._supervision_dof_names()
+        if not dof_names:
+            log.warning(
+                "[DOF-WEIGHTS] per-group supervision MSE readout DISABLED: the "
+                "agent's robot config carries no kinematic_info.dof_names. The "
+                "loss itself is unaffected."
+            )
+        elif len(dof_names) != action_dim:
+            log.warning(
+                "[DOF-WEIGHTS] per-group supervision MSE readout DISABLED: the "
+                f"supervised prediction has {action_dim} dims but the robot has "
+                f"{len(dof_names)} DOFs, so this loss is not supervising the "
+                "action vector (latent BC?). The loss itself is unaffected."
+            )
+        else:
+            groups = {
+                name: torch.as_tensor(idx, dtype=torch.long)
+                for name, idx in resolve_dof_groups(dof_names).items()
+            }
+        self._dof_group_index_cache = {"action_dim": action_dim, "groups": groups}
+        return groups
+
+    def _dof_group_mse_metrics(self, squared_error: Tensor, prefix: str) -> Dict:
+        """UNWEIGHTED per-anatomical-group MSE, logged every epoch, always.
+
+        This is the reader for the ``PM_MM_DOF_WEIGHTS`` writer. It is computed
+        whether or not weights are active and it is deliberately UNWEIGHTED, so
+        a weighted run and an unweighted run produce directly comparable
+        curves: at epoch 50 ``masked_mimic/mse_group/wrists`` is what
+        distinguishes a working fix from a silently inert one.
+        """
+        groups = self._dof_group_indices(squared_error.shape[-1])
+        if not groups:
+            return {}
+        metrics: Dict = {}
+        with torch.no_grad():
+            flat = squared_error.detach().reshape(-1, squared_error.shape[-1])
+            for name, idx in groups.items():
+                metrics[f"{prefix}/mse_group/{name}"] = flat.index_select(
+                    -1, idx.to(flat.device)
+                ).mean()
+        return metrics
+
+    def _log_dof_weight_proof_once(self, dim_weights) -> None:
+        """Emit the loud startup proof of the weights the LOSS actually uses.
+
+        ``train_agent.py`` already logs a proof line when the gate resolves the
+        vector, but that proves only what was written into the config. This one
+        is emitted from inside the loss on the first optimizer step, so it
+        proves what is actually multiplying the gradient.
+        """
+        if getattr(self, "_dof_weight_proof_logged", False):
+            return
+        self._dof_weight_proof_logged = True
+
+        if dim_weights is None:
+            log.warning(
+                "[DOF-WEIGHTS] LOSS: per-DOF supervision weights INACTIVE "
+                "(agent.action_dim_weights is None) -- the distillation MSE is "
+                "the stock flat mean over all action DOFs. Set "
+                "PM_MM_DOF_WEIGHTS (e.g. 'default') to enable, and note that on "
+                "a RESUME the frozen resolved_configs.pt is what governs unless "
+                "the gate re-applies. Per-group MSE is logged either way."
+            )
+            return
+
+        dof_names = self._supervision_dof_names()
+        if not dof_names or len(dof_names) != len(dim_weights):
+            log.warning(
+                "[DOF-WEIGHTS] LOSS: per-DOF supervision weights ACTIVE, vector "
+                f"= {list(dim_weights)} (DOF names unavailable for the grouped "
+                "proof)"
+            )
+            return
+
+        from protomotions.agents.supervised.dof_weight_env_gates import (
+            format_dof_weight_proof,
+        )
+
+        for line in format_dof_weight_proof(
+            dim_weights, dof_names, "LOSS", "agent.action_dim_weights"
+        ):
+            log.warning(line)
+
+    def _compute_supervision_loss(self, batch_td: TensorDict) -> Tuple[Tensor, Dict]:
+        """Configured supervision loss, with optional per-DOF MSE weighting.
+
+        ``action_dim_weights`` (getattr: old pickles predate the field) is a
+        length-``number_of_actions`` vector in robot DOF order, resolved from
+        DOF-NAME globs by ``dof_weight_env_gates`` at config-build time -- the
+        loss itself never sees DOF names. The weighted form is
+
+            ``(((pred - target) ** 2) * w).sum(-1) / w.sum()``  batch-meaned
+
+        normalized by ``w.sum()`` so a UNIFORM ``w`` reproduces ``F.mse_loss``
+        exactly, keeping loss scale, learning-rate meaning and resume dynamics
+        intact. Only the MSE branch is affected; the other three supervision
+        loss types are delegated untouched.
+
+        The per-group unweighted MSE readout is attached on the MSE branch
+        REGARDLESS of whether weights are active, so weighted and unweighted
+        runs stay directly comparable.
         """
         loss_config = self.config.loss
         dim_weights = getattr(self.config, "action_dim_weights", None)
-        if dim_weights is None or not loss_config.enabled:
+        if not loss_config.enabled:
             return compute_supervision_loss(batch_td, loss_config)
 
         from protomotions.agents.common.supervision import SupervisionLossType
 
         if SupervisionLossType(loss_config.loss_type) != SupervisionLossType.MSE:
-            raise ValueError(
-                "action_dim_weights is only supported for loss_type=mse, got "
-                f"{loss_config.loss_type}"
-            )
+            if dim_weights is not None:
+                raise ValueError(
+                    "action_dim_weights is only supported for loss_type=mse, got "
+                    f"{loss_config.loss_type}"
+                )
+            return compute_supervision_loss(batch_td, loss_config)
 
         prediction = batch_td[loss_config.prediction_key]
         target = batch_td[loss_config.target_key]
+        prefix = loss_config.log_prefix
+        self._log_dof_weight_proof_once(dim_weights)
+
+        if dim_weights is None:
+            # Untouched stock path: delegate so the unweighted loss value stays
+            # bit-identical to F.mse_loss, and only ADD the reader.
+            loss, metrics = compute_supervision_loss(batch_td, loss_config)
+            metrics.update(
+                self._dof_group_mse_metrics((prediction - target).pow(2), prefix)
+            )
+            return loss, metrics
+
         weights = torch.as_tensor(
             dim_weights, dtype=prediction.dtype, device=prediction.device
         )
@@ -463,14 +607,21 @@ class SupervisedAgent(BaseAgent):
                 f"action_dim_weights length {tuple(weights.shape)} does not "
                 f"match action dim {prediction.shape[-1]}"
             )
-        weights = weights / weights.mean()
-        raw_loss = ((prediction - target).pow(2) * weights).mean()
+        weight_sum = weights.sum()
+        if not bool(torch.isfinite(weight_sum)) or float(weight_sum) <= 0.0:
+            raise ValueError(
+                "action_dim_weights must sum to a finite positive value (it is "
+                f"the loss normalizer), got sum={float(weight_sum)}"
+            )
+        squared_error = (prediction - target).pow(2)
+        raw_loss = (squared_error * weights).sum(-1).div(weight_sum).mean()
         weighted_loss = raw_loss * loss_config.weight
-        prefix = loss_config.log_prefix
-        return weighted_loss, {
+        metrics = {
             f"{prefix}/mse": raw_loss.detach(),
             f"{prefix}/loss": weighted_loss.detach(),
         }
+        metrics.update(self._dof_group_mse_metrics(squared_error, prefix))
+        return weighted_loss, metrics
 
     def calculate_extra_loss(self, batch_dict, actions) -> Tuple[Tensor, Dict]:
         extra_loss = torch.tensor(0.0, device=self.device)
