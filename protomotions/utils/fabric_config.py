@@ -158,6 +158,69 @@ def _default_ddp_strategy() -> fabric.strategies.DDPStrategy:
     )
 
 
+def assert_world_size_matches_request(
+    world_size: int, ngpu: int, num_nodes: int, env: Optional[Dict[str, str]] = None
+) -> None:
+    """Fail loudly when Lightning built a world smaller/larger than requested.
+
+    2026-08-11 root-cause fix (job 4863416 step 15). ``--ngpu N`` is a REQUEST;
+    the world size that actually materialises is decided by the
+    ``ClusterEnvironment`` Lightning auto-detects. Inside an ``srun`` step
+    ``SLURMEnvironment`` wins (``SLURM_NTASKS`` is exported by srun but NOT by
+    a plain sbatch that never asked for ``--ntasks``), Lightning reports
+    ``world_size = SLURM_NTASKS`` and spawns no subprocesses -- so an 8-GPU
+    resume launched with ``srun --overlap --ntasks=1`` silently became ONE rank
+    that tried to build all 8x8192 environments on GPU 0 and died with a CUDA
+    OOM inside ``motion_lib._quantize_motion_tensors_fp16``, ~90 s into a boot
+    whose only symptom was the line "Starting with 1 processes".
+
+    A run whose world size does not match its request is not a degraded run, it
+    is a DIFFERENT run: batch size, data-parallel gradient averaging and VRAM
+    budget all change. Refuse to train instead of discovering it from a crash
+    (or worse, from a trend curve days later). ``ngpu`` is the full world-size
+    request in every mode this repo supports, including the rank-stacking modes
+    where it is ``N_gpus * ranks_per_gpu`` (see ``_default_ddp_strategy``).
+    """
+    expected = int(ngpu) * int(num_nodes)
+    if int(world_size) == expected:
+        return
+    env = dict(os.environ if env is None else env)
+    slurm = {
+        k: env[k]
+        for k in (
+            "SLURM_JOB_ID",
+            "SLURM_JOB_NAME",
+            "SLURM_STEP_ID",
+            "SLURM_NTASKS",
+            "SLURM_NTASKS_PER_NODE",
+            "SLURM_NNODES",
+            "SLURM_PROCID",
+        )
+        if k in env
+    }
+    hint = ""
+    if "SLURM_NTASKS" in slurm and slurm.get("SLURM_JOB_NAME") not in (
+        "bash",
+        "interactive",
+    ):
+        hint = (
+            "\n  CAUSE: SLURM_NTASKS is set and SLURM_JOB_NAME is not "
+            "'bash'/'interactive', so lightning.fabric picked SLURMEnvironment "
+            "and took world_size from SLURM_NTASKS instead of spawning "
+            f"{expected} ranks itself. If the ranks are meant to be spawned by "
+            "the launcher (the normal case for this repo), export "
+            "SLURM_JOB_NAME=interactive before starting python. If they are "
+            "meant to be spawned by srun, run srun with "
+            f"--ntasks={expected}."
+        )
+    raise RuntimeError(
+        f"world size mismatch: Lightning built world_size={world_size}, but "
+        f"this run requested ngpu={ngpu} x nodes={num_nodes} = {expected} "
+        f"rank(s). Refusing to train a run that is not the run that was asked "
+        f"for.\n  SLURM env: {slurm or '<none>'}{hint}"
+    )
+
+
 @dataclass
 class FabricConfig:
     """Configuration for Lightning Fabric distributed training."""

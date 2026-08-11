@@ -679,7 +679,15 @@ def test_global_weight_zero_leaves_the_wrist_term_untouched(robot_config):
         actions_b,
     )
     assert la.item() == lb.item()
-    assert set(loga) == set(logb) == {"supervised/fk_wrist_pos_loss"}
+    # The wrist pass ran, so BOTH wrist channels are reported even though only
+    # the position weight is on (see
+    # test_disabled_wrist_channel_is_still_logged). The global channel stays
+    # absent: its weight is off AND its loss was never computed.
+    assert (
+        set(loga)
+        == set(logb)
+        == {"supervised/fk_wrist_pos_loss", "supervised/fk_wrist_ori_loss"}
+    )
     assert torch.equal(ga, gb)
 
 
@@ -918,3 +926,144 @@ def test_missing_reference_key_raises_a_named_error(robot_config):
     agent = _make_agent(robot_config, {"fk_wrist_pos_weight": 1.0})
     with pytest.raises(KeyError, match="mimic_target_poses"):
         agent._calculate_fk_wrist_loss({"privileged_action": actions}, actions)
+
+
+# ---------------------------------------------------------------------------
+# 10. observability: the disabled channel must still be MEASURABLE
+# ---------------------------------------------------------------------------
+
+
+def test_disabled_wrist_channel_is_still_logged(robot_config):
+    """A weight of 0 must not hide the loss it would have paid.
+
+    ``_calculate_fk_wrist_loss`` computes (pos, ori) as a PAIR whenever either
+    weight is on, so the disabled channel's value already exists -- it was
+    simply discarded. Discarding it makes the disabled weight impossible to
+    SIZE from measured data, which is how a weight ends up being a round number
+    somebody guessed. Logging it costs one ``detach()``.
+
+    The contract has two halves and both are asserted here:
+      * the disabled channel IS logged, and
+      * it contributes NOTHING to the optimized objective.
+    """
+    torch.manual_seed(71)
+    ki = robot_config.kinematic_info
+    batch = 4
+    actions = (torch.randn(batch, ki.num_dofs) * 0.2).requires_grad_(True)
+    cur_pos, cur_rot = _random_state(robot_config, batch, seed=72)
+    ref_pos, ref_rot = _random_state(robot_config, batch, seed=73)
+
+    def run(overrides, act):
+        agent = _make_agent(robot_config, overrides)
+        batch_td = _batch(robot_config, act, cur_pos, cur_rot, ref_pos, ref_rot)
+        return agent.calculate_extra_loss(batch_td, act)
+
+    pos_only, log_pos_only = run({"fk_wrist_pos_weight": 0.3}, actions)
+    assert "supervised/fk_wrist_ori_loss" in log_pos_only, (
+        "fk_wrist_ori_loss is computed and thrown away when its weight is 0 -- "
+        "log it, or the weight can only ever be guessed"
+    )
+    assert "supervised/fk_wrist_pos_loss" in log_pos_only
+
+    # ORI off must be worth exactly the position term alone.
+    ori_off_actions = actions.detach().clone().requires_grad_(True)
+    _, log_ref = run(
+        {"fk_wrist_pos_weight": 0.3, "fk_wrist_ori_weight": 0.0}, ori_off_actions
+    )
+    expected = 0.3 * log_pos_only["supervised/fk_wrist_pos_loss"]
+    assert torch.allclose(pos_only, expected, atol=1e-9), (
+        f"extra_loss {pos_only.item()} != 0.3 * fk_wrist_pos_loss "
+        f"{expected.item()} -- a zero-weight channel leaked into the objective"
+    )
+    assert log_ref["supervised/fk_wrist_ori_loss"] > 0
+
+    # Mirror case: position disabled, orientation on.
+    ori_actions = actions.detach().clone().requires_grad_(True)
+    ori_only, log_ori_only = run(
+        {"fk_wrist_pos_weight": 0.0, "fk_wrist_ori_weight": 0.075}, ori_actions
+    )
+    assert "supervised/fk_wrist_pos_loss" in log_ori_only
+    assert torch.allclose(
+        ori_only, 0.075 * log_ori_only["supervised/fk_wrist_ori_loss"], atol=1e-9
+    )
+
+    # Both fully off -> the wrist pass never runs, so nothing is logged and the
+    # zero-FK-cost guarantee for unconfigured runs is preserved.
+    off_actions = actions.detach().clone().requires_grad_(True)
+    off_loss, log_off = run(
+        {"fk_wrist_pos_weight": 0.0, "fk_wrist_ori_weight": 0.0}, off_actions
+    )
+    assert not [k for k in log_off if "fk_" in k]
+    assert float(off_loss) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# 11. boot-time proof (fk_wrist_proof)
+# ---------------------------------------------------------------------------
+
+
+def test_fk_loss_weights_is_the_single_accessor():
+    from protomotions.agents.supervised import fk_wrist_proof
+
+    # Missing fields (a pickle predating them) and explicit None both read 0.0.
+    assert fk_wrist_proof.fk_loss_weights(SimpleNamespace()) == {
+        "fk_wrist_pos_weight": 0.0,
+        "fk_wrist_ori_weight": 0.0,
+        "fk_global_pos_weight": 0.0,
+    }
+    cfg = SimpleNamespace(
+        fk_wrist_pos_weight=0.286, fk_wrist_ori_weight=None, fk_global_pos_weight=1
+    )
+    assert fk_wrist_proof.fk_loss_weights(cfg) == {
+        "fk_wrist_pos_weight": 0.286,
+        "fk_wrist_ori_weight": 0.0,
+        "fk_global_pos_weight": 1.0,
+    }
+
+
+def test_fk_proof_prints_the_weight_the_loss_will_pay(robot_config):
+    """The proof and the objective must read the SAME number, or it proves nothing."""
+    from protomotions.agents.supervised import fk_wrist_proof
+
+    torch.manual_seed(74)
+    ki = robot_config.kinematic_info
+    batch = 3
+    actions = (torch.randn(batch, ki.num_dofs) * 0.2).requires_grad_(True)
+    cur_pos, cur_rot = _random_state(robot_config, batch, seed=75)
+    ref_pos, ref_rot = _random_state(robot_config, batch, seed=76)
+
+    agent = _make_agent(
+        robot_config,
+        {"fk_wrist_pos_weight": 0.286, "fk_wrist_ori_weight": 0.0731},
+    )
+    batch_td = _batch(robot_config, actions, cur_pos, cur_rot, ref_pos, ref_rot)
+    extra_loss, log_dict = agent.calculate_extra_loss(batch_td, actions)
+
+    lines = fk_wrist_proof.format_fk_loss_proof(agent.config, "RESUME")
+    text = "\n".join(lines)
+    assert "ACTIVE" in text
+    assert "fk_wrist_pos_weight" in text and "0.286" in text
+    assert "fk_wrist_ori_weight" in text and "0.0731" in text
+
+    # The advertised weights reconstruct the paid objective exactly.
+    w = fk_wrist_proof.fk_loss_weights(agent.config)
+    rebuilt = (
+        w["fk_wrist_pos_weight"] * log_dict["supervised/fk_wrist_pos_loss"]
+        + w["fk_wrist_ori_weight"] * log_dict["supervised/fk_wrist_ori_loss"]
+    )
+    assert torch.allclose(extra_loss, rebuilt, atol=1e-9)
+
+
+def test_fk_proof_is_emitted_even_when_off():
+    """A MISSING [FK-LOSS] line must mean 'stale binary', never 'term is off'."""
+    from protomotions.agents.supervised import fk_wrist_proof
+
+    lines = fk_wrist_proof.format_fk_loss_proof(SimpleNamespace(), "FRESH-BUILD")
+    assert lines, "the proof must speak even when every weight is zero"
+    assert "OFF" in lines[0] and "[FK-LOSS]" in lines[0]
+
+    emitted = []
+    fk_wrist_proof.log_fk_loss_proof(
+        SimpleNamespace(fk_wrist_pos_weight=0.3), emitted.append, "RESUME"
+    )
+    assert any("fk_wrist_pos_weight" in line and "0.3" in line for line in emitted)

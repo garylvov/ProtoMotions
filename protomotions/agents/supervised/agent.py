@@ -671,9 +671,15 @@ class SupervisedAgent(BaseAgent):
         # FK Cartesian wrist loss. Both weights default to 0.0 and are read via
         # getattr (old resolved_configs pickles predate the fields), so an
         # unconfigured run pays ZERO FK cost and stays byte-identical.
-        fk_pos_weight = getattr(self.config, "fk_wrist_pos_weight", 0.0)
-        fk_ori_weight = getattr(self.config, "fk_wrist_ori_weight", 0.0)
-        fk_global_weight = getattr(self.config, "fk_global_pos_weight", 0.0)
+        # ONE accessor, shared with the boot-time [FK-LOSS] proof in
+        # train_agent.py, so the weight the log advertises and the weight the
+        # objective pays can never be two different numbers.
+        from protomotions.agents.supervised.fk_wrist_proof import fk_loss_weights
+
+        _fk_w = fk_loss_weights(self.config)
+        fk_pos_weight = _fk_w["fk_wrist_pos_weight"]
+        fk_ori_weight = _fk_w["fk_wrist_ori_weight"]
+        fk_global_weight = _fk_w["fk_global_pos_weight"]
         if fk_pos_weight > 0 or fk_ori_weight > 0 or fk_global_weight > 0:
             # ONE context, ONE FK pass. compute_forward_kinematics_from_transforms
             # already produces every body's pose, so the all-body term is a slice
@@ -684,12 +690,21 @@ class SupervisedAgent(BaseAgent):
                 fk_pos_loss, fk_ori_loss = self._calculate_fk_wrist_loss(
                     batch_dict, actions, cached=cached
                 )
+                # LOG BOTH whenever the wrist pass runs, INDEPENDENT of which
+                # weight is on. _calculate_fk_wrist_loss computes the pair
+                # unconditionally, so the disabled channel was being computed
+                # and thrown away -- logging it is free (one .detach() and a
+                # scalar) and it is the only way to SIZE the disabled weight
+                # from measured data instead of guessing. Sizing
+                # fk_wrist_ori_weight blind is exactly the failure this exists
+                # to prevent. A weight of 0.0 still contributes nothing to
+                # extra_loss, so the optimized objective is unchanged.
+                log_dict["supervised/fk_wrist_pos_loss"] = fk_pos_loss.detach()
+                log_dict["supervised/fk_wrist_ori_loss"] = fk_ori_loss.detach()
                 if fk_pos_weight > 0:
                     extra_loss = extra_loss + fk_pos_weight * fk_pos_loss
-                    log_dict["supervised/fk_wrist_pos_loss"] = fk_pos_loss.detach()
                 if fk_ori_weight > 0:
                     extra_loss = extra_loss + fk_ori_weight * fk_ori_loss
-                    log_dict["supervised/fk_wrist_ori_loss"] = fk_ori_loss.detach()
             if fk_global_weight > 0:
                 fk_global_loss = self._calculate_fk_global_loss(
                     batch_dict, actions, cached=cached
