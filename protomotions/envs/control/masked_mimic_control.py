@@ -66,10 +66,40 @@ class MaskedMimicControlConfig(MimicControlConfig):
     # Optional absolute bounds on the sampled gap between consecutive
     # conditioning times, in seconds. None keeps the legacy behavior
     # (offset = beta * remaining clip time, unbounded above). Setting e.g.
-    # min_time_gap=0.02, max_time_gap=2.0 trains conditioning densities from
-    # every-control-step (50 Hz) down to one target every 2 s.
+    # CORRECTED 2026-08-11. The previous comment here claimed that
+    # min_time_gap=0.02 / max_time_gap=2.0 "trains conditioning densities from
+    # every-control-step (50 Hz) down to one target every 2 s". It does not,
+    # and believing it inverted the reading of every gap sweep we ran.
+    #
+    # In `remaining_scaled` mode the Beta draw is multiplied by the clip's
+    # REMAINING TIME and only then clamped to [min_time_gap, max_time_gap], so
+    # these two numbers are a CLAMP, not the sampling range. On our corpus that
+    # yields a median first gap of 0.79 s, and P(all 5 draws <= 0.02) = 0.000000
+    # -- 50 Hz conditioning is never trained, it is out of distribution.
+    #
+    # Measured consequence (teleop5 ep8200, canonical_eval_v1, wrist cm):
+    #     gap 0.02 -> 15.01   gap 0.10 -> 11.16   gap 0.25 -> 11.40   gap 0.50 -> 13.64
+    # The student is best at 0.10-0.25 while being TRAINED at ~0.79. Closing
+    # that train/deploy mismatch is what `absolute` mode exists for.
     min_time_gap: Optional[float] = None
     max_time_gap: Optional[float] = None
+
+    # How to turn a Beta(time_alpha, time_beta) draw into a time gap.
+    #
+    #   "remaining_scaled"  gap = beta * remaining_clip_time, then clamped.
+    #                       The historical behaviour. Gap depends on where in
+    #                       the clip you are and how long the clip is, so the
+    #                       realised distribution is a property of the CORPUS,
+    #                       not of the config. Default, so existing configs and
+    #                       resumed runs are bit-identical.
+    #
+    #   "absolute"          gap = min_time_gap + beta * (max_time_gap - min_time_gap).
+    #                       Samples the configured range directly, independent
+    #                       of clip length. With Beta(2,5) (mean 2/7) and
+    #                       [0.02, 0.50] this gives a mean gap of 0.157 s and
+    #                       puts the mass where the student actually scores
+    #                       best. Requires both bounds to be set.
+    time_gap_mode: str = "remaining_scaled"
     
     # Joint masking
     repeat_mask_probability: float = 0.8
@@ -227,13 +257,41 @@ class MaskedMimicControl(MimicControl):
         )
         beta_samples = beta_dist.sample((num_envs,)).to(self.env.device)
         
-        # Calculate new times
-        time_offsets = beta_samples * remaining_times
-        if self.config.min_time_gap is not None or self.config.max_time_gap is not None:
-            time_offsets = torch.clamp(
-                time_offsets,
-                min=self.config.min_time_gap,
-                max=self.config.max_time_gap,
+        # Calculate new times. See `time_gap_mode` on the config for why these
+        # two modes exist and what the historical one actually samples.
+        mode = getattr(self.config, "time_gap_mode", "remaining_scaled")
+        if mode == "absolute":
+            if self.config.min_time_gap is None or self.config.max_time_gap is None:
+                raise ValueError(
+                    "time_gap_mode='absolute' needs both min_time_gap and "
+                    "max_time_gap set -- they are the sampling range in this "
+                    "mode, not a clamp, so there is no sensible default."
+                )
+            lo = float(self.config.min_time_gap)
+            hi = float(self.config.max_time_gap)
+            if not hi > lo:
+                raise ValueError(
+                    f"time_gap_mode='absolute' needs max_time_gap ({hi}) > "
+                    f"min_time_gap ({lo})"
+                )
+            # Draw the configured range directly: independent of clip length,
+            # so the realised gap distribution is a property of the CONFIG.
+            time_offsets = lo + beta_samples * (hi - lo)
+        elif mode == "remaining_scaled":
+            time_offsets = beta_samples * remaining_times
+            if (
+                self.config.min_time_gap is not None
+                or self.config.max_time_gap is not None
+            ):
+                time_offsets = torch.clamp(
+                    time_offsets,
+                    min=self.config.min_time_gap,
+                    max=self.config.max_time_gap,
+                )
+        else:
+            raise ValueError(
+                f"unknown time_gap_mode {mode!r}; expected 'remaining_scaled' "
+                "or 'absolute'"
             )
         absolute_times = last_conditioned_times + time_offsets
         
