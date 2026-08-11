@@ -38,7 +38,7 @@ sys.path.insert(0, H2H)
 import mujoco
 import onnxruntime as ort
 import batch_mj_eval as B  # inserts GOLDEN on sys.path; load_mujoco_model, set_initial_pose
-from deployment.motion_utils import MotionPlayer
+from deployment.motion_utils import MotionPlayer, motion_names
 from deployment.state_utils import mujoco_wxyz_to_xyzw
 
 
@@ -274,8 +274,11 @@ def main():
     cam = mujoco.MjvCamera()
     cam.azimuth = 120.0; cam.elevation = -15.0; cam.distance = 3.2
 
-    import torch
-    names = torch.load(args.motion, map_location="cpu", weights_only=False).get("motion_names", [])
+    # motion_names() knows every container layout MotionPlayer accepts. Reading
+    # "motion_names" directly returned [] for a motion pack (which names its
+    # clips per-clip, not in a top-level list), so every output file fell back
+    # to "clip<i>" and the folder was unlabelled.
+    names = motion_names(args.motion)
 
     written = []
     all_stats = {}

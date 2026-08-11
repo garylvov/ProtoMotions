@@ -5,12 +5,15 @@
 
 :class:`MotionPlayer` loads **a single motion clip** and provides per-frame
 state (joint positions, velocities, body rotations, etc.) at a fixed control
-rate.  It accepts three input formats:
+rate.  It accepts four input formats:
 
 - A single ``.motion`` file (RobotState dict with ``fps``, ``dof_pos``, …).
 - A packaged ``.pt`` library (multi-motion file with ``length_starts``,
   ``gts``, ``grs``, …) -- requires an explicit ``motion_index`` to select
   which clip to load.
+- A **motion pack** (``{"clips": [...], "meta": {...}}``) as written by the
+  eval harness -- requires an explicit ``motion_index``.  See
+  :func:`unwrap_pack_clip`.
 - A pre-resampled cache previously written by :meth:`cache_to_file`.
 
 Two runtime modes
@@ -74,7 +77,13 @@ from typing import Dict, List
 
 import numpy as np
 
-__all__ = ["MotionPlayer"]
+__all__ = [
+    "MotionPlayer",
+    "is_motion_pack",
+    "motion_names",
+    "num_motions",
+    "unwrap_pack_clip",
+]
 
 # Keys present in every state/future-reference dict
 _STATE_KEYS = ("dof_pos", "dof_vel", "body_rot", "body_pos", "body_vel", "body_ang_vel")
@@ -82,34 +91,169 @@ _STATE_KEYS = ("dof_pos", "dof_vel", "body_rot", "body_pos", "body_vel", "body_a
 # Keys stored in cache files (superset of _STATE_KEYS plus metadata)
 _CACHE_METADATA_KEYS = {"control_dt", "num_frames"}
 
+#: Top-level key that identifies a motion pack.
+_PACK_KEY = "clips"
+
 
 def _is_cache_file(data: dict) -> bool:
     """Return True if *data* looks like a pre-resampled cache (not a raw motion)."""
     return "control_dt" in data and "body_rot" in data
 
 
+# ---------------------------------------------------------------------------
+# Motion-pack adapter
+# ---------------------------------------------------------------------------
+#
+# The eval harness packages a whole testset as a single **motion pack**::
+#
+#     {"clips": [clip, clip, ...], "meta": {...}}
+#
+# Each ``clip`` is already resampled to a fixed control rate, so key for key it
+# *is* a MotionPlayer cache dict (``dof_pos``/``body_rot``/``control_dt``/
+# ``num_frames``/…) carrying extra provenance (``name``, ``category``,
+# ``metrics``, …).  Written by ``scripts/wbc/eval/build_canonical_eval.py``;
+# the harness's own reader is ``batch_mj_eval.load_testset``.
+#
+# Until this adapter existed, ``MotionPlayer`` rejected packs outright with
+# "Unrecognised raw motion format", which is the whole reason the masked-mimic
+# student could never be rendered on ``canonical_eval_v1.pt``.
+#
+# The fix is a NORMALISER rather than a branch inside the loader: a pack is
+# unwrapped to the one clip that was asked for, and that clip then travels the
+# ordinary cache path.  Nothing downstream of ``__init__`` learns that packs
+# exist, so there is exactly one place that knows the pack layout.
+
+
+def is_motion_pack(data) -> bool:
+    """True iff *data* is a motion pack (a dict whose ``clips`` is a sequence).
+
+    Deliberately structural, not name-based: the format is identified by what
+    it contains, so a pack stays recognisable under any filename.
+    """
+    return isinstance(data, dict) and isinstance(data.get(_PACK_KEY), (list, tuple))
+
+
+def unwrap_pack_clip(data: dict, motion_index: int, control_dt: float | None = None) -> dict:
+    """Return clip *motion_index* of a motion pack as a plain cache dict.
+
+    Args:
+        data: the loaded motion pack.
+        motion_index: which clip to select.  Required -- a pack holds many
+            clips and there is no sensible default beyond 0, so an
+            out-of-range index is an error rather than a clamp.
+        control_dt: if given, the rate the caller intends to play at.  Pack
+            clips are **already resampled**, so a mismatch cannot be honoured
+            and is refused loudly instead of silently replaying at the wrong
+            rate (which desynchronises every time-indexed signal downstream:
+            the masked-mimic conditioning ladder, reference lookups, the
+            frame pairing the metrics are defined on).
+
+    Raises:
+        IndexError: *motion_index* is outside the pack.
+        ValueError: the clip is missing state arrays, or its stored
+            ``control_dt`` disagrees with the requested one.
+    """
+    clips = data[_PACK_KEY]
+    n = len(clips)
+    if n == 0:
+        raise ValueError("motion pack contains no clips")
+    idx = int(motion_index)
+    if not 0 <= idx < n:
+        raise IndexError(
+            f"motion_index {motion_index} is out of range for a {n}-clip motion pack"
+        )
+    clip = clips[idx]
+    if not isinstance(clip, dict):
+        raise ValueError(
+            f"clip {idx} of this motion pack is a {type(clip).__name__}, not a dict; "
+            "a pack clip must be a cache-shaped mapping"
+        )
+    missing = [k for k in _STATE_KEYS if k not in clip]
+    if missing:
+        raise ValueError(
+            f"clip {idx} of this motion pack is missing {missing}. A pack clip must "
+            f"carry every state array ({', '.join(_STATE_KEYS)}); refusing to play a "
+            "clip whose missing channels would be read as zeros."
+        )
+    if control_dt is not None and "control_dt" in clip:
+        src = float(clip["control_dt"])
+        if abs(src - float(control_dt)) > 1e-9:
+            raise ValueError(
+                f"clip {idx} of this motion pack is stored at control_dt={src} s but "
+                f"{float(control_dt)} s was requested. Pack clips are ALREADY "
+                "resampled, so the request cannot be honoured; replaying them at "
+                "another rate silently desynchronises every time-indexed signal. "
+                "Rebuild the pack at the required rate instead."
+            )
+    return clip
+
+
+def _as_container(source) -> dict:
+    """Accept an already-loaded dict or a path to one."""
+    if isinstance(source, dict):
+        return source
+    import torch
+
+    return torch.load(str(source), map_location="cpu", weights_only=False)
+
+
+def motion_names(source) -> List[str]:
+    """Per-clip names for any supported multi-motion container.
+
+    Callers used to reach into the file themselves with
+    ``torch.load(...).get("motion_names", [])``, which returns ``[]`` for a
+    motion pack -- so every rendered file fell back to ``clip<i>`` and the
+    output was unlabelled.  Packs carry the name on each clip instead; this is
+    the one accessor that knows both layouts.
+
+    Returns an empty list when the container declares no names, matching the
+    previous ``.get("motion_names", [])`` contract so callers that guard with
+    ``if idx < len(names)`` keep working.
+    """
+    data = _as_container(source)
+    if is_motion_pack(data):
+        return [str(c.get("name", f"clip{i}")) if isinstance(c, dict) else f"clip{i}"
+                for i, c in enumerate(data[_PACK_KEY])]
+    names = data.get("motion_names")
+    return [] if names is None else [str(n) for n in names]
+
+
+def num_motions(source) -> int:
+    """How many clips *source* holds (1 for a single ``.motion`` or a cache)."""
+    data = _as_container(source)
+    if is_motion_pack(data):
+        return len(data[_PACK_KEY])
+    if "length_starts" in data:
+        return len(data["length_starts"])
+    return 1
+
+
 class MotionPlayer:
     """Lightweight player for a **single** motion clip at a fixed control rate.
 
-    Accepts three input formats (auto-detected):
+    Accepts four input formats (auto-detected):
 
     1. **Single ``.motion`` file** — a RobotState dict saved via
        ``torch.save`` with keys ``fps``, ``dof_pos``, ``rigid_body_pos``, etc.
     2. **Packaged ``.pt`` library** — a multi-motion file with
        ``length_starts``, ``gts``, ``grs``, … keys.  You **must** pass
        ``motion_index`` to select which clip to extract.
-    3. **Pre-resampled cache** — written by :meth:`cache_to_file`, containing
+    3. **Motion pack** — ``{"clips": [...], "meta": {...}}`` as written by the
+       eval harness.  You **must** pass ``motion_index``.  Clips are already
+       resampled, so the pack is normalised to a single cache dict up front
+       (:func:`unwrap_pack_clip`) and then loaded like any other cache.
+    4. **Pre-resampled cache** — written by :meth:`cache_to_file`, containing
        NumPy arrays at the control rate.  Auto-detected by the presence of
        a ``control_dt`` key.
 
     Parameters
     ----------
     motion_file:
-        Path to any of the three formats above.
+        Path to any of the four formats above.
     motion_index:
-        Index of the clip to extract from a packaged ``.pt`` library.
-        **Required** for packaged files, ignored for ``.motion`` and cache
-        files.
+        Index of the clip to extract from a packaged ``.pt`` library or a
+        motion pack.  **Required** for both, ignored for ``.motion`` and
+        cache files.
     control_dt:
         Control period in seconds (default 0.02 s = 50 Hz).  Determines the
         resampling rate when loading raw motion data.  Ignored when loading
@@ -127,6 +271,11 @@ class MotionPlayer:
         self._torch = torch
         motion_file = str(motion_file)
         data = torch.load(motion_file, map_location="cpu", weights_only=False)
+
+        # Normalise a motion pack down to the single clip that was asked for.
+        # The result is cache-shaped, so the two branches below are unchanged.
+        if is_motion_pack(data):
+            data = unwrap_pack_clip(data, motion_index, control_dt)
 
         if _is_cache_file(data):
             self._load_cache(data)
@@ -316,9 +465,12 @@ class MotionPlayer:
             motion_length = src_dt * (nf - 1)
         else:
             raise ValueError(
-                "Unrecognised raw motion format.  Expected either:\n"
+                "Unrecognised raw motion format.  Expected one of:\n"
                 "  - packaged library: keys 'length_starts', 'gts', 'grs', …\n"
-                "  - single-motion:   keys 'rigid_body_pos', 'fps', 'dof_pos', …"
+                "  - single-motion:   keys 'rigid_body_pos', 'fps', 'dof_pos', …\n"
+                "  - motion pack:     key 'clips' (a list of cache-shaped dicts)\n"
+                "  - resampled cache: keys 'control_dt', 'body_rot', …\n"
+                f"got keys: {sorted(data)[:12]}"
             )
 
         # ---- resample to control rate via training-identical interpolation ----
