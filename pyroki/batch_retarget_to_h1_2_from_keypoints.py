@@ -84,6 +84,7 @@ def load_motion_data(
     subsample_factor,
     target_raw_frames,
     fallback_input_fps=30.0,
+    truncate_to_target=False,
 ):
     """Load and process motion data from a keypoints file.
 
@@ -91,8 +92,15 @@ def load_motion_data(
         motion_path: Path to the motion file
         source_type: Source type ('smpl' or 'rigv1')
         subsample_factor: Subsampling factor
-        target_raw_frames: Target number of raw frames before subsampling
+        target_raw_frames: Solver buffer quantum, in raw frames before
+            subsampling. The buffer is grown in whole multiples of this number
+            until it covers the clip, so a clip is never shortened; the number
+            of distinct buffer sizes (and therefore of `solve_retargeting` JIT
+            compilations) stays small.
         fallback_input_fps: FPS to use for legacy keypoint files without metadata
+        truncate_to_target: Opt in to the old behaviour of discarding every raw
+            frame past `target_raw_frames`. Off by default: a clip must never
+            lose frames unless the caller asked for it in so many words.
 
     Returns:
         Tuple of (simplified_keypoints, keypoint_orientations, left_foot_contact, right_foot_contact, num_timesteps, input_fps)
@@ -100,9 +108,6 @@ def load_motion_data(
     print(f"Loading motion from: {motion_path}")
     motion_data = onp.load(motion_path, allow_pickle=True).item()
     input_fps = fps_from_mapping(motion_data, fallback_input_fps)
-
-    # Compute target subsampled frames from raw frames and subsample factor
-    target_subsampled_frames = len(list(range(0, target_raw_frames, subsample_factor)))
 
     raw_positions = motion_data["positions"]
     raw_orientations = motion_data["orientations"]
@@ -116,24 +121,59 @@ def load_motion_data(
 
     print(f"Original motion length: {original_raw_frames} frames.")
 
-    # Calculate the original number of frames after subsampling for display purposes
     assert original_raw_frames > 0
+    assert target_raw_frames > 0, "--target-raw-frames must be positive"
+
+    # Size the solver's fixed-size buffer. Growing it in whole multiples of the
+    # quantum keeps the set of distinct shapes small (solve_retargeting is
+    # @jdc.jit, so every new T costs a full recompile) while guaranteeing the
+    # buffer always covers the clip. Only an explicit opt-in shortens a clip.
+    if truncate_to_target:
+        effective_raw_frames = target_raw_frames
+    else:
+        num_buffers = -(-original_raw_frames // target_raw_frames)  # ceil div
+        effective_raw_frames = num_buffers * target_raw_frames
+
+    if effective_raw_frames != target_raw_frames:
+        print(
+            f"Buffer grown from {target_raw_frames} to {effective_raw_frames} raw frames "
+            f"to cover the clip's {original_raw_frames}."
+        )
+
+    target_subsampled_frames = len(
+        list(range(0, effective_raw_frames, subsample_factor))
+    )
+
+    # Calculate the original number of frames after subsampling for display purposes
     original_subsampled_display_count = raw_positions[::subsample_factor].shape[0]
     # Display frames are the minimum of original's useful frames and the buffer's capacity
     num_timesteps = min(original_subsampled_display_count, target_subsampled_frames)
+
+    if num_timesteps != original_subsampled_display_count:
+        dropped = original_subsampled_display_count - num_timesteps
+        message = (
+            f"{motion_path}: refusing to silently discard {dropped} of "
+            f"{original_subsampled_display_count} subsampled frames "
+            f"({original_raw_frames} raw frames, buffer {effective_raw_frames}). "
+            "Raise --target-raw-frames or drop --truncate-to-target."
+        )
+        # Truncation is only reachable via the explicit opt-in; anything else
+        # here is a sizing bug and must not exit 0 with a short clip.
+        assert truncate_to_target, message
+        print(f"WARNING: --truncate-to-target in effect. {message}")
 
     print(
         f"Motion will be displayed for {num_timesteps} subsampled frames (original subsampled count: {original_subsampled_display_count})."
     )
 
-    # Pad or trim raw data to target_raw_frames for the solver's fixed-size input
-    if original_raw_frames >= target_raw_frames:
-        processed_positions = raw_positions[:target_raw_frames]
-        processed_orientations = raw_orientations[:target_raw_frames]
-        processed_left_foot_contacts = raw_left_foot_contacts[:target_raw_frames]
-        processed_right_foot_contacts = raw_right_foot_contacts[:target_raw_frames]
+    # Pad or trim raw data to effective_raw_frames for the solver's fixed-size input
+    if original_raw_frames >= effective_raw_frames:
+        processed_positions = raw_positions[:effective_raw_frames]
+        processed_orientations = raw_orientations[:effective_raw_frames]
+        processed_left_foot_contacts = raw_left_foot_contacts[:effective_raw_frames]
+        processed_right_foot_contacts = raw_right_foot_contacts[:effective_raw_frames]
     else:
-        padding_count = target_raw_frames - original_raw_frames
+        padding_count = effective_raw_frames - original_raw_frames
 
         last_pos_frame = raw_positions[-1:]
         pos_padding = onp.repeat(last_pos_frame, padding_count, axis=0)
@@ -403,7 +443,19 @@ def main():
         "--target-raw-frames",
         type=int,
         default=450,
-        help="Target raw frames before subsampling.",
+        help=(
+            "Solver buffer quantum in raw frames before subsampling. The buffer "
+            "grows in whole multiples of this until it covers the clip, so long "
+            "clips are padded, never shortened."
+        ),
+    )
+    parser.add_argument(
+        "--truncate-to-target",
+        action="store_true",
+        help=(
+            "Discard every raw frame past --target-raw-frames. Off by default; "
+            "without it an over-long clip grows the buffer instead of losing data."
+        ),
     )
     parser.add_argument(
         "--skip-existing",
@@ -486,6 +538,7 @@ def main():
                     subsample_factor,
                     TARGET_RAW_FRAMES,
                     args.input_fps,
+                    args.truncate_to_target,
                 )
             )
             save_contact_labels(
@@ -562,6 +615,7 @@ def main():
             subsample_factor,
             TARGET_RAW_FRAMES,
             args.input_fps,
+            args.truncate_to_target,
         )
         server = viser.ViserServer()
         base_frame = server.scene.add_frame("/base", show_axes=False)
@@ -632,6 +686,7 @@ def main():
                 subsample_factor,
                 TARGET_RAW_FRAMES,
                 args.input_fps,
+                args.truncate_to_target,
             )
 
             # Update UI elements that depend on num_timesteps (displayable frames)
@@ -708,6 +763,7 @@ def main():
                 subsample_factor,
                 TARGET_RAW_FRAMES,
                 args.input_fps,
+                args.truncate_to_target,
             )
 
             Ts_world_root, joints = solve_retargeting(
